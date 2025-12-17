@@ -1,21 +1,24 @@
 from __future__ import annotations
 
-from datetime import date
+import time
+import io
+from datetime import date, timedelta
 from typing import Any, Optional
 
 import duckdb
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.utils import get_column_letter
 
 from supabase_link import get_supabase_client
 from aws_duckdb import get_duckdb_connection
 
 try:
-    # Optional (better UX). Falls back to st.dataframe if not installed.
     from st_aggrid import AgGrid  # type: ignore
     from st_aggrid.grid_options_builder import GridOptionsBuilder  # type: ignore
     from st_aggrid.shared import GridUpdateMode  # type: ignore
-
     _HAS_AGGRID = True
 except Exception:
     AgGrid = None  # type: ignore
@@ -118,8 +121,61 @@ def equipment_deviation_candidates(
         con.close()
 
 
+@st.cache_data(show_spinner=False)
+def fetch_download_candidates(
+    db_path: str,
+    *,
+    site_name: str,
+    start_date: date,
+    end_date: date,
+    threshold: float
+) -> pd.DataFrame:
+    """
+    Fetch candidates for Excel download.
+    - Single Day: Actual SYD
+    - Date Range: Median SYD
+    """
+    con = _connect_ro(db_path)
+    try:
+        # Single Date: Use actual value
+        if start_date == end_date:
+            return con.execute(
+                """
+                select
+                  site_name,
+                  equipment_name,
+                  (syd_percent * 100.0) as deviation
+                from syd
+                where site_name = ?
+                  and date = ?
+                  and (syd_percent * 100.0) < ?
+                order by equipment_name
+                """,
+                [site_name, start_date, float(threshold)]
+            ).fetchdf()
+        
+        # Date Range: Use MEDIAN
+        return con.execute(
+            """
+            select
+              site_name,
+              equipment_name,
+              median(syd_percent * 100.0) as deviation
+            from syd
+            where site_name = ?
+              and date between ? and ?
+            group by 1, 2
+            having median(syd_percent * 100.0) < ?
+            order by equipment_name
+            """,
+            [site_name, start_date, end_date, float(threshold)]
+        ).fetchdf()
+    finally:
+        con.close()
+
+
 # -----------------------------
-# Supabase helpers (comments store)
+# Supabase helpers
 # -----------------------------
 
 
@@ -128,13 +184,6 @@ def _to_iso(d: date) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def fetch_comments(limit: int = 500) -> pd.DataFrame:
-    sb = get_supabase_client(prefer_service_role=True)
-    resp = sb.table("zelestra_comments").select("*").order("created_at", desc=True).limit(int(limit)).execute()
-    rows = resp.data or []
-    return pd.DataFrame(rows)
-
-
 def fetch_comments_live(
     *,
     site_name: Optional[str] = None,
@@ -143,12 +192,6 @@ def fetch_comments_live(
     equipment_name: Optional[str] = None,
     limit: int = 500,
 ) -> pd.DataFrame:
-    """
-    Live fetch from Supabase (no caching) for viewing/filtering.
-
-    Date filter uses overlap semantics:
-      comment.start_date <= end_date AND comment.end_date >= start_date
-    """
     sb = get_supabase_client(prefer_service_role=True)
     q = sb.table("zelestra_comments").select("*").order("created_at", desc=True).limit(int(limit))
 
@@ -162,12 +205,10 @@ def fetch_comments_live(
     elif end_date and not start_date:
         q = q.lte("start_date", end_date.isoformat())
 
-    # Equipment filter: best-effort for array/json column
     if equipment_name:
         try:
             q = q.contains("equipment_names", [equipment_name])
         except Exception:
-            # Fallback: no equipment filter if backend column type doesn't support contains
             pass
 
     resp = q.execute()
@@ -176,19 +217,53 @@ def fetch_comments_live(
 
 
 def _clear_comments_cache() -> None:
-    fetch_comments.clear()
+    pass
 
 
 def insert_comment(payload: dict[str, Any]) -> None:
+    # Add created_by from session state if available
+    user_info = st.session_state.get("user_info", {})
+    username = user_info.get("username")
+    if username:
+        payload["created_by"] = username
+    
     sb = get_supabase_client(prefer_service_role=True)
     sb.table("zelestra_comments").insert(payload).execute()
-    _clear_comments_cache()
+
+
+def insert_bulk_comments(payloads: list[dict[str, Any]]) -> None:
+    """Bulk insert with fallback for integer schema mismatch (Fix for 22P02 error)"""
+    if not payloads:
+        return
+    
+    # Add created_by from session state if available
+    user_info = st.session_state.get("user_info", {})
+    username = user_info.get("username")
+    if username:
+        for p in payloads:
+            p["created_by"] = username
+    
+    sb = get_supabase_client(prefer_service_role=True)
+    try:
+        # Try inserting exactly as provided (likely floats)
+        sb.table("zelestra_comments").insert(payloads).execute()
+    except Exception as e:
+        # Check if error is specifically about integer format "22P02"
+        err_msg = str(e).lower()
+        if "22p02" in err_msg or "invalid input syntax for type integer" in err_msg:
+            # Fallback: Round all deviations to nearest integer and retry
+            for p in payloads:
+                if "deviation" in p:
+                    p["deviation"] = int(round(p["deviation"]))
+            sb.table("zelestra_comments").insert(payloads).execute()
+        else:
+            # Re-raise if it's a different error
+            raise e
 
 
 def update_comment(comment_id: Any, payload: dict[str, Any]) -> None:
     sb = get_supabase_client(prefer_service_role=True)
     sb.table("zelestra_comments").update(payload).eq("id", comment_id).execute()
-    _clear_comments_cache()
 
 
 def _stringify_error(e: Exception) -> str:
@@ -199,18 +274,11 @@ def _stringify_error(e: Exception) -> str:
 
 
 def _needs_int_deviation(err: str) -> bool:
-    """
-    Some Supabase schemas define `deviation` as INTEGER. In that case, inserting
-    a float like -10.0869 fails with 22P02.
-    """
     s = err.lower()
     return ("22p02" in s and "integer" in s) or ("invalid input syntax for type integer" in s)
 
 
 def _write_comment_with_fallback(*, comment_id: Any | None, payload: dict[str, Any], deviation_value: float) -> None:
-    """
-    Write to Supabase. If schema expects INTEGER deviation, retry with rounded int.
-    """
     try:
         if comment_id is None:
             insert_comment(payload)
@@ -231,23 +299,84 @@ def _write_comment_with_fallback(*, comment_id: Any | None, payload: dict[str, A
 
 
 # -----------------------------
-# UI
+# Excel Generation Logic
+# -----------------------------
+
+def generate_excel_template(
+    data: pd.DataFrame, 
+    start_date: date, 
+    end_date: date
+) -> bytes:
+    """
+    Generates an Excel file in memory with:
+    - Pre-filled columns: site_name, deviation, equipment_name, start_date, end_date
+    - User-fillable: reasons, remarks
+    - Data Validation: Dropdown for 'reasons'
+    """
+    output = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bulk Upload"
+
+    # Define headers
+    headers = ["site_name", "deviation", "equipment_name", "reasons", "start_date", "end_date", "remarks"]
+    ws.append(headers)
+
+    # Fill data
+    for _, row in data.iterrows():
+        ws.append([
+            row["site_name"],
+            row["deviation"],
+            row["equipment_name"],
+            "",  # User fills reason
+            start_date,
+            end_date,
+            ""   # User fills remarks
+        ])
+
+    # Create Data Validation for 'reasons' column (Col D = 4)
+    # Excel validation lists must be comma-separated string if simple, or reference a range.
+    # Since REASONS list is long, we'll put it in a separate hidden sheet and reference it.
+    
+    validation_sheet = wb.create_sheet("RefData")
+    validation_sheet.sheet_state = "hidden"
+    for i, r in enumerate(REASONS, 1):
+        validation_sheet.cell(row=i, column=1, value=r)
+    
+    # Define range for validation: RefData!$A$1:$A$N
+    ref_formula = f"RefData!$A$1:$A${len(REASONS)}"
+    
+    dv = DataValidation(type="list", formula1=ref_formula, allow_blank=True)
+    dv.error = "Please select a valid reason from the list"
+    dv.errorTitle = "Invalid Reason"
+    dv.prompt = "Select a reason"
+    dv.promptTitle = "Reason Selection"
+
+    # Apply validation to 'reasons' column (D), rows 2 to 5000
+    ws.add_data_validation(dv)
+    dv.add(f"D2:D{max(len(data) + 100, 500)}")
+
+    # Adjust column widths
+    for col_idx, col_name in enumerate(headers, 1):
+        column_letter = get_column_letter(col_idx)
+        ws.column_dimensions[column_letter].width = 20
+
+    wb.save(output)
+    return output.getvalue()
+
+
+# -----------------------------
+# UI & Logic
 # -----------------------------
 
 
 def _format_equipment_label(equipment_name: str, dev: float) -> str:
-    # Keep the required "deviation_equipment" shape, but make it more readable
     return f"{dev:.2f}%_{equipment_name}"
 
 
 def _reset_comment_form_state(*, default_site: Optional[str], dmin: date, dmax: date) -> None:
-    """
-    Clear all fields after add/update, and exit edit mode.
-    """
     st.session_state["comments_edit_id"] = None
     st.session_state["comments_edit_row"] = None
-    # IMPORTANT: do NOT directly mutate widget-backed keys after instantiation.
-    # Set a pending-reset flag; it will be applied on the next rerun BEFORE widgets are created.
     st.session_state["ac_pending_reset"] = {
         "default_site": default_site,
         "dmin": dmin,
@@ -256,9 +385,6 @@ def _reset_comment_form_state(*, default_site: Optional[str], dmin: date, dmax: 
 
 
 def _ensure_comment_form_state(*, dmin: date, dmax: date) -> None:
-    """
-    Initialize widget keys once so we can reliably clear them later.
-    """
     st.session_state.setdefault("ac_site", None)
     st.session_state.setdefault("ac_threshold", -3.0)
     st.session_state.setdefault("ac_from", None)
@@ -267,13 +393,15 @@ def _ensure_comment_form_state(*, dmin: date, dmax: date) -> None:
     st.session_state.setdefault("ac_reasons", [])
     st.session_state.setdefault("ac_remarks", "")
     st.session_state.setdefault("ac_pending_reset", None)
+    
+    # Upload state
+    st.session_state.setdefault("up_site", None)
+    st.session_state.setdefault("up_threshold", -3.0)
+    st.session_state.setdefault("up_from", None)
+    st.session_state.setdefault("up_to", None)
 
 
 def _render_aggrid_table(df: pd.DataFrame, *, key: str, height: int = 380) -> None:
-    """
-    Render a filterable, hover-highlighted table.
-    Falls back to st.dataframe if AG Grid isn't available.
-    """
     if df is None or df.empty:
         st.info("No comments found.")
         return
@@ -293,7 +421,7 @@ def _render_aggrid_table(df: pd.DataFrame, *, key: str, height: int = 380) -> No
         ".ag-header-cell-label": {"font-weight": "700"},
     }
 
-    AgGrid(  # type: ignore[misc]
+    AgGrid(
         df,
         gridOptions=grid_options,
         theme="balham",
@@ -302,7 +430,7 @@ def _render_aggrid_table(df: pd.DataFrame, *, key: str, height: int = 380) -> No
         allow_unsafe_jscode=False,
         custom_css=custom_css,
         enable_enterprise_modules=False,
-        update_mode=GridUpdateMode.NO_UPDATE,  # type: ignore[union-attr]
+        update_mode=GridUpdateMode.NO_UPDATE,
         key=key,
     )
 
@@ -323,13 +451,10 @@ def render(db_path: str) -> None:
 
     st.session_state.setdefault("comments_edit_id", None)
     st.session_state.setdefault("comments_edit_row", None)
-
-    edit_row = st.session_state.get("comments_edit_row") or {}
-    is_edit_mode = bool(st.session_state.get("comments_edit_id"))
-
+    
     _ensure_comment_form_state(dmin=dmin, dmax=dmax)
 
-    # Apply pending reset BEFORE widgets are instantiated (fixes session_state modification error).
+    # Apply pending reset
     pending = st.session_state.get("ac_pending_reset")
     if isinstance(pending, dict):
         st.session_state["ac_site"] = None
@@ -343,290 +468,322 @@ def render(db_path: str) -> None:
         st.session_state["_ac_prefilled"] = False
         st.session_state["_ac_equipment_prefilled"] = False
 
-    # If a row is loaded for editing, prefill widget state once (and keep it stable).
-    if is_edit_mode and edit_row and not st.session_state.get("_ac_prefilled", False):
-        try:
-            st.session_state["ac_site"] = str(edit_row.get("site_name") or sites[0])
-            st.session_state["ac_threshold"] = float(edit_row.get("threshold") or 2.0)
-            st.session_state["ac_from"] = date.fromisoformat(str(edit_row.get("start_date"))) if edit_row.get("start_date") else dmin
-            st.session_state["ac_to"] = date.fromisoformat(str(edit_row.get("end_date"))) if edit_row.get("end_date") else dmax
-            st.session_state["ac_reasons"] = list(edit_row.get("reasons") or [])
-            st.session_state["ac_remarks"] = str(edit_row.get("remarks") or "")
-        except Exception:
-            pass
-        st.session_state["_ac_prefilled"] = True
-    if not is_edit_mode:
-        st.session_state["_ac_prefilled"] = False
+    edit_row = st.session_state.get("comments_edit_row") or {}
+    is_edit_mode = bool(st.session_state.get("comments_edit_id"))
 
-    if is_edit_mode:
-        st.info("Edit mode: update fields and click **Update**. (Ctrl+Enter will NOT submit.)")
-
-    c1, c2, c3 = st.columns([2.4, 1.2, 2.4])
-    with c1:
-        site_name = st.selectbox("Site Name", options=["(select)", *sites], index=0 if st.session_state.get("ac_site") is None else (sites.index(st.session_state["ac_site"]) + 1 if st.session_state["ac_site"] in sites else 0), key="ac_site")
-        if site_name == "(select)":
-            site_name = None
-    with c2:
-        threshold = st.number_input(
-            "Threshold (%)",
-            min_value=-100.0,
-            max_value=100.0,
-            value=st.session_state.get("ac_threshold") if st.session_state.get("ac_threshold") is not None else -3.0,
-            step=0.1,
-            key="ac_threshold",
-            help="Equipment with SYD deviation (%) below this value will appear in the equipment list.",
-        )
-    with c3:
-        dcol1, dcol2 = st.columns(2)
-        with dcol1:
-            start_date = st.date_input("From", value=st.session_state.get("ac_from"), min_value=dmin, max_value=dmax, key="ac_from")
-        with dcol2:
-            end_date = st.date_input("To", value=st.session_state.get("ac_to"), min_value=dmin, max_value=dmax, key="ac_to")
-
-    if start_date is not None and end_date is not None and start_date > end_date:
-        st.error("From date cannot be after To date.")
-
-    # Equipment candidates based on site/date range/threshold (only if all required fields are filled)
-    cand = pd.DataFrame()
-    if site_name and start_date and end_date and threshold is not None:
-        try:
-            cand = equipment_deviation_candidates(
-                db_path,
-                site_name=str(site_name),
-                start_date=start_date,
-                end_date=end_date,
-                threshold=float(threshold),
-            )
-        except Exception as e:
-            st.error(f"Failed to compute equipment list from `syd`: {e}")
-    elif not site_name or not start_date or not end_date or threshold is None:
-        st.caption("Fill Site Name, Threshold, and Date Range to see equipment list.")
-
-    label_to_equipment: dict[str, str] = {}
-    label_to_dev: dict[str, float] = {}
-    if not cand.empty:
-        for _, r in cand.iterrows():
-            eq = str(r["equipment_name"])
-            dev = float(r["syd_dev_pct"])
-            lbl = _format_equipment_label(eq, dev)
-            label_to_equipment[lbl] = eq
-            label_to_dev[lbl] = dev
-    else:
-        st.caption("No underperforming equipment found for this site/date/threshold. Try adjusting threshold or dates.")
-
-    # If edit row has equipment_names, map them to current dropdown labels (best effort).
-    if is_edit_mode and edit_row and not st.session_state.get("_ac_equipment_prefilled", False):
-        try:
-            desired = [str(x) for x in (edit_row.get("equipment_names") or [])]
-            selected_labels: list[str] = []
-            for eq in desired:
-                matches = [l for l in label_to_equipment.keys() if l.endswith(f"_{eq}") or l.endswith(f"%_{eq}")]
-                if matches:
-                    selected_labels.append(matches[0])
-            st.session_state["ac_equipment_labels"] = selected_labels
-        except Exception:
-            pass
-        st.session_state["_ac_equipment_prefilled"] = True
-    if not is_edit_mode:
-        st.session_state["_ac_equipment_prefilled"] = False
-
-    equipment_labels = st.multiselect(
-        "Equipment Name (auto-generated from SYD)",
-        options=list(label_to_equipment.keys()),
-        key="ac_equipment_labels",
-        help="Only equipment where deviation% < threshold are listed.",
-    )
-
-    reasons = st.multiselect("Reason(s)", options=REASONS, key="ac_reasons")
-    remarks = st.text_area(
-        "Remarks",
-        key="ac_remarks",
-        placeholder="Write a short operational note (what happened / what you observed / next steps)...",
-        height=120,
-    )
-
-    # Friendly preview
-    if equipment_labels:
-        devs = [float(label_to_dev.get(lbl, 0.0)) for lbl in equipment_labels]
-        avg_dev = float(sum(devs) / max(len(devs), 1))
-        st.caption(f"Selected equipment: {len(equipment_labels)} | Average deviation: {avg_dev:.2f}%")
-
-    b1, b3 = st.columns([1.6, 8.4])
-    with b1:
-        do_save = st.button("Update" if is_edit_mode else "Add Comment", type="primary", use_container_width=True)
-    with b3:
+    # ==========================
+    # 1. MANUAL ENTRY EXPANDER
+    # ==========================
+    # Auto-expand if in edit mode, otherwise collapsed by default
+    manual_expanded = is_edit_mode 
+    with st.expander("Manual Entry", expanded=manual_expanded):
+        
+        # Prefill if edit mode
+        if is_edit_mode and edit_row and not st.session_state.get("_ac_prefilled", False):
+            try:
+                st.session_state["ac_site"] = str(edit_row.get("site_name") or sites[0])
+                st.session_state["ac_threshold"] = float(edit_row.get("threshold") or 2.0)
+                st.session_state["ac_from"] = date.fromisoformat(str(edit_row.get("start_date"))) if edit_row.get("start_date") else dmin
+                st.session_state["ac_to"] = date.fromisoformat(str(edit_row.get("end_date"))) if edit_row.get("end_date") else dmax
+                st.session_state["ac_reasons"] = list(edit_row.get("reasons") or [])
+                st.session_state["ac_remarks"] = str(edit_row.get("remarks") or "")
+            except Exception:
+                pass
+            st.session_state["_ac_prefilled"] = True
+        
         if is_edit_mode:
-            st.caption("Update will modify the selected Supabase record. Use 'Clear edit mode' below to start a new comment.")
-        else:
-            st.caption("Add Comment saves a new Supabase record. Ctrl+Enter only adds a new line in remarks.")
-    # No separate Clear button as requested (auto-clear after submit/update).
+            st.info("Edit mode: update fields and click **Update**.")
 
-    if do_save:
-        if start_date is None or end_date is None:
-            st.error("Please select both From and To dates.")
-            return
-        if start_date > end_date:
-            st.error("Fix date range first.")
-            return
-        if not equipment_labels:
-            st.error("Select at least one equipment.")
-            return
+        c1, c2, c3 = st.columns([2.4, 1.2, 2.4])
+        with c1:
+            site_name = st.selectbox(
+                "Site Name", 
+                options=["(select)", *sites], 
+                index=0 if st.session_state.get("ac_site") is None else (sites.index(st.session_state["ac_site"]) + 1 if st.session_state["ac_site"] in sites else 0), 
+                key="ac_site"
+            )
+            if site_name == "(select)": site_name = None
+        with c2:
+            threshold = st.number_input("Threshold (%)", min_value=-100.0, max_value=100.0, step=0.1, key="ac_threshold")
+        with c3:
+            dcol1, dcol2 = st.columns(2)
+            with dcol1: start_date = st.date_input("From", min_value=dmin, max_value=dmax, key="ac_from")
+            with dcol2: end_date = st.date_input("To", min_value=dmin, max_value=dmax, key="ac_to")
 
-        equipment_names = [label_to_equipment[lbl] for lbl in equipment_labels]
-        deviations = [float(label_to_dev.get(lbl, 0.0)) for lbl in equipment_labels]
-        deviation_value = float(sum(deviations) / max(len(deviations), 1))
+        if start_date and end_date and start_date > end_date:
+            st.error("From date cannot be after To date.")
 
-        payload: dict[str, Any] = {
-            "site_name": str(site_name),
-            "start_date": _to_iso(start_date),
-            "end_date": _to_iso(end_date),
-            "equipment_names": equipment_names,
-            "reasons": reasons,
-            "remarks": remarks,
-            # Store deviation as numeric (Supabase should handle float, but ensure it's a number not string)
-            "deviation": round(deviation_value, 6),  # Round to avoid precision issues
-        }
-        # Note: threshold is not stored in Supabase as per user requirement
+        # Candidate logic
+        cand = pd.DataFrame()
+        if site_name and start_date and end_date and threshold is not None:
+            try:
+                cand = equipment_deviation_candidates(db_path, site_name=str(site_name), start_date=start_date, end_date=end_date, threshold=float(threshold))
+            except Exception as e:
+                st.error(f"Failed to fetch equipment: {e}")
 
-        try:
-            comment_id = st.session_state.get("comments_edit_id")
-            _write_comment_with_fallback(comment_id=comment_id, payload=payload, deviation_value=deviation_value)
-            if comment_id is None:
-                st.success("Comment saved successfully")
+        label_to_equipment = {}
+        label_to_dev = {}
+        if not cand.empty:
+            for _, r in cand.iterrows():
+                eq = str(r["equipment_name"])
+                dev = float(r["syd_dev_pct"])
+                lbl = _format_equipment_label(eq, dev)
+                label_to_equipment[lbl] = eq
+                label_to_dev[lbl] = dev
+        
+        # Prefill equipment for edit
+        if is_edit_mode and edit_row and not st.session_state.get("_ac_equipment_prefilled", False):
+            try:
+                desired = [str(x) for x in (edit_row.get("equipment_names") or [])]
+                selected_labels = []
+                for eq in desired:
+                    matches = [l for l in label_to_equipment.keys() if l.endswith(f"_{eq}") or l.endswith(f"%_{eq}")]
+                    if matches: selected_labels.append(matches[0])
+                st.session_state["ac_equipment_labels"] = selected_labels
+            except Exception: pass
+            st.session_state["_ac_equipment_prefilled"] = True
+
+        equipment_labels = st.multiselect("Equipment Name", options=list(label_to_equipment.keys()), key="ac_equipment_labels")
+        reasons = st.multiselect("Reason(s)", options=REASONS, key="ac_reasons")
+        remarks = st.text_area("Remarks", key="ac_remarks", height=100)
+
+        if equipment_labels:
+            devs = [float(label_to_dev.get(lbl, 0.0)) for lbl in equipment_labels]
+            avg_dev = float(sum(devs) / max(len(devs), 1))
+            st.caption(f"Selected: {len(equipment_labels)} | Avg Deviation: {avg_dev:.2f}%")
+
+        if st.button("Update" if is_edit_mode else "Add Comment", type="primary"):
+            if not site_name or not start_date or not end_date:
+                st.error("Missing required fields.")
+            elif not equipment_labels:
+                st.error("Select equipment.")
             else:
-                st.success("Comment updated successfully")
-            # Clear all fields after add/update as requested
-            _reset_comment_form_state(default_site=None, dmin=dmin, dmax=dmax)
-            st.rerun()
-        except Exception as e:
-            st.error(f"Supabase write failed: {e}")
+                eq_names = [label_to_equipment[lbl] for lbl in equipment_labels]
+                deviations = [float(label_to_dev.get(lbl, 0.0)) for lbl in equipment_labels]
+                deviation_val = float(sum(deviations) / max(len(deviations), 1))
+                
+                payload = {
+                    "site_name": str(site_name),
+                    "start_date": _to_iso(start_date),
+                    "end_date": _to_iso(end_date),
+                    "equipment_names": eq_names,
+                    "reasons": reasons,
+                    "remarks": remarks,
+                    "deviation": round(deviation_val, 6)
+                }
+                try:
+                    comment_id = st.session_state.get("comments_edit_id")
+                    _write_comment_with_fallback(comment_id=comment_id, payload=payload, deviation_value=deviation_val)
+                    st.success("Success!")
+                    _reset_comment_form_state(default_site=None, dmin=dmin, dmax=dmax)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-    # Edit picker (moved BELOW submit form as requested)
+    # ==========================
+    # 2. BULK UPLOAD EXPANDER
+    # ==========================
+    with st.expander("Bulk Upload", expanded=False):
+        st.info("Download data for underperforming equipment, fill in 'reasons' and 'remarks', then upload.")
+        
+        # --- Download Section ---
+        c_up1, c_up2, c_up3 = st.columns([2, 1, 2])
+        with c_up1:
+            up_site = st.selectbox("Site Name", options=["(select)", *sites], key="up_site")
+        with c_up2:
+            up_thresh = st.number_input("Threshold (%)", value=-3.0, step=0.1, key="up_thresh")
+        with c_up3:
+            uc1, uc2 = st.columns(2)
+            # Avoid widget warning: only set default value if session state doesn't have it
+            up_from_val = st.session_state.get("up_from") if "up_from" in st.session_state else dmin
+            up_to_val = st.session_state.get("up_to") if "up_to" in st.session_state else dmax
+            with uc1: up_from = st.date_input("From", value=up_from_val, min_value=dmin, max_value=dmax, key="up_from")
+            with uc2: up_to = st.date_input("To", value=up_to_val, min_value=dmin, max_value=dmax, key="up_to")
+
+        download_df = pd.DataFrame()
+        if up_site != "(select)" and up_from and up_to:
+            # Check button click
+            try:
+                download_df = fetch_download_candidates(
+                    db_path, 
+                    site_name=str(up_site), 
+                    start_date=up_from, 
+                    end_date=up_to, 
+                    threshold=float(up_thresh)
+                )
+            except Exception as e:
+                st.error(f"Error fetching data: {e}")
+
+        if not download_df.empty:
+            st.write(f"Found {len(download_df)} equipment(s) below {up_thresh}%.")
+            excel_bytes = generate_excel_template(download_df, up_from, up_to)
+            
+            st.download_button(
+                label="Download Excel Template",
+                data=excel_bytes,
+                file_name=f"Upload_{up_site}_{up_from}_{up_to}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_download_template"
+            )
+        elif up_site != "(select)":
+            st.caption("No equipment found matching criteria.")
+
+        st.markdown("---")
+        
+        # --- Upload Section ---
+        uploaded_file = st.file_uploader("Upload Filled Excel", type=["xlsx"], key="up_file")
+        
+        if uploaded_file:
+            try:
+                # Use engine='openpyxl' specifically to handle data validation warnings gracefully
+                df_up = pd.read_excel(uploaded_file, engine="openpyxl")
+                
+                # Basic validation
+                req_cols = ["site_name", "deviation", "equipment_name", "reasons", "start_date", "end_date", "remarks"]
+                missing = [c for c in req_cols if c not in df_up.columns]
+                
+                if missing:
+                    st.error(f"Invalid format. Missing columns: {missing}")
+                else:
+                    st.success("Format OK. Ready to submit.")
+                    
+                    if st.button("Submit to Supabase", type="primary"):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        payloads = []
+                        valid_rows = True
+                        
+                        total_rows = len(df_up)
+                        for i, row in df_up.iterrows():
+                            # Update progress
+                            progress_bar.progress(int((i / total_rows) * 90))
+                            
+                            # Row validation
+                            s_name = str(row["site_name"])
+                            eq_name = str(row["equipment_name"])
+                            reason_raw = str(row["reasons"]) if pd.notna(row["reasons"]) else ""
+                            remark_raw = str(row["remarks"]) if pd.notna(row["remarks"]) else ""
+                            dev_val = float(row["deviation"]) if pd.notna(row["deviation"]) else 0.0
+                            
+                            # Date parsing
+                            try:
+                                sd = pd.to_datetime(row["start_date"]).strftime("%Y-%m-%d")
+                                ed = pd.to_datetime(row["end_date"]).strftime("%Y-%m-%d")
+                            except Exception:
+                                st.error(f"Row {i+2}: Invalid Date format.")
+                                valid_rows = False
+                                break
+                            
+                            if not reason_raw.strip():
+                                st.error(f"Row {i+2}: Reason is mandatory.")
+                                valid_rows = False
+                                break
+                                
+                            # Supabase expects lists for equipment_names and reasons
+                            payloads.append({
+                                "site_name": s_name,
+                                "start_date": sd,
+                                "end_date": ed,
+                                "equipment_names": [eq_name],  # Single equipment per row as per requirement
+                                "reasons": [reason_raw],       # Single reason from dropdown
+                                "remarks": remark_raw,
+                                "deviation": round(dev_val, 6)
+                            })
+
+                        if valid_rows and payloads:
+                            try:
+                                insert_bulk_comments(payloads)
+                                progress_bar.progress(100)
+                                status_text.text("Upload Complete.")
+                                
+                                # Success message that persists
+                                placeholder = st.empty()
+                                placeholder.success(f"Successfully submitted {len(payloads)} records!")
+                                time.sleep(10)  # Wait 10 seconds before resetting form
+                                
+                                # Reset bulk upload form fields
+                                st.session_state["up_site"] = None
+                                st.session_state["up_thresh"] = -3.0
+                                st.session_state["up_from"] = None
+                                st.session_state["up_to"] = None
+                                st.session_state["up_file"] = None  # Clear uploaded file
+                                
+                                placeholder.empty()
+                                st.rerun()
+                                
+                            except Exception as e:
+                                st.error(f"Supabase submission failed: {e}")
+                        else:
+                             progress_bar.empty()
+
+            except Exception as e:
+                st.error(f"Failed to process file: {e}")
+
+
+    # ==========================
+    # 3. EXISTING COMMENTS & EDIT UI
+    # ==========================
     st.write("")
     with st.expander("Edit existing comment", expanded=False):
         try:
             existing_for_edit = fetch_comments_live(limit=500)
-        except Exception as e:
-            st.error(f"Failed to fetch Supabase comments: {e}")
+        except Exception:
             existing_for_edit = pd.DataFrame()
 
         if existing_for_edit.empty:
-            st.info("No comments found in Supabase.")
-            return
+            st.info("No comments found.")
+        else:
+            def _label_row(r):
+                sid = str(r.get("site_name",""))
+                sd = str(r.get("start_date",""))
+                eq_raw = r.get("equipment_names")
+                if isinstance(eq_raw, list):
+                    eq = ", ".join(str(v) for v in eq_raw)
+                else:
+                    eq = str(eq_raw) if eq_raw is not None else ""
+                return f"{sid} | {sd} | {eq}"
+            
+            labels = [_label_row(existing_for_edit.iloc[i]) for i in range(len(existing_for_edit))]
+            label_to_idx = {labels[i]: i for i in range(len(labels))}
+            picked = st.selectbox("Pick comment", ["(none)", *labels], key="ac_edit_pick")
 
-        if "id" not in existing_for_edit.columns:
-            st.warning("Supabase rows have no `id` column; update flow requires a primary key.")
-            return
-
-        def _equip_label(v: Any) -> str:
-            if isinstance(v, list):
-                if not v:
-                    return ""
-                return "+".join(str(x) for x in v[:3]) + ("…" if len(v) > 3 else "")
-            return str(v or "")
-
-        def _label_row(r: pd.Series) -> str:
-            sid = str(r.get("site_name", "") or "")
-            sd = str(r.get("start_date", "") or "")
-            ed = str(r.get("end_date", "") or "")
-            eq = _equip_label(r.get("equipment_names"))
-            try:
-                dv = float(r.get("deviation"))
-                dv_s = f"{dv:.2f}%"
-            except Exception:
-                dv_s = str(r.get("deviation", "") or "")
-            return f"{sid} | {sd} → {ed} | {eq}_{dv_s}"
-
-        labels = [_label_row(existing_for_edit.iloc[i]) for i in range(len(existing_for_edit))]
-        label_to_idx = {labels[i]: i for i in range(len(labels))}
-        picked = st.selectbox("Select a comment to load into the form above", options=["(none)", *labels], index=0, key="ac_edit_pick")
-
-        c_actions, c_note = st.columns([1.6, 8.4], vertical_alignment="center")
-        with c_actions:
-            if st.button("Load", use_container_width=True, disabled=(picked == "(none)"), key="ac_edit_load"):
-                row = existing_for_edit.iloc[label_to_idx[picked]].to_dict()
-                st.session_state["comments_edit_id"] = row.get("id")
-                st.session_state["comments_edit_row"] = row
-                st.rerun()
-            if st.button("Clear edit mode", use_container_width=True, disabled=not bool(st.session_state.get("comments_edit_id")), key="ac_edit_clear"):
-                _reset_comment_form_state(default_site=None, dmin=dmin, dmax=dmax)
-                st.rerun()
-        with c_note:
-            st.caption("Pick a comment, click Load to prefill. Clear exits edit mode.")
+            c_act, c_note = st.columns([1.6, 8.4])
+            with c_act:
+                if st.button("Load", disabled=(picked=="(none)"), key="ac_edit_load"):
+                    row = existing_for_edit.iloc[label_to_idx[picked]].to_dict()
+                    st.session_state["comments_edit_id"] = row.get("id")
+                    st.session_state["comments_edit_row"] = row
+                    st.rerun()
+                if st.button("Clear edit mode", disabled=not is_edit_mode, key="ac_edit_clear"):
+                    _reset_comment_form_state(default_site=None, dmin=dmin, dmax=dmax)
+                    st.rerun()
 
     st.write("")
     with st.expander("Existing Comments (table)", expanded=False):
-        # Filters (only affect this table)
-        f1, f2, f3, f4 = st.columns([2.2, 2.0, 2.0, 3.8], vertical_alignment="bottom")
-        with f1:
-            f_site = st.selectbox("Filter: Site Name", options=["(all)", *sites], index=0, key="ac_exist_site")
-            if f_site == "(all)":
-                f_site = None
-        with f2:
-            f_from = st.date_input("Filter: From", value=None, min_value=dmin, max_value=dmax, key="ac_exist_from")
-        with f3:
-            f_to = st.date_input("Filter: To", value=None, min_value=dmin, max_value=dmax, key="ac_exist_to")
-
-        # Fetch live (no cache)
+        f1, f2, f3 = st.columns([2.2, 2.0, 2.0])
+        with f1: f_site = st.selectbox("Filter: Site", ["(all)", *sites], key="ac_exist_site")
+        with f2: f_from = st.date_input("Filter: From", value=None, min_value=dmin, max_value=dmax, key="ac_exist_from")
+        with f3: f_to = st.date_input("Filter: To", value=None, min_value=dmin, max_value=dmax, key="ac_exist_to")
+        
+        fs = None if f_site == "(all)" else f_site
         try:
-            base = fetch_comments_live(site_name=f_site, start_date=f_from, end_date=f_to, limit=500)
+            base = fetch_comments_live(site_name=fs, start_date=f_from, end_date=f_to, limit=500)
+            if not base.empty:
+                # Format equipment_names and reasons columns (convert lists to comma-separated strings)
+                if "equipment_names" in base.columns:
+                    base["equipment_names"] = base["equipment_names"].apply(
+                        lambda x: ", ".join(str(v) for v in x) if isinstance(x, list) else (str(x) if x is not None else "")
+                    )
+                if "reasons" in base.columns:
+                    base["reasons"] = base["reasons"].apply(
+                        lambda x: ", ".join(str(v) for v in x) if isinstance(x, list) else (str(x) if x is not None else "")
+                    )
+                # Remove columns that should not be displayed
+                columns_to_hide = ["id", "created_by", "created_at"]
+                display_df = base.drop(columns=[c for c in columns_to_hide if c in base.columns])
+                _render_aggrid_table(display_df, key="ac_existing_comments")
+            else:
+                st.info("No records.")
         except Exception as e:
-            st.error(f"Failed to fetch Supabase comments: {e}")
-            base = pd.DataFrame()
-
-        # Build equipment options from current result set
-        eq_opts: list[str] = []
-        if not base.empty and "equipment_names" in base.columns:
-            vals: set[str] = set()
-            for v in base["equipment_names"].tolist():
-                if isinstance(v, list):
-                    vals.update(str(x) for x in v if str(x).strip())
-                elif v:
-                    vals.add(str(v))
-            eq_opts = sorted(vals)
-
-        with f4:
-            f_eq = st.selectbox("Filter: Equipment Name", options=["(all)", *eq_opts], index=0, key="ac_exist_eq")
-            if f_eq == "(all)":
-                f_eq = None
-
-        if f_eq:
-            # apply equipment filter via a second live query (no cache)
-            try:
-                base = fetch_comments_live(site_name=f_site, start_date=f_from, end_date=f_to, equipment_name=f_eq, limit=500)
-            except Exception as e:
-                st.error(f"Failed to fetch Supabase comments: {e}")
-                base = pd.DataFrame()
-
-        if base.empty:
-            st.info("No comments found for the selected filters.")
-            return
-
-        show = base.copy()
-        col_order = [
-            "start_date",
-            "end_date",
-            "site_name",
-            "deviation",
-            "equipment_names",
-            "reasons",
-            "remarks",
-        ]
-        cols = [c for c in col_order if c in show.columns] + [c for c in show.columns if c not in col_order]
-        show = show[cols]
-        if "deviation" in show.columns:
-            show["deviation"] = pd.to_numeric(show["deviation"], errors="coerce")
-        if "equipment_names" in show.columns:
-            show["equipment_names"] = show["equipment_names"].apply(
-                lambda x: ", ".join(str(v) for v in x) if isinstance(x, list) else (str(x) if x is not None else "")
-            )
-        if "reasons" in show.columns:
-            show["reasons"] = show["reasons"].apply(
-                lambda x: ", ".join(str(v) for v in x) if isinstance(x, list) else (str(x) if x is not None else "")
-            )
-        _render_aggrid_table(show, key="ac_existing_comments", height=380)
-
-
-
-
-
+            st.error(str(e))

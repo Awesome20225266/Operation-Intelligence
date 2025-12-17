@@ -17,6 +17,7 @@ import operation_theatre
 import add_comments
 import meta_viewer
 from aws_duckdb import get_duckdb_connection
+import auth
 
 # -----------------------------
 # App config
@@ -35,6 +36,13 @@ st.set_page_config(
         'About': None
     }
 )
+
+# -----------------------------
+# Authentication (Must be first)
+# -----------------------------
+
+if not auth.check_password():
+    st.stop()  # Do not run the rest of the app if not authenticated
 
 
 # -----------------------------
@@ -914,6 +922,13 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
+            # User info
+            user_info = st.session_state.get("user_info", {})
+            username = user_info.get("username", "Unknown")
+            st.markdown(f"### Welcome, **{username}**")
+
+            st.markdown("<div class='sb-divider'></div>", unsafe_allow_html=True)
+
             nav_items = [
                 ("portfolio", "📊  Portfolio Analytics"),
                 ("operation", "🏥  Operation Theatre"),
@@ -929,6 +944,11 @@ def main() -> None:
                 if st.button(label, key=f"nav_{key}", type=btn_type, use_container_width=True):
                     st.session_state.nav_page = key
                     st.rerun()
+            
+            # Logout button at the bottom
+            st.markdown("<div class='sb-divider'></div>", unsafe_allow_html=True)
+            if st.button("🚪 Logout", use_container_width=True, type="secondary"):
+                auth.logout()
     except Exception as e:
         st.error(f"Sidebar error: {e}")
         # Fallback: show sidebar content in main area for debugging
