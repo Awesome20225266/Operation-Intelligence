@@ -27,12 +27,11 @@ def _get_secret(name: str) -> Optional[str]:
 
 def _ensure_db_local(db_local: str = "master.duckdb") -> str:
     """
-    Ensure DuckDB file is present locally; if missing, download from S3 once.
+    Ensure DuckDB file is present locally; downloads from S3 if missing or if S3 object changed (ETag-based).
     Uses a simple lockfile to avoid parallel downloads in the same environment.
     """
     local_path = Path(db_local)
-    if local_path.exists() and local_path.stat().st_size > 0:
-        return str(local_path)
+    etag_path = local_path.with_suffix(local_path.suffix + ".etag")
 
     aws_access_key_id = _get_secret("AWS_ACCESS_KEY_ID")
     aws_secret_access_key = _get_secret("AWS_SECRET_ACCESS_KEY")
@@ -55,6 +54,35 @@ def _ensure_db_local(db_local: str = "master.duckdb") -> str:
             + ". Set them in `.streamlit/secrets.toml` (local) or Streamlit Cloud Secrets."
         )
 
+    import boto3  # type: ignore
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=aws_region,
+    )
+
+    # Get current S3 ETag (before lock to avoid unnecessary lock acquisition)
+    try:
+        s3_response = s3.head_object(Bucket=s3_bucket, Key=s3_key)
+        current_s3_etag = s3_response.get("ETag", "").strip('"')
+    except Exception as e:
+        # If head_object fails, fall back to checking if local file exists
+        if local_path.exists() and local_path.stat().st_size > 0:
+            return str(local_path)
+        raise RuntimeError(f"Failed to check S3 object freshness: {e}") from e
+
+    # Fast path: local DB exists, .etag file exists, and ETags match
+    if local_path.exists() and local_path.stat().st_size > 0 and etag_path.exists():
+        try:
+            stored_etag = etag_path.read_text().strip()
+            if stored_etag == current_s3_etag:
+                return str(local_path)
+        except Exception:
+            # If .etag file is corrupted/unreadable, treat as "needs refresh"
+            pass
+
     # Lockfile (best-effort)
     lock_path = local_path.with_suffix(local_path.suffix + ".lock")
     start = time.time()
@@ -65,26 +93,29 @@ def _ensure_db_local(db_local: str = "master.duckdb") -> str:
             os.close(fd)
             break
         except FileExistsError:
-            if local_path.exists() and local_path.stat().st_size > 0:
-                return str(local_path)
+            # After lock wait, check again if another process downloaded it
+            if local_path.exists() and local_path.stat().st_size > 0 and etag_path.exists():
+                try:
+                    stored_etag = etag_path.read_text().strip()
+                    if stored_etag == current_s3_etag:
+                        return str(local_path)
+                except Exception:
+                    pass
             if time.time() - start > 120:
                 raise RuntimeError(f"Timed out waiting for lock: {lock_path}")
             time.sleep(0.2)
 
     try:
-        # Check again after acquiring lock
-        if local_path.exists() and local_path.stat().st_size > 0:
-            return str(local_path)
+        # Check again after acquiring lock (another process might have downloaded)
+        if local_path.exists() and local_path.stat().st_size > 0 and etag_path.exists():
+            try:
+                stored_etag = etag_path.read_text().strip()
+                if stored_etag == current_s3_etag:
+                    return str(local_path)
+            except Exception:
+                pass
 
-        import boto3  # type: ignore
-
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            region_name=aws_region,
-        )
-
+        # Download fresh DuckDB from S3
         tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
         if tmp_path.exists():
             try:
@@ -93,6 +124,14 @@ def _ensure_db_local(db_local: str = "master.duckdb") -> str:
                 pass
         s3.download_file(s3_bucket, s3_key, str(tmp_path))
         os.replace(str(tmp_path), str(local_path))
+
+        # Store the ETag after successful download
+        try:
+            etag_path.write_text(current_s3_etag)
+        except Exception:
+            # Non-fatal: ETag storage failed, but DB download succeeded
+            pass
+
         return str(local_path)
     finally:
         try:
@@ -104,7 +143,7 @@ def _ensure_db_local(db_local: str = "master.duckdb") -> str:
 def get_duckdb_connection(db_local: str = "master.duckdb") -> duckdb.DuckDBPyConnection:
     """
     Always returns a READ-ONLY DuckDB connection to the locally cached DB.
-    Downloads from S3 only if the file is missing locally.
+    Downloads from S3 if the file is missing locally or if the S3 object has changed (ETag-based freshness check).
     """
     path = _ensure_db_local(db_local=db_local)
     return duckdb.connect(path, read_only=True)

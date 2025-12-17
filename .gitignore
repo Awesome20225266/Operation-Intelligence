@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local secrets (do not commit)
+.streamlit/secrets.toml
+
+# Local DB copies / artifacts (optional)
+*.duckdb.wal
+*.duckdb.tmp
+
+
+
