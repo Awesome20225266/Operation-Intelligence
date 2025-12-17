@@ -396,9 +396,11 @@ def _ensure_comment_form_state(*, dmin: date, dmax: date) -> None:
     
     # Upload state
     st.session_state.setdefault("up_site", None)
-    st.session_state.setdefault("up_threshold", -3.0)
+    st.session_state.setdefault("up_thresh", -3.0)
     st.session_state.setdefault("up_from", None)
     st.session_state.setdefault("up_to", None)
+    st.session_state.setdefault("up_pending_reset", None)
+    st.session_state.setdefault("up_file_counter", 0)  # Counter for file uploader key
 
 
 def _render_aggrid_table(df: pd.DataFrame, *, key: str, height: int = 380) -> None:
@@ -454,7 +456,7 @@ def render(db_path: str) -> None:
     
     _ensure_comment_form_state(dmin=dmin, dmax=dmax)
 
-    # Apply pending reset
+    # Apply pending reset for manual entry
     pending = st.session_state.get("ac_pending_reset")
     if isinstance(pending, dict):
         st.session_state["ac_site"] = None
@@ -467,6 +469,17 @@ def render(db_path: str) -> None:
         st.session_state["ac_pending_reset"] = None
         st.session_state["_ac_prefilled"] = False
         st.session_state["_ac_equipment_prefilled"] = False
+
+    # Apply pending reset for bulk upload (BEFORE widgets are created)
+    up_pending = st.session_state.get("up_pending_reset")
+    if up_pending is True:
+        st.session_state["up_site"] = None
+        st.session_state["up_thresh"] = -3.0
+        st.session_state["up_from"] = None
+        st.session_state["up_to"] = None
+        # Increment file uploader counter to force new widget instance (file uploaders can't be reset via session state)
+        st.session_state["up_file_counter"] = st.session_state.get("up_file_counter", 0) + 1
+        st.session_state["up_pending_reset"] = None
 
     edit_row = st.session_state.get("comments_edit_row") or {}
     is_edit_mode = bool(st.session_state.get("comments_edit_id"))
@@ -631,7 +644,9 @@ def render(db_path: str) -> None:
         st.markdown("---")
         
         # --- Upload Section ---
-        uploaded_file = st.file_uploader("Upload Filled Excel", type=["xlsx"], key="up_file")
+        # Use dynamic key based on counter to allow reset (file uploaders can't be reset via session state)
+        file_uploader_key = f"up_file_{st.session_state.get('up_file_counter', 0)}"
+        uploaded_file = st.file_uploader("Upload Filled Excel", type=["xlsx"], key=file_uploader_key)
         
         if uploaded_file:
             try:
@@ -645,77 +660,117 @@ def render(db_path: str) -> None:
                 if missing:
                     st.error(f"Invalid format. Missing columns: {missing}")
                 else:
-                    st.success("Format OK. Ready to submit.")
+                    # Validate all rows first before showing submit button
+                    validation_results = []
+                    valid_payloads = []
+                    invalid_rows = []
                     
-                    if st.button("Submit to Supabase", type="primary"):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
+                    for i, row in df_up.iterrows():
+                        row_num = i + 2  # Excel row number (accounting for header)
+                        errors = []
                         
-                        payloads = []
-                        valid_rows = True
+                        # Extract values
+                        s_name = str(row["site_name"]) if pd.notna(row["site_name"]) else ""
+                        eq_name = str(row["equipment_name"]) if pd.notna(row["equipment_name"]) else ""
+                        reason_raw = str(row["reasons"]) if pd.notna(row["reasons"]) else ""
+                        remark_raw = str(row["remarks"]) if pd.notna(row["remarks"]) else ""
+                        dev_val = row["deviation"] if pd.notna(row["deviation"]) else None
                         
-                        total_rows = len(df_up)
-                        for i, row in df_up.iterrows():
-                            # Update progress
-                            progress_bar.progress(int((i / total_rows) * 90))
-                            
-                            # Row validation
-                            s_name = str(row["site_name"])
-                            eq_name = str(row["equipment_name"])
-                            reason_raw = str(row["reasons"]) if pd.notna(row["reasons"]) else ""
-                            remark_raw = str(row["remarks"]) if pd.notna(row["remarks"]) else ""
-                            dev_val = float(row["deviation"]) if pd.notna(row["deviation"]) else 0.0
-                            
-                            # Date parsing
-                            try:
+                        # Validate required fields
+                        if not reason_raw.strip():
+                            errors.append("Reason is missing")
+                        
+                        if not remark_raw.strip():
+                            errors.append("Remarks is missing")
+                        
+                        # Validate dates
+                        sd = None
+                        ed = None
+                        try:
+                            if pd.notna(row["start_date"]):
                                 sd = pd.to_datetime(row["start_date"]).strftime("%Y-%m-%d")
+                            else:
+                                errors.append("Start date is missing")
+                        except Exception:
+                            errors.append("Start date is invalid")
+                        
+                        try:
+                            if pd.notna(row["end_date"]):
                                 ed = pd.to_datetime(row["end_date"]).strftime("%Y-%m-%d")
-                            except Exception:
-                                st.error(f"Row {i+2}: Invalid Date format.")
-                                valid_rows = False
-                                break
-                            
-                            if not reason_raw.strip():
-                                st.error(f"Row {i+2}: Reason is mandatory.")
-                                valid_rows = False
-                                break
-                                
-                            # Supabase expects lists for equipment_names and reasons
-                            payloads.append({
+                            else:
+                                errors.append("End date is missing")
+                        except Exception:
+                            errors.append("End date is invalid")
+                        
+                        # Validate deviation
+                        if dev_val is None:
+                            errors.append("Deviation is missing")
+                        else:
+                            try:
+                                dev_val = float(dev_val)
+                            except (ValueError, TypeError):
+                                errors.append("Deviation is invalid")
+                                dev_val = None
+                        
+                        # If all valid, add to payloads
+                        if not errors and sd and ed and dev_val is not None:
+                            valid_payloads.append({
                                 "site_name": s_name,
                                 "start_date": sd,
                                 "end_date": ed,
-                                "equipment_names": [eq_name],  # Single equipment per row as per requirement
-                                "reasons": [reason_raw],       # Single reason from dropdown
+                                "equipment_names": [eq_name],
+                                "reasons": [reason_raw],
                                 "remarks": remark_raw,
                                 "deviation": round(dev_val, 6)
                             })
-
-                        if valid_rows and payloads:
+                        else:
+                            invalid_rows.append({
+                                "row": row_num,
+                                "equipment": eq_name,
+                                "errors": errors
+                            })
+                    
+                    # Show validation summary
+                    total_rows = len(df_up)
+                    valid_count = len(valid_payloads)
+                    invalid_count = len(invalid_rows)
+                    
+                    if invalid_count == 0:
+                        st.success(f"✅ All good! All {valid_count} row(s) are valid and ready to submit.")
+                    else:
+                        st.warning(f"⚠️ Validation: {valid_count} valid row(s), {invalid_count} invalid row(s) will be rejected.")
+                        
+                        # Show invalid rows details
+                        with st.expander(f"View {invalid_count} rejected row(s)", expanded=False):
+                            for inv in invalid_rows:
+                                st.error(f"Row {inv['row']} (Equipment: {inv['equipment']}): {', '.join(inv['errors'])}")
+                    
+                    # Only show submit button if there are valid rows
+                    if valid_count > 0:
+                        if st.button("Submit to Supabase", type="primary"):
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
                             try:
-                                insert_bulk_comments(payloads)
+                                insert_bulk_comments(valid_payloads)
                                 progress_bar.progress(100)
                                 status_text.text("Upload Complete.")
                                 
                                 # Success message that persists
                                 placeholder = st.empty()
-                                placeholder.success(f"Successfully submitted {len(payloads)} records!")
+                                placeholder.success(f"Successfully submitted {len(valid_payloads)} record(s)!")
                                 time.sleep(10)  # Wait 10 seconds before resetting form
                                 
-                                # Reset bulk upload form fields
-                                st.session_state["up_site"] = None
-                                st.session_state["up_thresh"] = -3.0
-                                st.session_state["up_from"] = None
-                                st.session_state["up_to"] = None
-                                st.session_state["up_file"] = None  # Clear uploaded file
+                                # Set pending reset flag (will be applied on next rerun, before widgets are created)
+                                st.session_state["up_pending_reset"] = True
                                 
                                 placeholder.empty()
                                 st.rerun()
                                 
                             except Exception as e:
                                 st.error(f"Supabase submission failed: {e}")
-                        else:
-                             progress_bar.empty()
+                    else:
+                        st.error("❌ No valid rows to submit. Please fix the errors and re-upload.")
 
             except Exception as e:
                 st.error(f"Failed to process file: {e}")
