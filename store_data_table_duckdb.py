@@ -164,7 +164,11 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _read_excel_sheet_safe(path: Path, sheet_name: str, *, header: int = 0) -> Optional[pd.DataFrame]:
     try:
-        df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl", header=header)
+        # Prefer calamine (Rust-based) for speed; fall back to openpyxl.
+        try:
+            df = pd.read_excel(path, sheet_name=sheet_name, engine="calamine", header=header)
+        except Exception:
+            df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl", header=header)
         return _normalize_columns(df)
     except ValueError as e:
         # Sheet missing

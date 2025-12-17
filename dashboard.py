@@ -274,8 +274,6 @@ class Filters:
 
 
 def _connect(db_path: str) -> duckdb.DuckDBPyConnection:
-    # Always use the shared, read-only DuckDB connection helper (S3-backed if needed).
-    # Keeps signatures stable so business logic/queries remain unchanged.
     return get_duckdb_connection(db_local=db_path)
 
 
@@ -496,7 +494,6 @@ def _plotly_base_layout(title: str, *, x_title: str | None = None, y_title: str 
         hovermode="x unified",
     )
 
-    # Plotly v6+ uses axis.title.font (not titlefont)
     title_font = dict(color="#475569", size=12)
     if x_title:
         layout["xaxis"]["title"] = dict(text=x_title, font=title_font)
@@ -513,14 +510,11 @@ def plot_area_actual_vs_target(
     title: str,
     y_title: str,
 ) -> go.Figure:
-    # Ensure all inputs are valid lists with same length
     if not x or not actual or not target:
-        # Return empty figure if no data
         fig = go.Figure()
         fig.update_layout(**_plotly_base_layout(title, y_title=y_title))
         return fig
     
-    # Ensure lists are same length
     min_len = min(len(x), len(actual), len(target))
     x = x[:min_len]
     actual = actual[:min_len]
@@ -572,7 +566,6 @@ def plot_bar_top_n(
         fig.update_layout(**_plotly_base_layout(title, x_title=x_title))
         return fig
     
-    # Ensure lists are same length
     min_len = min(len(x), len(y))
     x = x[:min_len]
     y = y[:min_len]
@@ -672,7 +665,6 @@ def page_dashboard(db_path: str, f: Filters) -> None:
     st.write("")
     left, right = st.columns(2)
 
-    # Generation actual vs target (approx last 24h)
     with left:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         gap = target_kwh - inv_gen_kwh
@@ -701,14 +693,11 @@ def page_dashboard(db_path: str, f: Filters) -> None:
             st.error(f"Error rendering generation chart: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Irradiance actual vs target (approx last 24h)
     with right:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         poa = float(daily["poa"].iloc[0]) if not daily.empty else 0.0
         b_poa = float(budget["b_poa"].iloc[0]) if not budget.empty else 0.0
 
-        # Use arbitrary scaling to look like W/m² curves for UI.
-        # (poa/b_poa are daily totals in kWh/m² in your files; this is an approximation.)
         target_wm2 = b_poa * 100.0
         actual_wm2 = poa * 100.0
         st.markdown(
@@ -863,7 +852,6 @@ def page_remarks(db_path: str, f: Filters) -> None:
 def render_sidebar_tab(icon: str, label: str, key: str, is_active: bool) -> bool:
     """Render a sidebar tab button and return True if clicked."""
     button_label = f"{icon} {label}"
-    # Use different button types based on active state
     button_type = "primary" if is_active else "secondary"
     clicked = st.button(button_label, key=f"btn_{key}", use_container_width=True, type=button_type)
     if clicked:
@@ -890,9 +878,7 @@ def main() -> None:
     if st.session_state.nav_page not in allowed_pages:
         st.session_state.nav_page = "portfolio"
 
-    # Use default values for data access
     db_path = DB_DEFAULT
-    # Ensure DB is available locally (download from S3 once if missing)
     try:
         _ = get_duckdb_connection(db_local=db_path).close()
     except Exception as e:
@@ -904,7 +890,6 @@ def main() -> None:
         st.error("No sites found in DB (daily_kpi is empty). Run the loader first.")
         st.stop()
 
-    # Use defaults: first site, latest date, default tariff
     site_name = sites[0]
     dates = get_available_dates(db_path, site_name)
     if dates:

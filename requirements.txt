@@ -8,4 +8,5 @@ kaleido>=0.2.1
 supabase>=2.0.0
 streamlit-aggrid>=0.3.4.post3
 boto3>=1.34.0
+python-calamine>=0.2.0
 

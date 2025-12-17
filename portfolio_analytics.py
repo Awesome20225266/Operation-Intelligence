@@ -319,7 +319,6 @@ def render(db_path: str) -> None:
     with c_btn:
         plot = st.button("Plot Now", type="primary", disabled=not valid, use_container_width=True)
 
-    # If user just clicked a download (Streamlit reruns), reuse last plot/data without forcing new plot
     if not plot and "pa_last_fig" in st.session_state and "pa_last_raw" in st.session_state:
         st.download_button(
             "Download Raw Data (CSV)",
@@ -345,11 +344,6 @@ def render(db_path: str) -> None:
 
     df_steps, fig = build_waterfall(agg)
 
-    # Persist last plot/data for download without re-clicking
-    st.session_state["pa_last_raw"] = raw
-    st.session_state["pa_last_fig"] = fig
-
-    # Persist last plot/data for download without re-clicking
     st.session_state["pa_last_raw"] = raw
     st.session_state["pa_last_fig"] = fig
 

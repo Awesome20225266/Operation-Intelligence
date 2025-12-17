@@ -28,13 +28,13 @@ except Exception:
 # Owner-configurable reasons list
 # -----------------------------
 
-REASONS: list[str] = [
-    "Disconnected String",
+REASONS: list[str] = sorted([
+    "Disconnected String","SCB Fire","HT Panel Fire","Transformer Fire","Cable Failure","Clipping Loss","Deration Loss","Degrdation Loss","Shading Loss","Bypass Diode Failure","Bypass Diode Burnt","Soiling Loss","Passing Clouds","Reactive Power Loss","Fuse Failure","IGBT Failure","AC Breaker Issue","DC Breaker Issue","Module Damage","Temperature Loss","RISO Fault","MPPT Malfunction","Efficiency Loss","Ground Fault","Module Mismatch Loss","Array Misalignment","Tracker Failure","Inverter Fan Issue","Bifacial Factor Loss","Power Limitation","AC Current Imbalance","Vegetation Growth","Low Irradiation","Manual Trip/Stop","Trip","Overvoltage","Overcurrent","LVRT/HVRT","Land Undulation","DC Loading Pending","Inverter Card Issue","Inverter Software Fault",
     "Inverter Fire",
     "Connector Burn",
     "Grid Issue",
-    "Curtailment",
-]
+    "Curtailment","Unknown/No Issue","Capacitor Failure/Issue","Rainy Weather","Bad Weather","Late Wakeup","Theft","Cable Failure/Puncture","Rodent Issue","Heating Issue","Hotspot Formation","Outgoing Trip","Load Shifting","LT Panel Trip","Isolator Issue","Breaker Issue","Transposition Loss","Design Loss","IGBT Temperature Issue","Communication Issue","Bad Data","GFDI Protection Operated","Half String","Hardware Fault","Phase to Phase Fault","Phase to Ground Fault","Over Temperature Trip","Reactor Failure","Hardware Failure"
+])
 
 
 # -----------------------------
@@ -258,10 +258,9 @@ def _reset_comment_form_state(*, default_site: Optional[str], dmin: date, dmax: 
 def _ensure_comment_form_state(*, dmin: date, dmax: date) -> None:
     """
     Initialize widget keys once so we can reliably clear them later.
-    No default values - user must fill the form.
     """
     st.session_state.setdefault("ac_site", None)
-    st.session_state.setdefault("ac_threshold", None)
+    st.session_state.setdefault("ac_threshold", -3.0)
     st.session_state.setdefault("ac_from", None)
     st.session_state.setdefault("ac_to", None)
     st.session_state.setdefault("ac_equipment_labels", [])
@@ -310,7 +309,7 @@ def _render_aggrid_table(df: pd.DataFrame, *, key: str, height: int = 380) -> No
 
 def render(db_path: str) -> None:
     st.markdown("## Add Comments")
-    st.caption("Deviation-linked comments stored in Supabase (zelestra_comments).")
+    st.caption("Add deviation-based comments for underperforming equipment to guide operations.")
 
     sites = list_sites_from_syd(db_path)
     if not sites:
@@ -333,9 +332,8 @@ def render(db_path: str) -> None:
     # Apply pending reset BEFORE widgets are instantiated (fixes session_state modification error).
     pending = st.session_state.get("ac_pending_reset")
     if isinstance(pending, dict):
-        # Clear all fields - no default values
         st.session_state["ac_site"] = None
-        st.session_state["ac_threshold"] = None
+        st.session_state["ac_threshold"] = -3.0
         st.session_state["ac_from"] = None
         st.session_state["ac_to"] = None
         st.session_state["ac_equipment_labels"] = []
@@ -373,7 +371,7 @@ def render(db_path: str) -> None:
             "Threshold (%)",
             min_value=-100.0,
             max_value=100.0,
-            value=st.session_state.get("ac_threshold") if st.session_state.get("ac_threshold") is not None else None,
+            value=st.session_state.get("ac_threshold") if st.session_state.get("ac_threshold") is not None else -3.0,
             step=0.1,
             key="ac_threshold",
             help="Equipment with SYD deviation (%) below this value will appear in the equipment list.",

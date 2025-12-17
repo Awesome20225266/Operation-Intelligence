@@ -304,7 +304,6 @@ def _build_composite_chart(
                 sdf.get("overlay_val", pd.Series([None] * len(sdf))).tolist(),
             )
         )
-        # Build hovertemplate string with optional overlay line
         if overlay_mode != "None":
             overlay_part = f"{overlay_mode}: %{{customdata[3]:.2f}}%<br>"
         else:
@@ -657,94 +656,75 @@ def _build_comments_view_for_plot(
     """
     if plot_df is None or plot_df.empty:
         return pd.DataFrame()
+    # 1) Universe (plotted equipment)
     universe = plot_df[["site_name", "equipment_name"]].drop_duplicates().copy()
     if universe.empty:
         return pd.DataFrame()
 
-    # Fetch Supabase rows and filter to universe
+    # 2) Fetch comments
     sup = _fetch_supabase_comments_for_range(tuple(selected_sites), start, end)
     if sup.empty:
         return pd.DataFrame()
 
-    # Normalize required columns
+    # 3) Normalize required columns
     for col in ["site_name", "start_date", "end_date", "equipment_names", "reasons", "remarks", "deviation"]:
         if col not in sup.columns:
             sup[col] = None
 
-    # Parse dates
+    # 4) Parse + filter by date overlap (vectorized)
     sup["_sd"] = pd.to_datetime(sup["start_date"], errors="coerce").dt.date
     sup["_ed"] = pd.to_datetime(sup["end_date"], errors="coerce").dt.date
-    sup = sup.dropna(subset=["site_name", "_sd", "_ed"])
+    sup = sup.dropna(subset=["site_name", "_sd", "_ed"]).copy()
+    if sup.empty:
+        return pd.DataFrame()
+    sup = sup[(sup["_ed"] >= start) & (sup["_sd"] <= end)].copy()
     if sup.empty:
         return pd.DataFrame()
 
-    # Expand to rows per (equipment, reason) intersection with plotted universe
-    equip_by_site: dict[str, set[str]] = {}
-    for s, g in universe.groupby("site_name"):
-        equip_by_site[str(s)] = set(g["equipment_name"].astype(str).tolist())
+    def _ensure_list(x: Any) -> list[str]:
+        if isinstance(x, list):
+            return [str(v) for v in x]
+        return [str(v) for v in _parse_listish(x)]
 
-    rows: list[dict[str, Any]] = []
-    for _, r in sup.iterrows():
-        sname = str(r["site_name"])
-        if sname not in equip_by_site:
-            continue
-        eqs = set(_parse_listish(r["equipment_names"]))
-        reasons = _parse_listish(r["reasons"]) or [""]
-        remarks = str(r.get("remarks") or "").strip()
-        try:
-            dev = float(r.get("deviation"))
-        except Exception:
-            dev = None
-        sd = r["_sd"]
-        ed = r["_ed"]
+    sup["equipment_names"] = sup["equipment_names"].map(_ensure_list)
+    sup["reasons"] = sup["reasons"].map(_ensure_list)
 
-        # overlap with selected window (safety; already in query)
-        if ed < start or sd > end:
-            continue
-
-        plotted_eqs = equip_by_site[sname]
-        intersection = [e for e in eqs if e in plotted_eqs]
-        if not intersection:
-            continue
-
-        for eq in intersection:
-            for reason in reasons:
-                rows.append(
-                    {
-                        "site_name": sname,
-                        "equipment_name": eq,
-                        "reason": str(reason),
-                        "start_date": sd,
-                        "end_date": ed,
-                        "deviation": dev,
-                        "remarks": remarks,
-                    }
-                )
-
-    if not rows:
+    # 5) Explode to (site, equipment, reason) rows and inner-join to plotted universe
+    exp = sup.explode("equipment_names").rename(columns={"equipment_names": "equipment_name"})
+    exp = exp.explode("reasons").rename(columns={"reasons": "reason"})
+    exp["site_name"] = exp["site_name"].astype(str)
+    exp["equipment_name"] = exp["equipment_name"].astype(str)
+    exp["reason"] = exp["reason"].fillna("").astype(str)
+    universe["site_name"] = universe["site_name"].astype(str)
+    universe["equipment_name"] = universe["equipment_name"].astype(str)
+    exp = exp.merge(universe, on=["site_name", "equipment_name"], how="inner")
+    if exp.empty:
         return pd.DataFrame()
 
-    exp = pd.DataFrame(rows)
+    # Standardize fields
+    exp["start_date"] = exp["_sd"]
+    exp["end_date"] = exp["_ed"]
+    exp["remarks"] = exp["remarks"].fillna("").astype(str).str.strip()
+    exp["deviation"] = pd.to_numeric(exp["deviation"], errors="coerce")
 
-    # Past summary: counts by reason for each equipment
-    counts = (
-        exp.groupby(["site_name", "equipment_name", "reason"])
-        .size()
-        .reset_index(name="cnt")
+    # Past summary: counts by reason for each equipment (vectorized)
+    counts = exp.groupby(["site_name", "equipment_name", "reason"]).size().reset_index(name="cnt")
+    counts = counts.sort_values(["site_name", "equipment_name", "cnt", "reason"], ascending=[True, True, False, True])
+    counts["part"] = counts.apply(
+        lambda r: f"{r['reason']}({int(r['cnt'])})" if str(r["reason"]).strip() != "" else "",
+        axis=1,
     )
-    past_map: dict[tuple[str, str], str] = {}
-    for (sname, eq), g in counts.groupby(["site_name", "equipment_name"]):
-        g2 = g.sort_values(["cnt", "reason"], ascending=[False, True])
-        parts = [f"{row['reason']}({int(row['cnt'])})" for _, row in g2.iterrows() if str(row["reason"]).strip() != ""]
-        past_map[(str(sname), str(eq))] = ", ".join(parts)
+    past_series = (
+        counts[counts["part"] != ""]
+        .groupby(["site_name", "equipment_name"])["part"]
+        .apply(lambda s: ", ".join(s.tolist()))
+    )
+    past_map: dict[tuple[str, str], str] = past_series.to_dict()
 
-    # Merge ranges using source-of-truth start/end from Supabase.
-    # We merge overlapping/touching intervals per (site, equipment, reason).
-
+    # Merge overlapping/touching intervals per (site, equipment, reason).
     grouped_rows: list[dict[str, Any]] = []
     for (sname, eq, reason), g in exp.groupby(["site_name", "equipment_name", "reason"], dropna=False):
-        g = g.sort_values(["start_date", "end_date"]).copy()
-        # interval merging (overlap/touch)
+        g = g.sort_values(["start_date", "end_date"])
         cur_sd: Optional[date] = None
         cur_ed: Optional[date] = None
         cur_devs: list[float] = []
@@ -769,19 +749,15 @@ def _build_comments_view_for_plot(
             )
             cur_sd, cur_ed, cur_devs, cur_remarks = None, None, [], []
 
-        for _, rr in g.iterrows():
-            sd = rr["start_date"]
-            ed = rr["end_date"]
-            try:
-                dv = float(rr["deviation"]) if rr.get("deviation") is not None else None
-            except Exception:
-                dv = None
-            rm = rr.get("remarks")
+        for rr in g.itertuples(index=False):
+            sd = getattr(rr, "start_date")
+            ed = getattr(rr, "end_date")
+            dv = getattr(rr, "deviation")
+            rm = getattr(rr, "remarks")
 
             if cur_sd is None:
                 cur_sd, cur_ed = sd, ed
             else:
-                # merge if overlap or touch (no gap checking beyond touching)
                 if sd <= (cur_ed + timedelta(days=1)):
                     if ed > cur_ed:
                         cur_ed = ed
@@ -789,9 +765,9 @@ def _build_comments_view_for_plot(
                     flush()
                     cur_sd, cur_ed = sd, ed
 
-            if dv is not None:
-                cur_devs.append(dv)
-            if rm is not None:
+            if dv is not None and pd.notna(dv):
+                cur_devs.append(float(dv))
+            if rm:
                 cur_remarks.append(str(rm))
 
         flush()
@@ -827,7 +803,6 @@ def _build_comments_view_for_plot(
     out["Deviation (median)"] = pd.to_numeric(out["Deviation (median)"], errors="coerce")
     if "DC Capacity (kWp)" in out.columns:
         out["DC Capacity (kWp)"] = pd.to_numeric(out["DC Capacity (kWp)"], errors="coerce")
-        # Format to 2 decimal places with "kWp" suffix
         out["DC Capacity (kWp)"] = out["DC Capacity (kWp)"].apply(lambda x: f"{x:.2f} kWp" if pd.notna(x) else "")
     out = out.sort_values(["Site Name", "Equipment Name", "Reason"], ascending=[True, True, True])
     return out
@@ -975,7 +950,6 @@ def _fetch_continuous_deviation_flags(
 
 def render(db_path: str) -> None:
     st.markdown("## Operation Theatre")
-    st.caption("Equipment-level deviation scanner based on SYD.")
 
     sites = list_sites_from_syd(db_path)
     if not sites:
@@ -1041,7 +1015,6 @@ def render(db_path: str) -> None:
     with c_btn:
         plot = st.button("Plot Now", type="primary", disabled=not valid, use_container_width=True)
 
-    # Reuse last plot/data on rerun (e.g., after download click) without forcing new plot
     if not plot and "ot_last_fig" in st.session_state and "ot_last_df" in st.session_state:
         # Meta (only appears once a plot exists) — rendered right above the chart
         universe = st.session_state.get("ot_last_meta_universe", _meta_universe_from_plot_df(st.session_state["ot_last_df"]))
@@ -1168,7 +1141,6 @@ def render(db_path: str) -> None:
 
     fig = _build_composite_chart(df, title=title, overlay_mode=overlay_mode, asof_label=asof_label, threshold=threshold)
 
-    # Persist plot context so Meta can be opened on subsequent reruns without recomputing
     meta_universe = _meta_universe_from_plot_df(df)
     st.session_state["ot_last_meta_universe"] = meta_universe
     st.session_state["ot_last_meta_d1"] = d1 if (d1 and d2) else None

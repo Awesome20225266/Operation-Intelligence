@@ -7,6 +7,14 @@ from typing import Optional
 
 import duckdb
 
+try:
+    import streamlit as st  # type: ignore
+
+    _HAS_STREAMLIT = True
+except Exception:
+    st = None  # type: ignore
+    _HAS_STREAMLIT = False
+
 
 def _get_secret(name: str) -> Optional[str]:
     """
@@ -23,6 +31,65 @@ def _get_secret(name: str) -> Optional[str]:
         pass
     v2 = os.getenv(name)
     return v2 if v2 and v2.strip() != "" else None
+
+
+def _get_s3_etag(
+    *,
+    s3_bucket: str,
+    s3_key: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_region: str,
+) -> str:
+    import boto3  # type: ignore
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=aws_region,
+    )
+    s3_response = s3.head_object(Bucket=s3_bucket, Key=s3_key)
+    return str(s3_response.get("ETag", "")).strip().strip('"')
+
+
+# Cache the ETag lookup to reduce S3 round-trips on every Streamlit rerun.
+if _HAS_STREAMLIT:
+
+    @st.cache_data(ttl=600, show_spinner=False)  # type: ignore[misc]
+    def _get_s3_etag_cached(
+        *,
+        s3_bucket: str,
+        s3_key: str,
+        aws_access_key_id: str,
+        aws_secret_access_key: str,
+        aws_region: str,
+    ) -> str:
+        return _get_s3_etag(
+            s3_bucket=s3_bucket,
+            s3_key=s3_key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_region=aws_region,
+        )
+
+else:
+
+    def _get_s3_etag_cached(  # type: ignore[no-redef]
+        *,
+        s3_bucket: str,
+        s3_key: str,
+        aws_access_key_id: str,
+        aws_secret_access_key: str,
+        aws_region: str,
+    ) -> str:
+        return _get_s3_etag(
+            s3_bucket=s3_bucket,
+            s3_key=s3_key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_region=aws_region,
+        )
 
 
 def _ensure_db_local(db_local: str = "master.duckdb") -> str:
@@ -54,19 +121,15 @@ def _ensure_db_local(db_local: str = "master.duckdb") -> str:
             + ". Set them in `.streamlit/secrets.toml` (local) or Streamlit Cloud Secrets."
         )
 
-    import boto3  # type: ignore
-
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        region_name=aws_region,
-    )
-
     # Get current S3 ETag (before lock to avoid unnecessary lock acquisition)
     try:
-        s3_response = s3.head_object(Bucket=s3_bucket, Key=s3_key)
-        current_s3_etag = s3_response.get("ETag", "").strip('"')
+        current_s3_etag = _get_s3_etag_cached(
+            s3_bucket=str(s3_bucket),
+            s3_key=str(s3_key),
+            aws_access_key_id=str(aws_access_key_id),
+            aws_secret_access_key=str(aws_secret_access_key),
+            aws_region=str(aws_region),
+        )
     except Exception as e:
         # If head_object fails, fall back to checking if local file exists
         if local_path.exists() and local_path.stat().st_size > 0:
@@ -114,6 +177,15 @@ def _ensure_db_local(db_local: str = "master.duckdb") -> str:
                     return str(local_path)
             except Exception:
                 pass
+
+        import boto3  # type: ignore
+
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=aws_region,
+        )
 
         # Download fresh DuckDB from S3
         tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
