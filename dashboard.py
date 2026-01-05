@@ -16,6 +16,7 @@ import portfolio_analytics
 import operation_theatre
 import add_comments
 import meta_viewer
+import reconnect_dsm
 from aws_duckdb import get_duckdb_connection
 import auth
 
@@ -882,7 +883,7 @@ def main() -> None:
     # Sidebar navigation state (matches the UI you shared)
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = "portfolio"
-    allowed_pages = {"portfolio", "operation", "add_comments", "dfm", "visual_analyser", "meta_viewer"}
+    allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer"}
     if st.session_state.nav_page not in allowed_pages:
         st.session_state.nav_page = "portfolio"
 
@@ -932,6 +933,7 @@ def main() -> None:
             nav_items = [
                 ("portfolio", "📊  Portfolio Analytics"),
                 ("operation", "🏥  Operation Theatre"),
+                ("reconnect", "🔌  Re Connect"),
                 ("add_comments", "📝  Add Comments"),
                 ("dfm", "🛠️  Fault Detector"),
                 ("visual_analyser", "🖥️  Visual Analyser"),
@@ -962,6 +964,8 @@ def main() -> None:
         portfolio_analytics.render(db_path)
     elif page == "operation":
         operation_theatre.render(db_path)
+    elif page == "reconnect":
+        reconnect_dsm.render(db_path)
     elif page == "add_comments":
         add_comments.render(db_path)
     elif page == "dfm":
