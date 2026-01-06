@@ -1,0 +1,356 @@
+{
+  "Default": {
+    "bands": [
+      {
+        "direction": "UI",
+        "lower_pct": 0.0,
+        "upper_pct": 15.0,
+        "tolerance_cut_pct": 15.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI \u226415% (no penalty)"
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 15.0,
+        "upper_pct": 20.0,
+        "tolerance_cut_pct": 15.0,
+        "rate_type": "ppa_fraction",
+        "rate_value": 0.1,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI 15\u201320% (10% of PPA)"
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 20.0,
+        "upper_pct": 1000.0,
+        "tolerance_cut_pct": 20.0,
+        "rate_type": "scaled_excess",
+        "rate_value": 3.36,
+        "excess_slope_per_pct": 0.08,
+        "loss_zone": false,
+        "label": "UI >20% (scaled)"
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 0.0,
+        "upper_pct": 15.0,
+        "tolerance_cut_pct": 15.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI \u226415% (no penalty)"
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 15.0,
+        "upper_pct": 20.0,
+        "tolerance_cut_pct": 15.0,
+        "rate_type": "ppa_fraction",
+        "rate_value": 0.1,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 15\u201320% (10% of PPA)"
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 20.0,
+        "upper_pct": 1000.0,
+        "tolerance_cut_pct": 20.0,
+        "rate_type": "scaled_excess",
+        "rate_value": 3.36,
+        "excess_slope_per_pct": 0.08,
+        "loss_zone": true,
+        "label": "OI >20% (scaled)"
+      }
+    ],
+    "mode": "default",
+    "dyn_x": 50.0
+  },
+  "Test": {
+    "bands": [
+      {
+        "direction": "UI",
+        "lower_pct": 0.0,
+        "upper_pct": 15.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI 0.0\u201315.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 15.0,
+        "upper_pct": 25.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI 15.0\u201325.0%",
+        "tolerance_cut_pct": 15.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 25.0,
+        "upper_pct": 35.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.0,
+        "excess_slope_per_pct": 0.08,
+        "loss_zone": false,
+        "label": "UI 25.0\u201335.0%",
+        "tolerance_cut_pct": 20.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 35.0,
+        "upper_pct": 1000.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI >35.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 0.0,
+        "upper_pct": 15.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 0.0\u201315.0%",
+        "tolerance_cut_pct": 15.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 15.0,
+        "upper_pct": 25.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 15.0\u201325.0%",
+        "tolerance_cut_pct": 20.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 25.0,
+        "upper_pct": 35.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 25.0\u201335.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 35.0,
+        "upper_pct": 1000.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI >35.0%",
+        "tolerance_cut_pct": 0.0
+      }
+    ],
+    "mode": "default",
+    "dyn_x": 50.0
+  },
+  "Ghanpur": {
+    "bands": [
+      {
+        "direction": "UI",
+        "lower_pct": 0.0,
+        "upper_pct": 15.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI 0.0\u201315.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 15.0,
+        "upper_pct": 25.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI 15.0\u201325.0%",
+        "tolerance_cut_pct": 15.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 25.0,
+        "upper_pct": 35.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.0,
+        "excess_slope_per_pct": 0.08,
+        "loss_zone": false,
+        "label": "UI 25.0\u201335.0%",
+        "tolerance_cut_pct": 20.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 35.0,
+        "upper_pct": 1000.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI >35.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 0.0,
+        "upper_pct": 15.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 0.0\u201315.0%",
+        "tolerance_cut_pct": 15.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 15.0,
+        "upper_pct": 25.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 15.0\u201325.0%",
+        "tolerance_cut_pct": 20.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 25.0,
+        "upper_pct": 35.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 25.0\u201335.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 35.0,
+        "upper_pct": 1000.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 1.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI >35.0%",
+        "tolerance_cut_pct": 0.0
+      }
+    ],
+    "mode": "default",
+    "dyn_x": 50.0
+  },
+  "Nanj": {
+    "bands": [
+      {
+        "direction": "UI",
+        "lower_pct": 0.0,
+        "upper_pct": 10.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI 0.0\u201310.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 10.0,
+        "upper_pct": 20.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.25,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI 10.0\u201320.0%",
+        "tolerance_cut_pct": 15.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 20.0,
+        "upper_pct": 30.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.5,
+        "excess_slope_per_pct": 0.08,
+        "loss_zone": false,
+        "label": "UI 20.0\u201330.0%",
+        "tolerance_cut_pct": 20.0
+      },
+      {
+        "direction": "UI",
+        "lower_pct": 30.0,
+        "upper_pct": 1000.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.75,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "UI >30.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 0.0,
+        "upper_pct": 10.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.0,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 0.0\u201310.0%",
+        "tolerance_cut_pct": 15.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 10.0,
+        "upper_pct": 20.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.25,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 10.0\u201320.0%",
+        "tolerance_cut_pct": 20.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 20.0,
+        "upper_pct": 30.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.5,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI 20.0\u201330.0%",
+        "tolerance_cut_pct": 0.0
+      },
+      {
+        "direction": "OI",
+        "lower_pct": 30.0,
+        "upper_pct": 1000.0,
+        "rate_type": "flat_per_kwh",
+        "rate_value": 0.75,
+        "excess_slope_per_pct": 0.0,
+        "loss_zone": false,
+        "label": "OI >30.0%",
+        "tolerance_cut_pct": 0.0
+      }
+    ],
+    "mode": "default",
+    "dyn_x": 50.0
+  }
+}

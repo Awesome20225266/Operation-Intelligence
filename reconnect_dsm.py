@@ -18,6 +18,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 
 from aws_duckdb import get_duckdb_connection
 
@@ -493,8 +494,13 @@ def apply_corrections(
             'flatline_actual': {'formula': '(Prev_Actual_MW + Next_Actual_MW) / 2', 'x_value': None}
         }
     }
+    
+    Returns dataframe with corrections applied and 'is_corrected' flag added.
     """
     df_virtual = df_original.copy()
+    
+    # Initialize correction flag
+    df_virtual['is_corrected'] = False
     
     # Detect all anomalies
     anomalies = detect_anomalies(df_virtual)
@@ -514,8 +520,12 @@ def apply_corrections(
                 if formula:
                     for idx in df_virtual[missing_actual_mask].index:
                         row = df_virtual.loc[idx]
+                        original_actual = df_virtual.loc[idx, 'Actual_MW']
                         corrected_value = evaluate_excel_formula(formula, row, df_virtual, idx, x_value)
                         df_virtual.loc[idx, 'Actual_MW'] = corrected_value
+                        # Mark as corrected if value changed
+                        if abs(corrected_value - original_actual) > 1e-6:
+                            df_virtual.loc[idx, 'is_corrected'] = True
         
         # Apply missing schedule correction
         if 'missing_schedule' in plant_corrections:
@@ -528,8 +538,12 @@ def apply_corrections(
                 if formula:
                     for idx in df_virtual[missing_schedule_mask].index:
                         row = df_virtual.loc[idx]
+                        original_schedule = df_virtual.loc[idx, 'Scheduled_MW']
                         corrected_value = evaluate_excel_formula(formula, row, df_virtual, idx, x_value)
                         df_virtual.loc[idx, 'Scheduled_MW'] = corrected_value
+                        # Mark as corrected if value changed
+                        if abs(corrected_value - original_schedule) > 1e-6:
+                            df_virtual.loc[idx, 'is_corrected'] = True
         
         # Apply flatline actual correction
         if 'flatline_actual' in plant_corrections:
@@ -542,8 +556,12 @@ def apply_corrections(
                 if formula:
                     for idx in df_virtual[flatline_mask].index:
                         row = df_virtual.loc[idx]
+                        original_actual = df_virtual.loc[idx, 'Actual_MW']
                         corrected_value = evaluate_excel_formula(formula, row, df_virtual, idx, x_value)
                         df_virtual.loc[idx, 'Actual_MW'] = corrected_value
+                        # Mark as corrected if value changed
+                        if abs(corrected_value - original_actual) > 1e-6:
+                            df_virtual.loc[idx, 'is_corrected'] = True
     
     return df_virtual
 
@@ -570,6 +588,14 @@ def get_anomaly_summary(df: pd.DataFrame, plant_name: Optional[str] = None) -> D
     }
     
     return summary
+
+
+def anomaly_badge(value: int) -> str:
+    """Generate color-coded badge for anomaly count. GREEN if 0, RED if > 0."""
+    if value == 0:
+        return f"<span style='color:green;font-weight:bold'>✔ {value}</span>"
+    else:
+        return f"<span style='color:red;font-weight:bold'>✖ {value}</span>"
 
 
 # -----------------------------
@@ -1398,25 +1424,31 @@ def render(db_path: str) -> None:
             )
             
             if not temp_df.empty:
-                # Show anomaly summary
+                # Show anomaly summary with color-coded badges
                 st.markdown("### 📊 Anomaly Summary")
                 
-                summary_cols = st.columns(len(selected_plants) + 1)
-                with summary_cols[0]:
-                    st.markdown("**Plant**")
-                    st.markdown("**Total Blocks**")
-                    st.markdown("**Missing Actual**")
-                    st.markdown("**Missing Schedule**")
-                    st.markdown("**Flat-Line Actual**")
-                
-                for idx, plant_name in enumerate(selected_plants, 1):
-                    with summary_cols[idx]:
-                        summary = get_anomaly_summary(temp_df, plant_name)
-                        st.markdown(f"**{plant_name}**")
-                        st.markdown(f"{summary['total_blocks']}")
-                        st.markdown(f"🔴 {summary['missing_actual_count']} ({summary['missing_actual_pct']}%)")
-                        st.markdown(f"🔴 {summary['missing_schedule_count']} ({summary['missing_schedule_pct']}%)")
-                        st.markdown(f"🟠 {summary['flatline_actual_count']} ({summary['flatline_actual_pct']}%)")
+                # Create columns for each plant
+                num_cols = len(selected_plants)
+                if num_cols > 0:
+                    summary_cols = st.columns(num_cols)
+                    
+                    for idx, plant_name in enumerate(selected_plants):
+                        with summary_cols[idx]:
+                            summary = get_anomaly_summary(temp_df, plant_name)
+                            st.markdown(f"**{plant_name}**")
+                            st.markdown(f"Total Blocks: {summary['total_blocks']}")
+                            st.markdown(
+                                f"Missing Actual<br>{anomaly_badge(summary['missing_actual_count'])} ({summary['missing_actual_pct']}%)",
+                                unsafe_allow_html=True
+                            )
+                            st.markdown(
+                                f"Missing Schedule<br>{anomaly_badge(summary['missing_schedule_count'])} ({summary['missing_schedule_pct']}%)",
+                                unsafe_allow_html=True
+                            )
+                            st.markdown(
+                                f"Flatline Actual<br>{anomaly_badge(summary['flatline_actual_count'])} ({summary['flatline_actual_pct']}%)",
+                                unsafe_allow_html=True
+                            )
                 
                 # Formula input for each plant
                 st.markdown("### ✏️ Correction Formulas")
@@ -1504,6 +1536,249 @@ def render(db_path: str) -> None:
                                     'x_value': None
                                 }
     
+    # Upload/Download Template Section
+    if use_corrections and selected_plants and from_date and to_date:
+        st.markdown("---")
+        st.markdown("### 📤 Upload/Download Correction Template")
+        st.info("""
+        **Workflow:**
+        1. Download template CSV with current data
+        2. Edit values offline in Excel/CSV
+        3. Upload corrected file
+        4. Run Analysis to use corrected values
+        """)
+        
+        # Load data for template
+        template_df = load_reconnect_data(
+            db_path,
+            selected_plants,
+            from_date,
+            to_date,
+            50.0,  # Default AvC for template
+            None
+        )
+        
+        if not template_df.empty:
+            # Prepare template with key columns
+            # Ensure Scheduled_MW column exists (mapped from accepted_schedule_eod_mw in load_reconnect_data)
+            if 'Scheduled_MW' not in template_df.columns and 'accepted_schedule_eod_mw' in template_df.columns:
+                template_df['Scheduled_MW'] = template_df['accepted_schedule_eod_mw']
+            
+            template_cols = ["plant_name", "date", "block", "Actual_MW", "Scheduled_MW"]
+            # Only include columns that exist
+            available_cols = [col for col in template_cols if col in template_df.columns]
+            template_data = template_df[available_cols].copy()
+            
+            # Download button
+            csv_template = template_data.to_csv(index=False)
+            st.download_button(
+                "⬇ Download Correction Template",
+                csv_template,
+                file_name=f"virtual_correction_template_{from_date}_{to_date}.csv",
+                mime="text/csv",
+                help="Download CSV template with plant_name, date, block, Actual_MW, Scheduled_MW columns"
+            )
+            
+            # Upload corrected file
+            uploaded_file = st.file_uploader(
+                "Upload Corrected Data (CSV)",
+                type=["csv"],
+                help="Upload CSV file with corrected Actual_MW and/or Scheduled_MW values"
+            )
+            
+            if uploaded_file:
+                try:
+                    uploaded_df = pd.read_csv(uploaded_file)
+                    
+                    # Validate required columns
+                    required_cols = ["plant_name", "date", "block"]
+                    missing_cols = [col for col in required_cols if col not in uploaded_df.columns]
+                    if missing_cols:
+                        st.error(f"Missing required columns in uploaded file: {', '.join(missing_cols)}")
+                    else:
+                        # Parse date column if it's a string
+                        if uploaded_df['date'].dtype == 'object':
+                            uploaded_df['date'] = pd.to_datetime(uploaded_df['date']).dt.date
+                        
+                        # Ensure block is integer
+                        uploaded_df['block'] = pd.to_numeric(uploaded_df['block'], errors='coerce').astype('Int64')
+                        
+                        # Ensure Actual_MW and Scheduled_MW are numeric (if present)
+                        if 'Actual_MW' in uploaded_df.columns:
+                            uploaded_df['Actual_MW'] = pd.to_numeric(uploaded_df['Actual_MW'], errors='coerce')
+                        if 'Scheduled_MW' in uploaded_df.columns:
+                            uploaded_df['Scheduled_MW'] = pd.to_numeric(uploaded_df['Scheduled_MW'], errors='coerce')
+                        
+                        # Store uploaded data in session state for use during analysis
+                        st.session_state['uploaded_corrections'] = uploaded_df
+                        st.success("✅ Uploaded data loaded successfully. Corrections will be applied when you run analysis.")
+                        
+                        # Show preview
+                        with st.expander("📋 Preview Uploaded Data", expanded=False):
+                            st.dataframe(uploaded_df.head(20), use_container_width=True)
+                            st.caption(f"Total rows: {len(uploaded_df)}")
+                except Exception as e:
+                    st.error(f"Error reading uploaded file: {e}")
+    
+    # Visual Insight Section
+    if use_corrections and selected_plants and from_date and to_date:
+        st.markdown("---")
+        st.markdown("## 📈 Visual Insight")
+        st.info("Compare Actual vs Schedule with virtual corrections highlighted. Select a plant to visualize.")
+        
+        # Load data for visualization
+        viz_df = load_reconnect_data(
+            db_path,
+            selected_plants,
+            from_date,
+            to_date,
+            50.0,  # Default AvC for visualization
+            None
+        )
+        
+        if not viz_df.empty and len(selected_plants) > 0:
+            # Apply corrections if configured
+            df_original = viz_df.copy()
+            df_virtual = df_original.copy()
+            
+            # First apply formula-based corrections
+            if corrections_config:
+                df_virtual = apply_corrections(df_original, corrections_config)
+            
+            # Then apply uploaded corrections (override formula-based if both exist)
+            if 'uploaded_corrections' in st.session_state and st.session_state['uploaded_corrections'] is not None:
+                uploaded_df = st.session_state['uploaded_corrections'].copy()
+                
+                # Normalize date column types before merging
+                # Convert both to date objects (not datetime)
+                if 'date' in df_virtual.columns:
+                    if pd.api.types.is_datetime64_any_dtype(df_virtual['date']):
+                        df_virtual['date'] = df_virtual['date'].dt.date
+                    elif not isinstance(df_virtual['date'].iloc[0] if len(df_virtual) > 0 else None, date):
+                        df_virtual['date'] = pd.to_datetime(df_virtual['date']).dt.date
+                
+                if 'date' in uploaded_df.columns:
+                    if pd.api.types.is_datetime64_any_dtype(uploaded_df['date']):
+                        uploaded_df['date'] = uploaded_df['date'].dt.date
+                    elif uploaded_df['date'].dtype == 'object':
+                        uploaded_df['date'] = pd.to_datetime(uploaded_df['date']).dt.date
+                
+                # Ensure block is same type
+                df_virtual['block'] = df_virtual['block'].astype('int64')
+                uploaded_df['block'] = uploaded_df['block'].astype('int64')
+                
+                # Merge uploaded corrections
+                df_virtual = df_virtual.merge(
+                    uploaded_df[['plant_name', 'date', 'block', 'Actual_MW', 'Scheduled_MW']],
+                    on=['plant_name', 'date', 'block'],
+                    how='left',
+                    suffixes=('', '_uploaded')
+                )
+                
+                # Override values where uploaded data exists
+                mask_actual = df_virtual['Actual_MW_uploaded'].notna()
+                mask_schedule = df_virtual['Scheduled_MW_uploaded'].notna()
+                
+                if mask_actual.any():
+                    df_virtual.loc[mask_actual, 'Actual_MW'] = df_virtual.loc[mask_actual, 'Actual_MW_uploaded']
+                    df_virtual.loc[mask_actual, 'is_corrected'] = True
+                
+                if mask_schedule.any():
+                    df_virtual.loc[mask_schedule, 'Scheduled_MW'] = df_virtual.loc[mask_schedule, 'Scheduled_MW_uploaded']
+                    df_virtual.loc[mask_schedule, 'is_corrected'] = True
+                
+                # Clean up temporary columns
+                df_virtual = df_virtual.drop(columns=[col for col in df_virtual.columns if col.endswith('_uploaded')])
+            
+            # Add correction flag if not already present
+            if 'is_corrected' not in df_virtual.columns:
+                df_virtual['is_corrected'] = False
+            
+            # Plant selector for visualization
+            selected_plant_viz = st.selectbox(
+                "Select Plant for Visual Insight",
+                selected_plants,
+                key="viz_plant_selector"
+            )
+            
+            if selected_plant_viz:
+                plot_df = df_virtual[df_virtual["plant_name"] == selected_plant_viz].copy()
+                plot_df = plot_df.sort_values(['date', 'block'])
+                
+                if not plot_df.empty:
+                    # Create block identifier for x-axis (date + block)
+                    plot_df['block_id'] = plot_df.apply(
+                        lambda row: f"{row['date']} B{row['block']}", axis=1
+                    )
+                    
+                    fig = go.Figure()
+                    
+                    # Actual MW line
+                    fig.add_trace(go.Scatter(
+                        x=plot_df["block_id"],
+                        y=plot_df["Actual_MW"],
+                        mode="lines+markers",
+                        name="Actual MW",
+                        marker=dict(color="blue", size=6),
+                        line=dict(width=2, color="blue")
+                    ))
+                    
+                    # Accepted Schedule line
+                    fig.add_trace(go.Scatter(
+                        x=plot_df["block_id"],
+                        y=plot_df["Scheduled_MW"],
+                        mode="lines+markers",
+                        name="Accepted Schedule EOD MW",
+                        marker=dict(color="orange", size=6, symbol="diamond"),
+                        line=dict(dash="dash", width=2, color="orange")
+                    ))
+                    
+                    # Highlight corrected points
+                    corrected = plot_df[plot_df["is_corrected"] == True]
+                    if not corrected.empty:
+                        fig.add_trace(go.Scatter(
+                            x=corrected["block_id"],
+                            y=corrected["Actual_MW"],
+                            mode="markers",
+                            name="Virtual Correction Applied",
+                            marker=dict(
+                                color="red",
+                                size=12,
+                                symbol="diamond",
+                                line=dict(width=2, color="darkred")
+                            ),
+                            hovertemplate="<b>Corrected Block</b><br>" +
+                                        "Date: %{text}<br>" +
+                                        "Actual: %{y:.2f} MW<extra></extra>",
+                            text=corrected["date"].astype(str)
+                        ))
+                    
+                    fig.update_layout(
+                        title=f"Actual vs Schedule with Virtual Corrections – {selected_plant_viz}",
+                        xaxis_title="Block",
+                        yaxis_title="MW",
+                        legend_title="Legend",
+                        height=500,
+                        hovermode="x unified",
+                        xaxis=dict(
+                            tickangle=-45,
+                            tickmode='linear',
+                            tick0=0,
+                            dtick=max(1, len(plot_df) // 20)  # Show ~20 ticks
+                        )
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Show correction summary
+                    num_corrected = int(plot_df["is_corrected"].sum())
+                    if num_corrected > 0:
+                        st.info(f"🔴 **{num_corrected} blocks** were virtually corrected for {selected_plant_viz}")
+                    else:
+                        st.success(f"✅ No virtual corrections applied for {selected_plant_viz}")
+                else:
+                    st.warning(f"No data available for {selected_plant_viz} in selected date range.")
+    
     # Run Analysis Button
     run_analysis_clicked = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
     
@@ -1586,10 +1861,60 @@ def render(db_path: str) -> None:
                         df.loc[plant_mask, 'PPA'] = None
             
             # Apply virtual corrections if enabled
-            if use_corrections and corrections_config:
+            if use_corrections:
                 with st.spinner("Applying virtual corrections..."):
-                    df = apply_corrections(df, corrections_config)
-                    st.success("✅ Virtual corrections applied. Original data unchanged.")
+                    # First apply formula-based corrections
+                    if corrections_config:
+                        df = apply_corrections(df, corrections_config)
+                    
+                    # Then apply uploaded corrections (override formula-based if both exist)
+                    if 'uploaded_corrections' in st.session_state and st.session_state['uploaded_corrections'] is not None:
+                        uploaded_df = st.session_state['uploaded_corrections'].copy()
+                        
+                        # Normalize date column types before merging
+                        # Convert both to date objects (not datetime)
+                        if 'date' in df.columns:
+                            if pd.api.types.is_datetime64_any_dtype(df['date']):
+                                df['date'] = df['date'].dt.date
+                            elif not isinstance(df['date'].iloc[0] if len(df) > 0 else None, date):
+                                df['date'] = pd.to_datetime(df['date']).dt.date
+                        
+                        if 'date' in uploaded_df.columns:
+                            if pd.api.types.is_datetime64_any_dtype(uploaded_df['date']):
+                                uploaded_df['date'] = uploaded_df['date'].dt.date
+                            elif uploaded_df['date'].dtype == 'object':
+                                uploaded_df['date'] = pd.to_datetime(uploaded_df['date']).dt.date
+                        
+                        # Ensure block is same type
+                        df['block'] = df['block'].astype('int64')
+                        uploaded_df['block'] = uploaded_df['block'].astype('int64')
+                        
+                        # Merge uploaded corrections
+                        df = df.merge(
+                            uploaded_df[['plant_name', 'date', 'block', 'Actual_MW', 'Scheduled_MW']],
+                            on=['plant_name', 'date', 'block'],
+                            how='left',
+                            suffixes=('', '_uploaded')
+                        )
+                        
+                        # Override values where uploaded data exists
+                        mask_actual = df['Actual_MW_uploaded'].notna()
+                        mask_schedule = df['Scheduled_MW_uploaded'].notna()
+                        
+                        if mask_actual.any():
+                            df.loc[mask_actual, 'Actual_MW'] = df.loc[mask_actual, 'Actual_MW_uploaded']
+                            df.loc[mask_actual, 'is_corrected'] = True
+                        
+                        if mask_schedule.any():
+                            df.loc[mask_schedule, 'Scheduled_MW'] = df.loc[mask_schedule, 'Scheduled_MW_uploaded']
+                            df.loc[mask_schedule, 'is_corrected'] = True
+                        
+                        # Clean up temporary columns
+                        df = df.drop(columns=[col for col in df.columns if col.endswith('_uploaded')])
+                        
+                        st.success("✅ Virtual corrections applied (formulas + uploaded data). Original data unchanged.")
+                    elif corrections_config:
+                        st.success("✅ Virtual corrections applied. Original data unchanged.")
             
             # Compute summary results (using df_virtual if corrections applied, otherwise df_original)
             results_df = compute_dsm_results(df, plant_configs_with_bands)
