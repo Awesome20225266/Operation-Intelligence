@@ -195,7 +195,7 @@
         "upper_pct": 35.0,
         "rate_type": "flat_per_kwh",
         "rate_value": 1.0,
-        "excess_slope_per_pct": 0.08,
+        "excess_slope_per_pct": 0.0,
         "loss_zone": false,
         "label": "UI 25.0\u201335.0%",
         "tolerance_cut_pct": 20.0
@@ -289,7 +289,7 @@
         "upper_pct": 30.0,
         "rate_type": "flat_per_kwh",
         "rate_value": 0.5,
-        "excess_slope_per_pct": 0.08,
+        "excess_slope_per_pct": 0.0,
         "loss_zone": false,
         "label": "UI 20.0\u201330.0%",
         "tolerance_cut_pct": 20.0

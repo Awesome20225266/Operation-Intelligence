@@ -176,9 +176,52 @@ def check_password() -> bool:
                 st.session_state["password_correct"] = False
                 st.session_state["login_error"] = "Invalid credentials. Please try again."
                 st.rerun()
-        except Exception as e:
+        except ValueError as e:
+            # Configuration errors - show clear message
             st.session_state["password_correct"] = False
-            st.session_state["login_error"] = f"System Error: {e}"
+            error_msg = str(e)
+            if "Missing SUPABASE" in error_msg or "Invalid SUPABASE" in error_msg:
+                st.session_state["login_error"] = (
+                    f"⚠️ **Configuration Error:** {error_msg}\n\n"
+                    "Please configure Supabase credentials in `.streamlit/secrets.toml`:\n"
+                    "```toml\n"
+                    "SUPABASE_URL = 'https://your-project.supabase.co'\n"
+                    "SUPABASE_SERVICE_ROLE_KEY = 'your-service-role-key'\n"
+                    "```"
+                )
+            else:
+                st.session_state["login_error"] = f"⚠️ **Configuration Error:** {error_msg}"
+            st.rerun()
+        except ConnectionError as e:
+            # Network/connection errors
+            st.session_state["password_correct"] = False
+            error_msg = str(e)
+            st.session_state["login_error"] = (
+                f"🔴 **Connection Error:** Cannot connect to Supabase authentication service.\n\n"
+                f"{error_msg}\n\n"
+                "**Troubleshooting:**\n"
+                "1. Check your internet connection\n"
+                "2. Verify Supabase URL is correct and accessible\n"
+                "3. Check if firewall/proxy is blocking the connection"
+            )
+            st.rerun()
+        except Exception as e:
+            # Other unexpected errors
+            st.session_state["password_correct"] = False
+            error_msg = str(e)
+            # Provide helpful message for common errors
+            if "getaddrinfo failed" in error_msg or "11001" in error_msg:
+                st.session_state["login_error"] = (
+                    f"🔴 **Network Error:** Cannot resolve Supabase hostname.\n\n"
+                    "**Possible solutions:**\n"
+                    "1. Check your internet connection\n"
+                    "2. Verify SUPABASE_URL in `.streamlit/secrets.toml` is correct\n"
+                    "3. Try accessing Supabase dashboard in browser to confirm service is up\n"
+                    "4. Check DNS settings or try using a different network\n\n"
+                    f"Technical details: {error_msg}"
+                )
+            else:
+                st.session_state["login_error"] = f"⚠️ **System Error:** {error_msg}"
             st.rerun()
 
     # --- Login Form UI ---
