@@ -18,8 +18,10 @@ import add_comments
 import meta_viewer
 import reconnect_dsm
 import scb_ot
+import scb_comment
 from aws_duckdb import get_duckdb_connection
 import auth
+from access_control import is_admin
 
 # -----------------------------
 # App config
@@ -884,9 +886,20 @@ def main() -> None:
     # Sidebar navigation state (matches the UI you shared)
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = "portfolio"
-    allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot"}
+
+    user_info = st.session_state.get("user_info", {})
+    username = user_info.get("username")
+
+    if is_admin(username):
+        allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot", "scb_comment"}
+        default_page = "portfolio"
+    else:
+        # Restricted users: ONLY these tabs must exist in the UI.
+        allowed_pages = {"scb_ot", "scb_comment"}
+        default_page = "scb_ot"
+
     if st.session_state.nav_page not in allowed_pages:
-        st.session_state.nav_page = "portfolio"
+        st.session_state.nav_page = default_page
 
     db_path = DB_DEFAULT
     try:
@@ -925,22 +938,28 @@ def main() -> None:
             )
 
             # User info
-            user_info = st.session_state.get("user_info", {})
-            username = user_info.get("username", "Unknown")
-            st.markdown(f"### Welcome, **{username}**")
+            username_disp = username or "Unknown"
+            st.markdown(f"### Welcome, **{username_disp}**")
 
             st.markdown("<div class='sb-divider'></div>", unsafe_allow_html=True)
 
-            nav_items = [
-                ("portfolio", "📊  Portfolio Analytics"),
-                ("operation", "🏥  Operation Theatre"),
-                ("reconnect", "🔌  Re Connect"),
-                ("add_comments", "📝  Add Comments"),
-                ("dfm", "🛠️  Fault Detector"),
-                ("visual_analyser", "🖥️  Visual Analyser"),
-                ("meta_viewer", "🧭  Meta Viewer"),
-                ("scb_ot", "⚡  SCB OT"),
-            ]
+            if is_admin(username):
+                nav_items = [
+                    ("portfolio", "📊  Portfolio Analytics"),
+                    ("operation", "🏥  Operation Theatre"),
+                    ("reconnect", "🔌  Re Connect"),
+                    ("add_comments", "📝  Add Comments"),
+                    ("scb_comment", "🧾  SCB Comment"),
+                    ("dfm", "🛠️  Fault Detector"),
+                    ("visual_analyser", "🖥️  Visual Analyser"),
+                    ("meta_viewer", "🧭  Meta Viewer"),
+                    ("scb_ot", "⚡  SCB OT"),
+                ]
+            else:
+                nav_items = [
+                    ("scb_ot", "⚡  SCB OT"),
+                    ("scb_comment", "🧾  SCB Comment"),
+                ]
 
             for key, label in nav_items:
                 is_active = st.session_state.nav_page == key
@@ -962,6 +981,11 @@ def main() -> None:
     f = Filters(site_name=site_name, as_of_date=as_of_date, tariff_inr_per_kwh=float(tariff))
     page = st.session_state.nav_page
 
+    # Defensive routing safety: restricted users cannot access hidden pages even if nav_page is tampered.
+    if not is_admin(username) and page not in {"scb_ot", "scb_comment"}:
+        st.error("Unauthorized page access")
+        return
+
     if page == "portfolio":
         portfolio_analytics.render(db_path)
     elif page == "operation":
@@ -980,6 +1004,8 @@ def main() -> None:
         meta_viewer.render(db_path)
     elif page == "scb_ot":
         scb_ot.render_scb_ot(db_path)
+    elif page == "scb_comment":
+        scb_comment.render(db_path)
     else:
         st.error("Unknown page")
 

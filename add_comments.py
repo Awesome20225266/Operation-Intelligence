@@ -231,10 +231,18 @@ def insert_comment(payload: dict[str, Any]) -> None:
     sb.table("zelestra_comments").insert(payload).execute()
 
 
-def insert_bulk_comments(payloads: list[dict[str, Any]]) -> None:
-    """Bulk insert with fallback for integer schema mismatch (Fix for 22P02 error)"""
+def insert_bulk_comments(payloads: list[dict[str, Any]]) -> dict[str, int]:
+    """
+    Bulk insert with:
+    - Duplicate prevention (exact match) based on:
+      site_name, deviation, start_date, end_date, equipment_names, reasons
+    - Fallback for integer schema mismatch (Fix for 22P02 error)
+
+    Backward compatible: callers that ignore the return value are unaffected.
+    Returns a summary dict: {"inserted": X, "duplicates": Y}
+    """
     if not payloads:
-        return
+        return {"inserted": 0, "duplicates": 0}
     
     # Add created_by from session state if available
     user_info = st.session_state.get("user_info", {})
@@ -244,21 +252,90 @@ def insert_bulk_comments(payloads: list[dict[str, Any]]) -> None:
             p["created_by"] = username
     
     sb = get_supabase_client(prefer_service_role=True)
+
+    # -----------------------------
+    # Duplicate prevention (exact match across fields)
+    # -----------------------------
+    def _norm_str(x: object) -> str:
+        return str(x or "").strip().lower()
+
+    def _norm_list(x: object) -> tuple[str, ...]:
+        if isinstance(x, list):
+            return tuple(sorted(_norm_str(v) for v in x if v is not None and str(v).strip() != ""))
+        if x is None:
+            return tuple()
+        s = str(x).strip()
+        return tuple(sorted([_norm_str(s)])) if s else tuple()
+
+    def _dev_key(x: object) -> str:
+        try:
+            return f"{float(x):.6f}"
+        except Exception:
+            return "nan"
+
+    sites = sorted({_norm_str(p.get("site_name")) for p in payloads if p.get("site_name")})
+    existing_rows: list[dict[str, Any]] = []
+    try:
+        for sname in sites:
+            resp = (
+                sb.table("zelestra_comments")
+                .select("site_name,deviation,start_date,end_date,equipment_names,reasons")
+                .eq("site_name", sname)
+                .limit(10000)
+                .execute()
+            )
+            existing_rows.extend(resp.data or [])
+    except Exception:
+        existing_rows = []
+
+    existing_keys: set[tuple[str, str, str, str, tuple[str, ...], tuple[str, ...]]] = set()
+    for r in existing_rows:
+        existing_keys.add(
+            (
+                _norm_str(r.get("site_name")),
+                _dev_key(r.get("deviation")),
+                str(r.get("start_date") or ""),
+                str(r.get("end_date") or ""),
+                _norm_list(r.get("equipment_names")),
+                _norm_list(r.get("reasons")),
+            )
+        )
+
+    new_payloads: list[dict[str, Any]] = []
+    dup_count = 0
+    for p in payloads:
+        key = (
+            _norm_str(p.get("site_name")),
+            _dev_key(p.get("deviation")),
+            str(p.get("start_date") or ""),
+            str(p.get("end_date") or ""),
+            _norm_list(p.get("equipment_names")),
+            _norm_list(p.get("reasons")),
+        )
+        if key in existing_keys:
+            dup_count += 1
+        else:
+            new_payloads.append(p)
+            existing_keys.add(key)
     try:
         # Try inserting exactly as provided (likely floats)
-        sb.table("zelestra_comments").insert(payloads).execute()
+        if new_payloads:
+            sb.table("zelestra_comments").insert(new_payloads).execute()
     except Exception as e:
         # Check if error is specifically about integer format "22P02"
         err_msg = str(e).lower()
         if "22p02" in err_msg or "invalid input syntax for type integer" in err_msg:
             # Fallback: Round all deviations to nearest integer and retry
-            for p in payloads:
+            for p in new_payloads:
                 if "deviation" in p:
                     p["deviation"] = int(round(p["deviation"]))
-            sb.table("zelestra_comments").insert(payloads).execute()
+            if new_payloads:
+                sb.table("zelestra_comments").insert(new_payloads).execute()
         else:
             # Re-raise if it's a different error
             raise e
+
+    return {"inserted": len(new_payloads), "duplicates": int(dup_count)}
 
 
 def update_comment(comment_id: Any, payload: dict[str, Any]) -> None:

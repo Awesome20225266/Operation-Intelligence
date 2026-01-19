@@ -214,6 +214,11 @@ def get_array_string_nums(db_path: str, site_name: str) -> pd.DataFrame:
 
     Required columns:
       site_name, inv_stn_name, inv_name, scb_name, string_num
+
+    GSPL-only median enhancement:
+      We also fetch inv_unit_name from array_details via the SAME query (no new query).
+      If the column does not exist in the DB schema, we safely return NULL for inv_unit_name
+      so non-GSPL behavior remains unchanged.
     """
     con = _connect(db_path)
     try:
@@ -224,6 +229,8 @@ def get_array_string_nums(db_path: str, site_name: str) -> pd.DataFrame:
         if missing:
             raise RuntimeError(f"`array_details` is missing required columns: {missing}")
 
+        unit_select = "inv_unit_name" if "inv_unit_name" in cols else "cast(null as varchar) as inv_unit_name"
+
         df = con.execute(
             """
             select
@@ -231,7 +238,10 @@ def get_array_string_nums(db_path: str, site_name: str) -> pd.DataFrame:
               inv_stn_name,
               inv_name,
               scb_name,
-              string_num
+              string_num,
+              """
+            + unit_select
+            + """
             from array_details
             where lower(trim(site_name)) = lower(trim(?))
             """,
@@ -656,6 +666,39 @@ def _style_remarks(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
     return df.style.apply(_row_style, axis=1)
 
 
+def build_scb_insight_summary(remarks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    UI-only "big hoarder view" summary derived from remarks_df.
+    Must not change any computation outputs (purely re-grouping existing remarks).
+    """
+    if remarks_df is None or remarks_df.empty:
+        return pd.DataFrame(columns=["Explanation", "Count", "Details"])
+
+    def classify(msg: str) -> str:
+        if "very low energy contribution" in msg:
+            return "SCB eliminated: very low energy contribution"
+        if "value constant throughout" in msg:
+            return "SCB eliminated: value constant throughout selected time window"
+        if "Possible disconnected strings detected" in msg:
+            return "Possible disconnected strings detected"
+        return "Other"
+
+    tmp = remarks_df.copy()
+    tmp["message"] = tmp.get("message", "").astype(str)
+    tmp["Explanation"] = tmp["message"].map(classify)
+
+    grouped = (
+        tmp.groupby("Explanation")
+        .agg(
+            Count=("scb_label", "count"),
+            Details=("message", lambda x: ", ".join(sorted(set(x)))),
+        )
+        .reset_index()
+    )
+
+    return grouped
+
+
 def _compute_scb_ot_peak_pipeline(
     *,
     df_raw: pd.DataFrame,
@@ -914,7 +957,7 @@ def _compute_scb_ot_peak_pipeline(
         peaks[f"{c}_key"] = peaks[c].map(_norm_key)
 
     joined = peaks.merge(
-        string_df[["site_name_key", "inv_stn_name_key", "inv_name_key", "scb_name_key", "string_num"]],
+        string_df[["site_name_key", "inv_stn_name_key", "inv_name_key", "scb_name_key", "string_num", "inv_unit_name"]],
         on=["site_name_key", "inv_stn_name_key", "inv_name_key", "scb_name_key"],
         how="left",
     )
@@ -933,7 +976,10 @@ def _compute_scb_ot_peak_pipeline(
 
     joined["normalized_value"] = pd.to_numeric(joined["scb_peak"], errors="coerce") / pd.to_numeric(joined["string_num"], errors="coerce")
 
-    # STEP 7 — MEDIAN BENCHMARK (UNCHANGED LOGIC)
+    # STEP 7 — MEDIAN BENCHMARK
+    # Default (non-GSPL): global median across all surviving SCBs (unchanged behavior).
+    # GSPL-only: unit-wise median grouped by (inv_stn_name, inv_name, inv_unit_name).
+    is_gspl = str(site_name).strip().upper() == "GSPL"
     norm = pd.to_numeric(joined["normalized_value"], errors="coerce").dropna()
     if norm.empty:
         return (
@@ -942,38 +988,93 @@ def _compute_scb_ot_peak_pipeline(
             "no_normalized",
         )
 
-    if len(norm) == 1:
-        median_value = float(norm.iloc[0])
-        joined["median_value"] = median_value
-        joined["deviation_pct"] = 0.0
+    if not is_gspl:
+        if len(norm) == 1:
+            median_value = float(norm.iloc[0])
+            joined["median_value"] = median_value
+            joined["deviation_pct"] = 0.0
+        else:
+            median_value = float(norm.median())
+            if pd.isna(median_value) or median_value == 0:
+                return (
+                    pd.DataFrame(columns=[*base_cols, "scb_name", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings", "scb_label"]),
+                    pd.DataFrame(remarks, columns=["severity", "scb_label", "message"]),
+                    "median_zero",
+                )
+            joined["median_value"] = median_value
+            # STEP 8 — DEVIATION CALCULATION (UNCHANGED FORMULA)
+            joined["deviation_pct"] = ((joined["normalized_value"] / median_value) - 1.0) * 100.0
     else:
-        median_value = float(norm.median())
-        if pd.isna(median_value) or median_value == 0:
+        # GSPL-specific unit-wise median benchmark (AFTER elimination + normalization).
+        # Group keys: inv_stn_name + inv_name + inv_unit_name
+        grp_keys = ["inv_stn_name", "inv_name", "inv_unit_name"]
+        tmp = joined.copy()
+        tmp["normalized_value"] = pd.to_numeric(tmp["normalized_value"], errors="coerce")
+
+        group_n = (
+            tmp.groupby(grp_keys, dropna=False)["normalized_value"]
+            .size()
+            .reset_index(name="_group_n")
+        )
+        group_median = (
+            tmp.groupby(grp_keys, dropna=False)["normalized_value"]
+            .median()
+            .reset_index()
+            .rename(columns={"normalized_value": "median_value"})
+        )
+
+        tmp = tmp.merge(group_n, on=grp_keys, how="left").merge(group_median, on=grp_keys, how="left")
+
+        # Per-group edge cases (must match existing intent, but applied unit-wise):
+        # - group size == 1 => deviation = 0.0 and median_value = normalized_value
+        one_mask = pd.to_numeric(tmp["_group_n"], errors="coerce").fillna(0).astype(int) <= 1
+        tmp.loc[one_mask, "median_value"] = tmp.loc[one_mask, "normalized_value"]
+        tmp.loc[one_mask, "deviation_pct"] = 0.0
+
+        # - median_value == 0 or NaN => abort computation for that group (drop its SCBs)
+        med = pd.to_numeric(tmp["median_value"], errors="coerce")
+        bad_med = med.isna() | (med == 0)
+        tmp = tmp.loc[~bad_med].copy()
+        if tmp.empty:
             return (
                 pd.DataFrame(columns=[*base_cols, "scb_name", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings", "scb_label"]),
                 pd.DataFrame(remarks, columns=["severity", "scb_label", "message"]),
-                "median_zero",
+                "no_normalized",
             )
-        joined["median_value"] = median_value
-        # STEP 8 — DEVIATION CALCULATION (UNCHANGED FORMULA)
-        joined["deviation_pct"] = ((joined["normalized_value"] / median_value) - 1.0) * 100.0
+
+        many_mask = pd.to_numeric(tmp["_group_n"], errors="coerce").fillna(0).astype(int) > 1
+        tmp.loc[many_mask, "deviation_pct"] = ((tmp.loc[many_mask, "normalized_value"] / tmp.loc[many_mask, "median_value"]) - 1.0) * 100.0
+
+        # Clean up helper column
+        joined = tmp.drop(columns=["_group_n"], errors="ignore")
 
     # STEP 9 — DISCONNECTED STRING CHECK (NEW INSIGHT)
     # disconnected_check = ((median_value * string_num) - SCB_PEAK) / median_value
-    mv = float(pd.to_numeric(joined["median_value"], errors="coerce").iloc[0]) if not joined.empty else 0.0
-    if mv != 0:
-        disconnected_check = ((mv * pd.to_numeric(joined["string_num"], errors="coerce")) - pd.to_numeric(joined["scb_peak"], errors="coerce")) / mv
+    # IMPORTANT:
+    # - Non-GSPL keeps the historical scalar median behavior.
+    # - GSPL must use the SAME unit-wise median_value already attached per row (no new median computation).
+    is_gspl = str(site_name).strip().upper() == "GSPL"
+    if is_gspl:
+        mv_series = pd.to_numeric(joined["median_value"], errors="coerce")
+        disconnected_check = ((mv_series * pd.to_numeric(joined["string_num"], errors="coerce")) - pd.to_numeric(joined["scb_peak"], errors="coerce")) / mv_series
         disconnected_check = pd.to_numeric(disconnected_check, errors="coerce")
         joined["_disconnected_check"] = disconnected_check
         joined["disconnected_strings"] = joined["_disconnected_check"].apply(lambda x: int((x // 1)) if pd.notna(x) and float(x) > 1.0 else 0)
     else:
-        joined["disconnected_strings"] = 0
+        mv = float(pd.to_numeric(joined["median_value"], errors="coerce").iloc[0]) if not joined.empty else 0.0
+        if mv != 0:
+            disconnected_check = ((mv * pd.to_numeric(joined["string_num"], errors="coerce")) - pd.to_numeric(joined["scb_peak"], errors="coerce")) / mv
+            disconnected_check = pd.to_numeric(disconnected_check, errors="coerce")
+            joined["_disconnected_check"] = disconnected_check
+            joined["disconnected_strings"] = joined["_disconnected_check"].apply(lambda x: int((x // 1)) if pd.notna(x) and float(x) > 1.0 else 0)
+        else:
+            joined["disconnected_strings"] = 0
 
     for r in joined.itertuples(index=False):
         lbl = getattr(r, "scb_label")
         ds = int(getattr(r, "disconnected_strings"))
         if ds > 0:
-            remarks.append({"severity": "insight", "scb_label": lbl, "message": f"Possible disconnected strings detected: {ds}"})
+            remarks.append({"severity": "insight", "scb_label": lbl, "message": f"Possible disconnected strings detected: {ds} (sum = {int(ds)})"})
 
     out = joined[[*base_cols, "scb_name", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings", "scb_label"]].copy()
     remarks_df = pd.DataFrame(remarks, columns=["severity", "scb_label", "message"])
@@ -983,6 +1084,11 @@ def _compute_scb_ot_peak_pipeline(
 def render_scb_ot(db_path: str) -> None:
     st.markdown("## SCB OT (SCB Operation Theatre)")
     st.caption("Read-only SCB deviation analysis (06:00–18:00 window). No DB writes.")
+
+    # Username-based access control (UI/data-filter driven)
+    from access_control import allowed_sites_for_user, is_admin, is_restricted_user
+
+    username = st.session_state.get("user_info", {}).get("username")
 
     try:
         sites = list_sites_from_array_details(db_path)
@@ -994,6 +1100,11 @@ def render_scb_ot(db_path: str) -> None:
         st.info("No sites found in array_details.site_name.")
         return
 
+    allowed_sites = allowed_sites_for_user(username)
+    if allowed_sites:
+        allowed_l = {str(x).strip().lower() for x in allowed_sites}
+        sites = [s for s in sites if str(s).strip().lower() in allowed_l]
+
     # UI REQUIREMENTS (STRICT):
     # - Site Name multiselect (MUST default empty)
     # - Threshold % (numeric, optional)
@@ -1004,22 +1115,33 @@ def render_scb_ot(db_path: str) -> None:
     c_site, c_thr, c_n = st.columns([3.8, 1.8, 1.8], vertical_alignment="bottom")
 
     with c_site:
-        # Mandatory: default selection must be EMPTY.
-        selected_sites = st.multiselect("Site Name", options=sites, default=[], key="scb_ot_site_multiselect")
+        # For restricted users: auto-select their single allowed site so Plot Now is enabled.
+        if is_restricted_user(username) and sites:
+            selected_sites = st.multiselect(
+                "Site Name",
+                options=sites,
+                default=[sites[0]],
+                disabled=True,
+                key="scb_ot_site_multiselect",
+            )
+        else:
+            # Admin behavior remains unchanged (empty by default).
+            selected_sites = st.multiselect("Site Name", options=sites, default=[], key="scb_ot_site_multiselect")
+
+    # Defensive guard (safety net)
+    if is_restricted_user(username):
+        if len(selected_sites) > 0 and str(selected_sites[0]).strip().lower() != str(username).strip().lower():
+            st.error("Unauthorized site access")
+            st.stop()
 
     with c_thr:
-        default_threshold = st.session_state.get("scb_ot_threshold", "")
-        thr_txt = st.text_input("Threshold (%) (optional)", value=default_threshold, placeholder="e.g. -3", key="scb_ot_threshold_input")
-        st.session_state["scb_ot_threshold"] = thr_txt
-        threshold_val: Optional[float]
-        if thr_txt.strip() == "":
-            threshold_val = None
-        else:
-            try:
-                threshold_val = float(thr_txt)
-            except Exception:
-                threshold_val = None
-                st.warning("Threshold must be a number.")
+        threshold_val = st.number_input(
+            "Threshold (%)",
+            value=-3.0,
+            step=0.5,
+            help="Deviation threshold. SCBs with deviation <= threshold will be shown.",
+            key="scb_ot_threshold_number",
+        )
 
     with c_n:
         # Kept for UI consistency with Operation Theatre (currently not used by SCB OT logic).
@@ -1141,49 +1263,67 @@ def render_scb_ot(db_path: str) -> None:
 
     st.caption(f"Time window is enforced internally (SQL): **{TIME_START} onward** (data before is ignored).")
 
-    with st.spinner("Fetching and processing SCB data…"):
-        df_raw = _fetch_raw_scb_data(
-            db_path=db_path,
-            table=table,
-            from_date=from_date,
-            to_date=to_date,
-            scb_cols=scb_cols,
-        )
+    prog = st.progress(0, text="Starting…")
+    prog.progress(0.2, text="Fetching SCB data…")
+    df_raw = _fetch_raw_scb_data(
+        db_path=db_path,
+        table=table,
+        from_date=from_date,
+        to_date=to_date,
+        scb_cols=scb_cols,
+    )
 
-        if df_raw.empty:
-            st.info("No data found for the selected filters/time window.")
-            return
+    if df_raw.empty:
+        prog.progress(1.0, text="No data")
+        st.info("No data found for the selected filters/time window.")
+        return
 
-        dev, remarks_df, abort_reason = _compute_scb_ot_peak_pipeline(
-            df_raw=df_raw,
-            site_name=site_name,
-            table=table,
-            from_date=from_date,
-            to_date=to_date,
-            scb_cols=list(scb_cols),
-            db_path=db_path,
-        )
-        if abort_reason == "median_zero":
-            st.warning("Abort: median(normalized_value) is zero. Cannot compute deviations.")
-            # Still show remarks if present (mandatory).
-            if remarks_df is not None and not remarks_df.empty:
-                st.markdown("### Remarks")
-                st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
-            return
-        if dev is None or dev.empty:
-            st.warning("Unable to compute deviations (no SCBs remained after elimination/skip rules).")
-            if remarks_df is not None and not remarks_df.empty:
-                st.markdown("### Remarks")
-                st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
-            return
+    prog.progress(0.5, text="Applying elimination and normalization…")
+    dev, remarks_df, abort_reason = _compute_scb_ot_peak_pipeline(
+        df_raw=df_raw,
+        site_name=site_name,
+        table=table,
+        from_date=from_date,
+        to_date=to_date,
+        scb_cols=list(scb_cols),
+        db_path=db_path,
+    )
+    if abort_reason == "median_zero":
+        prog.progress(1.0, text="Aborted")
+        st.warning("Abort: median(normalized_value) is zero. Cannot compute deviations.")
+        # Still show remarks if present (mandatory).
+        if remarks_df is not None and not remarks_df.empty:
+            st.markdown("### Remarks")
+            st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
+        return
+    if dev is None or dev.empty:
+        prog.progress(1.0, text="No results")
+        st.warning("Unable to compute deviations (no SCBs remained after elimination/skip rules).")
+        if remarks_df is not None and not remarks_df.empty:
+            st.markdown("### Remarks")
+            st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
+        return
 
-        # Strict hierarchical sorting (IS -> INV -> SCB) before plotting.
-        dev = dev.copy()
-        dev["sort_key"] = dev["scb_label"].apply(_parse_scb_label)
-        dev = dev.sort_values(["sort_key"], ascending=True).reset_index(drop=True)
+    prog.progress(0.8, text="Computing deviation & disconnected strings…")
+    # Strict hierarchical sorting (IS -> INV -> SCB) before plotting.
+    dev = dev.copy()
+    dev["sort_key"] = dev["scb_label"].apply(_parse_scb_label)
+    dev = dev.sort_values(["sort_key"], ascending=True).reset_index(drop=True)
+    prog.progress(1.0, text="SCB OT results ready")
 
     st.markdown("### Results")
     st.caption("Outliers are removed per SCB (cells nullified), peaks are selected per SCB, and normalization uses string_num (no DB writes).")
+
+    # KPIs above remarks table (SCB-count-based, not reason-count-based)
+    below_threshold_count = 0
+    with_comments_count = 0
+
+    st.markdown("### 🧠 SCB Health Insights")
+    insight_df = build_scb_insight_summary(remarks_df)
+    if insight_df.empty:
+        st.info("No eliminations or anomalies detected for the selected window.")
+    else:
+        st.dataframe(insight_df, hide_index=True, width="stretch")
 
     # Remarks system (MANDATORY): eliminations, skips, insights
     # Requirement: remarks table must be collapsed by default, but still visible/accessible.
@@ -1234,6 +1374,8 @@ def render_scb_ot(db_path: str) -> None:
                 },
             )
 
+            pass
+
     # Threshold behavior (IMPORTANT CORRECTION):
     # Threshold acts as FILTER + RED COLOR.
     if threshold_val is None:
@@ -1253,7 +1395,11 @@ def render_scb_ot(db_path: str) -> None:
         with st.expander("Show full table (unfiltered)", expanded=False):
             show_cols = ["scb_label", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings"]
             present = [c for c in show_cols if c in dev.columns]
-            st.dataframe(dev[present], width="stretch", hide_index=True)
+            display_df = dev[present].drop(columns=["scb_median"], errors="ignore").copy()
+            if "scb_label" in display_df.columns:
+                display_df["_sort_key"] = display_df["scb_label"].map(_parse_scb_label)
+                display_df = display_df.sort_values("_sort_key").drop(columns="_sort_key")
+            st.dataframe(display_df, width="stretch", hide_index=True)
         return
 
     fig = px.bar(
@@ -1271,6 +1417,87 @@ def render_scb_ot(db_path: str) -> None:
     with st.expander("Show table"):
         show_cols = ["scb_label", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings"]
         present = [c for c in show_cols if c in dev_plot.columns]
-        st.dataframe(dev_plot[present], width="stretch", hide_index=True)
+        display_df = dev_plot[present].drop(columns=["scb_median"], errors="ignore").copy()
+        if "scb_label" in display_df.columns:
+            display_df["_sort_key"] = display_df["scb_label"].map(_parse_scb_label)
+            display_df = display_df.sort_values("_sort_key").drop(columns="_sort_key")
+        st.dataframe(display_df, width="stretch", hide_index=True)
+
+    # -----------------------------
+    # SCB Comments (Supabase) — shown BELOW the SCB OT show table
+    # -----------------------------
+    st.markdown("### SCB Comments")
+    prog2 = st.progress(0, text="Fetching SCB comments…")
+    comments_df = pd.DataFrame()
+    try:
+        import add_comments  # reuse existing Supabase logic + AgGrid config
+
+        # Avoid cached "no comments" results; comments must reflect Supabase as source of truth.
+        try:
+            add_comments.fetch_comments_live.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        comments_df = add_comments.fetch_comments_live(site_name=str(site_name), start_date=from_date, end_date=to_date, limit=2000)
+    except Exception:
+        comments_df = pd.DataFrame()
+    prog2.progress(1.0, text="SCB comments ready")
+
+    # Filter SCB-only comments (equipment_names contains SCB label)
+    scb_comments = pd.DataFrame()
+    if comments_df is not None and not comments_df.empty:
+        tmp = comments_df.copy()
+        # explode equipment_names into a single equipment_names cell per row
+        if "equipment_names" in tmp.columns:
+            tmp = tmp.explode("equipment_names")
+        else:
+            tmp["equipment_names"] = ""
+        tmp["equipment_names"] = tmp["equipment_names"].astype(str)
+        tmp = tmp[tmp["equipment_names"].str.contains("SCB", case=False, na=False)].copy()
+
+        # normalize dates for display
+        if "start_date" in tmp.columns:
+            # AgGrid renders Python date objects as [object Object] in some setups; use ISO strings for clean UI.
+            tmp["start_date"] = pd.to_datetime(tmp["start_date"], errors="coerce").dt.date.astype(str)
+        if "end_date" in tmp.columns:
+            tmp["end_date"] = pd.to_datetime(tmp["end_date"], errors="coerce").dt.date.astype(str)
+
+        # reasons is typically a list; keep as string for clean UI while preserving content
+        if "reasons" in tmp.columns:
+            tmp["reasons"] = tmp["reasons"].apply(lambda x: ", ".join([str(v) for v in x]) if isinstance(x, list) else ("" if x is None else str(x)))
+
+        # Required display columns (exact order)
+        cols_order = ["site_name", "deviation", "start_date", "end_date", "equipment_names", "reasons", "remarks"]
+        present_cols = [c for c in cols_order if c in tmp.columns]
+        scb_comments = tmp[present_cols].copy()
+        # Deterministic sort by SCB label (hierarchical)
+        if "equipment_names" in scb_comments.columns:
+            scb_comments["_sort_key"] = scb_comments["equipment_names"].map(_parse_scb_label)
+            scb_comments = scb_comments.sort_values("_sort_key").drop(columns="_sort_key")
+
+    # KPI bar (SCB-count-based)
+    try:
+        if threshold_val is None:
+            dev_below = dev.copy()
+        else:
+            dev_below = dev[dev["deviation_pct"] <= float(threshold_val)].copy()
+        below_set = set(dev_below["scb_label"].astype(str).tolist()) if not dev_below.empty and "scb_label" in dev_below.columns else set()
+        comment_set = set(scb_comments["equipment_names"].astype(str).tolist()) if scb_comments is not None and not scb_comments.empty and "equipment_names" in scb_comments.columns else set()
+        k1, k2 = st.columns(2)
+        with k1:
+            st.metric("Total SCBs below threshold", f"{len(below_set)}")
+        with k2:
+            st.metric("Total SCBs with comments", f"{len(below_set.intersection(comment_set))}")
+    except Exception:
+        pass
+
+    if scb_comments is None or scb_comments.empty:
+        st.info("No SCB comments found for the selected site and date range.")
+    else:
+        try:
+            # AgGrid (same configuration as Add Comments)
+            add_comments._render_aggrid_table(scb_comments, key="scb_ot_scb_comments", height=360)  # type: ignore[attr-defined]
+        except Exception:
+            st.dataframe(scb_comments, width="stretch", hide_index=True)
 
 
