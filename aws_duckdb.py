@@ -148,14 +148,36 @@ def _ensure_db_local(db_local: str = "master.duckdb") -> str:
 
     # Lockfile (best-effort)
     lock_path = local_path.with_suffix(local_path.suffix + ".lock")
+    # If a previous run crashed, the lockfile can be left behind forever.
+    # Treat sufficiently old locks as stale and remove them.
+    # Keep this relatively small: Streamlit reruns can happen frequently, and a crash can
+    # leave a 0-byte lockfile behind. If a lock is older than this, we consider it stale.
+    STALE_LOCK_SECONDS = 5 * 60  # 5 minutes
     start = time.time()
     while True:
         try:
             # atomic create
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                # best-effort metadata (helps debugging)
+                os.write(fd, f"pid={os.getpid()}\ncreated_at={time.time()}\n".encode("utf-8"))
+            except Exception:
+                pass
             os.close(fd)
             break
         except FileExistsError:
+            # Stale lock cleanup
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+                if age > STALE_LOCK_SECONDS:
+                    try:
+                        os.remove(str(lock_path))
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
+                # If we can't stat it, just fall back to waiting
+                pass
             # After lock wait, check again if another process downloaded it
             if local_path.exists() and local_path.stat().st_size > 0 and etag_path.exists():
                 try:

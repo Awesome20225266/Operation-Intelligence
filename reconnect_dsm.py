@@ -1434,7 +1434,7 @@ def render(db_path: str) -> None:
                 num_cols = len(selected_plants)
                 if num_cols > 0:
                     summary_cols = st.columns(num_cols)
-                    
+                
                     for idx, plant_name in enumerate(selected_plants):
                         with summary_cols[idx]:
                             summary = get_anomaly_summary(temp_df, plant_name)

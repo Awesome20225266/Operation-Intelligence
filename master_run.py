@@ -10,6 +10,8 @@ import boto3
 from botocore.exceptions import ClientError
 
 import store_data_table_duckdb
+import design_array_injestor
+import apollo_injestor
 
 # RE-Connect pipeline imports
 sys.path.insert(0, str(Path(__file__).parent / "Web Scraping_RE_Connect"))
@@ -97,7 +99,7 @@ def upload_duckdb_to_s3(*, db_path: Path) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="One-command pipeline: Excel -> DuckDB -> RE-Connect -> S3")
+    parser = argparse.ArgumentParser(description="One-command pipeline: Excel -> DuckDB -> Design -> RE-Connect -> Apollo -> S3")
     parser.add_argument("--dgr-dir", default="DGR", help="Folder containing DGR_*.xlsx files (default: DGR)")
     parser.add_argument("--db", default="master.duckdb", help="Local DuckDB file path (default: master.duckdb)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging for the loader")
@@ -108,7 +110,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     db_path = Path(args.db)
 
     # 1) Load Excel -> local DuckDB (uses existing loader as-is)
-    print("=== Step 1/3: Updating local DuckDB from Excel ===")
+    print("=== Step 1/4: Updating local DuckDB from Excel ===")
     rc = store_data_table_duckdb.main(
         [
             "--dgr-dir",
@@ -123,14 +125,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Loader failed with exit code {rc}. Aborting pipeline.")
         return int(rc)
 
+    # 1.5) Design Excel data ingestion
+    print("\n=== Step 1.5/4: Injecting Design Excel Data ===")
+    rc_design = design_array_injestor.main(
+        [
+            "--db",
+            str(db_path),
+            "--design-dir",
+            "design_data",
+        ]
+    )
+    if rc_design != 0:
+        print(f"Design array ingestion failed with exit code {rc_design}. Aborting pipeline.")
+        return int(rc_design)
+    print("✓ Design data ingestion completed")
+
     # 2) RE-Connect pipeline (download -> inject)
     if not args.skip_reconnect:
         if reconnect_downloads is None or reconnect_inject is None:
-            print("=== Step 2/3: RE-Connect pipeline (SKIPPED - modules not available) ===")
+            print("=== Step 2/4: RE-Connect pipeline (SKIPPED - modules not available) ===")
             print(f"  Warning: RE-Connect modules could not be imported: {_reconnect_import_error}")
             print("  Continuing with remaining steps...")
         else:
-            print("=== Step 2/3: RE-Connect pipeline ===")
+            print("=== Step 2/4: RE-Connect pipeline ===")
             
             # 2.1) Download RE-Connect data
             print("\n--- 2.1: Downloading RE-Connect data ---")
@@ -160,10 +177,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 print("✓ RE-Connect ingestion completed")
     else:
-        print("=== Step 2/3: RE-Connect pipeline (SKIPPED by user request) ===")
+        print("=== Step 2/4: RE-Connect pipeline (SKIPPED by user request) ===")
 
-    # 3) Upload DuckDB -> S3 (overwrites object at bucket/key)
-    print("\n=== Step 3/3: Uploading DuckDB to AWS S3 ===")
+    # 3) Apollo ingestion into DuckDB (MANDATORY pre-S3 step)
+    print("\n=== Step 3/4: Injecting Apollo Raw Data into DuckDB ===")
+    try:
+        rc_apollo = apollo_injestor.main(
+            [
+                "--db",
+                str(db_path),
+                "--input-dir",
+                "Apollo Raw Data",
+                *(["--verbose"] if args.verbose else []),
+                *(["--no-progress"] if args.no_progress else []),
+            ]
+        )
+    except Exception as e:
+        print(f"Apollo ingestion failed: {e}. Aborting pipeline (no S3 upload).")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
+    if rc_apollo != 0:
+        print(f"Apollo ingestion failed with exit code {rc_apollo}. Aborting pipeline (no S3 upload).")
+        return int(rc_apollo)
+    print("✓ Apollo ingestion completed")
+
+    # 4) Upload DuckDB -> S3 (overwrites object at bucket/key)
+    print("\n=== Step 4/4: Uploading DuckDB to AWS S3 ===")
     try:
         upload_duckdb_to_s3(db_path=db_path)
         print("✓ Upload complete. Your deployed Streamlit app will use the latest DuckDB from S3.")

@@ -1,249 +1,278 @@
 from __future__ import annotations
 
-import os
-import sys
+import argparse
 import hashlib
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Optional
 
 import duckdb
 import pandas as pd
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
+
 # -----------------------------
 # Configuration
 # -----------------------------
-DB_PATH = "master.duckdb"
-DESIGN_DATA_DIR = Path("design_data")
 
-ARRAY_FILE = DESIGN_DATA_DIR / "array_details.xlsx"
-PLANT_FILE = DESIGN_DATA_DIR / "plant_details.xlsx"
+DEFAULT_DB_PATH = "master.duckdb"
+DEFAULT_DESIGN_DIR = Path("design_data")
+
+# NON-NEGOTIABLE constraint: only these tables may be created/updated
+ALLOWED_TABLES = {"plant_details", "array_details"}
+
 
 # -----------------------------
-# Robust Helpers
+# Excel loading
 # -----------------------------
 
-def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardizes the dataframe:
-    1. Replaces all NA/None/Blank with 0.
-    2. Coerces non-identity columns to numeric where possible, else 0.
-    """
-    df = df.copy()
+def _read_excel_single_dataset(path: Path) -> pd.DataFrame:
+    """Read a single-dataset workbook (row1 headers, remaining rows data)."""
+    df = pd.read_excel(path, header=0)
     df.columns = [str(c).strip() for c in df.columns]
-    
-    # Fill actual NA values
-    df = df.fillna(0)
-    
-    # Clean strings and force "N/A" type strings to 0
-    def _sanitize(val):
-        if isinstance(val, str):
-            v = val.strip().upper()
-            if v in ["", "NA", "N/A", "NONE", "NULL", "-"]:
-                return 0
-        return val
-
-    # Use apply with map instead of deprecated applymap
-    for col in df.columns:
-        df[col] = df[col].map(_sanitize)
-        # Try to convert to numeric, if fails keep as is (will be 0 from sanitize)
-        try:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        except Exception:
-            pass
-
     return df
 
-def get_row_hash(row_dict: dict) -> str:
-    """Creates a unique MD5 hash of the entire row for exact-match detection."""
-    # Sort keys for consistent hashing
-    sorted_items = sorted(row_dict.items())
-    combined = "|".join(f"{k}:{v}" for k, v in sorted_items)
-    return hashlib.md5(combined.encode("utf-8")).hexdigest()
 
-def ingest_table(con: duckdb.DuckDBPyConnection, table_name: str, excel_path: Path, identity_cols: List[str]):
+def _read_excel_union_all_sheets(path: Path) -> pd.DataFrame:
     """
-    Core ingestion engine with Skip/Update/Insert logic.
+    Read ALL sheets from an Excel workbook and union them into one dataframe.
+    - No sheet is skipped under any circumstance
+    - No extra columns (like sheet_name) are added
+    - Assumes all sheets share the same schema
     """
-    if not excel_path.exists():
-        print(f"Skipping {table_name}: File not found at {excel_path}")
-        return
+    xls = pd.ExcelFile(path)
+    sheet_names = list(xls.sheet_names)
+    if not sheet_names:
+        return pd.DataFrame()
 
-    print(f"\n>>> Processing {table_name} from {excel_path.name}...")
+    frames: list[pd.DataFrame] = []
+    it = sheet_names
+    if tqdm is not None:
+        it = tqdm(sheet_names, desc=f"Reading sheets: {path.name}", unit="sheet")
 
-    # 1. Load All Sheets
+    for sheet in it:
+        df_sheet = pd.read_excel(xls, sheet_name=sheet, header=0)
+        df_sheet.columns = [str(c).strip() for c in df_sheet.columns]
+        frames.append(df_sheet)  # do not skip empties
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# -----------------------------
+# Change detection (cell-level, order-independent)
+# -----------------------------
+
+def _canonical_cell(v: Any) -> str:
+    """Canonical representation for safe equality checks across dtype differences."""
+    if pd.isna(v):
+        return "<NA>"
+
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        try:
+            return pd.to_datetime(v).isoformat()
+        except Exception:
+            return str(v)
+
+    if isinstance(v, bool):
+        return "true" if v else "false"
+
+    if isinstance(v, (int, float)):
+        try:
+            fv = float(v)
+            if abs(fv - round(fv)) < 1e-9:
+                return str(int(round(fv)))
+            return format(fv, ".15g")
+        except Exception:
+            return str(v)
+
+    return str(v)
+
+
+def _row_hashes(df: pd.DataFrame, *, desc: str) -> pd.Series:
+    """Compute a stable MD5 hash for each row after canonicalizing values."""
+    cols = list(df.columns)
+
+    canon = df.copy()
+    col_it = cols
+    if tqdm is not None:
+        col_it = tqdm(cols, desc=f"Normalizing: {desc}", unit="col")
+    for c in col_it:
+        canon[c] = canon[c].map(_canonical_cell)
+
+    def _hash_row(row: pd.Series) -> str:
+        s = "\x1f".join(row.values.tolist())
+        return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+    if tqdm is not None:
+        tqdm.pandas(desc=f"Hashing rows: {desc}")  # type: ignore[attr-defined]
+        return canon.progress_apply(_hash_row, axis=1)  # type: ignore[attr-defined]
+    return canon.apply(_hash_row, axis=1)
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = con.execute(
+        "select 1 from information_schema.tables where table_schema='main' and table_name=? limit 1",
+        [table_name],
+    ).fetchone()
+    return bool(row)
+
+
+def _load_table_df(con: duckdb.DuckDBPyConnection, table_name: str) -> pd.DataFrame:
+    return con.execute(f'SELECT * FROM "{table_name}"').df()
+
+
+def _data_changed(excel_df: pd.DataFrame, db_df: pd.DataFrame, *, table_name: str) -> tuple[bool, str]:
+    excel_cols = [str(c).strip() for c in excel_df.columns]
+    db_cols = [str(c).strip() for c in db_df.columns]
+
+    # Normalize column order (comparison should not fail just because DB column order differs)
+    if set(excel_cols) != set(db_cols):
+        return True, "Change detected (column mismatch)"
+
+    # Reorder both frames to a deterministic order (Excel column order)
+    excel_df = excel_df[excel_cols].copy()
+    db_df = db_df[excel_cols].copy()
+
+    excel_hashes = _row_hashes(excel_df, desc=f"{table_name} (excel)")
+    db_hashes = _row_hashes(db_df, desc=f"{table_name} (db)")
+
+    excel_counts = excel_hashes.value_counts(dropna=False).sort_index()
+    db_counts = db_hashes.value_counts(dropna=False).sort_index()
+
+    if not excel_counts.equals(db_counts):
+        return True, "Change detected in row data"
+
+    return False, "No change detected – table not updated"
+
+
+# -----------------------------
+# Safe write (isolated to allowed tables only)
+# -----------------------------
+
+def _write_table(con: duckdb.DuckDBPyConnection, *, table_name: str, df: pd.DataFrame, replace: bool) -> None:
+    if table_name not in ALLOWED_TABLES:
+        raise ValueError(f"Refusing to write to non-allowed table: {table_name}")
+
+    view_name = "__design_df"
+    con.register(view_name, df)
     try:
-        xls = pd.ExcelFile(excel_path)
-        df_list = []
-        for sheet in xls.sheet_names:
-            temp_df = pd.read_excel(xls, sheet_name=sheet, header=0)
-            if not temp_df.empty:
-                df_list.append(temp_df)
-        
-        if not df_list:
-            print(f"  Empty workbook found at {excel_path}")
-            return
-            
-        df = pd.concat(df_list, ignore_index=True)
-        df.columns = [str(c).strip() for c in df.columns]
-    except Exception as e:
-        print(f"  CRITICAL ERROR reading Excel: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
-    # Validate identity columns
-    missing = [c for c in identity_cols if c not in df.columns]
-    if missing:
-        print(f"  ERROR: Identity columns not found: {missing}")
-        print(f"  Available columns: {list(df.columns)}")
-        return
-
-    # 2. Clean Data
-    df = _clean_dataframe(df)
-
-    # 3. Ensure Table Exists (using Excel schema)
-    # Register temp view for schema creation
-    con.register("_tmp_schema", df.head(0))
-    try:
-        con.execute(f"CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM _tmp_schema WHERE 1=0")
+        con.execute("BEGIN TRANSACTION")
+        if replace:
+            con.execute(f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM {view_name}')
+        else:
+            con.execute(f'CREATE TABLE "{table_name}" AS SELECT * FROM {view_name}')
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
     finally:
         try:
-            con.unregister("_tmp_schema")
+            con.unregister(view_name)
         except Exception:
             pass
 
-    # 4. Fetch existing data for comparison
-    try:
-        existing_df = con.execute(f"SELECT * FROM {table_name}").df()
-    except Exception:
-        existing_df = pd.DataFrame()
-    
-    # Maps for high-speed lookup
-    # full_hash -> True (Exact duplicate)
-    # identity_tuple -> full_row_dict (Logical match for potential update)
-    hash_lookup = {}
-    id_lookup = {}
 
-    if not existing_df.empty:
-        existing_df = _clean_dataframe(existing_df)
-        for _, row in existing_df.iterrows():
-            r_dict = row.to_dict()
-            h = get_row_hash(r_dict)
-            hash_lookup[h] = True
-            
-            id_key = tuple(r_dict.get(c) for c in identity_cols)
-            id_lookup[id_key] = r_dict
+def process_table(con: duckdb.DuckDBPyConnection, *, table_name: str, excel_df: pd.DataFrame) -> None:
+    print(f"\nProcessing {table_name}...")
 
-    # 5. Process Rows
-    inserted, updated, skipped = 0, 0, 0
+    if table_name not in ALLOWED_TABLES:
+        raise ValueError(f"Table '{table_name}' is not allowed by constraints.")
 
-    for _, row in df.iterrows():
-        row_dict = row.to_dict()
-        row_hash = get_row_hash(row_dict)
-        id_key = tuple(row_dict.get(c) for c in identity_cols)
-        
-        # LOGIC A: Skip if exact match
-        if row_hash in hash_lookup:
-            id_display = ", ".join(str(v) for v in id_key)
-            print(f"  SKIPPED (duplicate row): {id_display}")
-            skipped += 1
-            continue
-        
-        # LOGIC B: Update if ID exists but data changed
-        if id_key in id_lookup:
-            # Build WHERE clause for DELETE using proper escaping
-            conditions = []
-            for c in identity_cols:
-                v = row_dict.get(c)
-                if pd.isna(v):
-                    conditions.append(f'"{c}" IS NULL')
-                elif isinstance(v, (int, float)):
-                    conditions.append(f'"{c}" = {v}')
-                else:
-                    escaped_val = str(v).replace("'", "''")
-                    conditions.append(f'"{c}" = \'{escaped_val}\'')
-            
-            where_clause = " AND ".join(conditions)
-            
-            # Delete the old version
-            con.execute(f"DELETE FROM {table_name} WHERE {where_clause}")
-            
-            # Insert the new version using VALUES with proper escaping
-            cols = list(row_dict.keys())
-            col_names = ", ".join([f'"{c}"' for c in cols])
-            values = []
-            for c in cols:
-                v = row_dict.get(c)
-                if pd.isna(v):
-                    values.append("NULL")
-                elif isinstance(v, (int, float)):
-                    values.append(str(v))
-                else:
-                    escaped_val = str(v).replace("'", "''")
-                    values.append(f"'{escaped_val}'")
-            
-            val_list = ", ".join(values)
-            con.execute(f"INSERT INTO {table_name} ({col_names}) VALUES ({val_list})")
-            
-            id_display = ", ".join(str(v) for v in id_key)
-            print(f"  UPDATED (row values changed): {id_display}")
-            updated += 1
-        
-        # LOGIC C: Insert if brand new
+    if not _table_exists(con, table_name):
+        if tqdm is not None:
+            p = tqdm(total=1, desc=f"Writing {table_name}", unit="step")
         else:
-            cols = list(row_dict.keys())
-            col_names = ", ".join([f'"{c}"' for c in cols])
-            values = []
-            for c in cols:
-                v = row_dict.get(c)
-                if pd.isna(v):
-                    values.append("NULL")
-                elif isinstance(v, (int, float)):
-                    values.append(str(v))
-                else:
-                    escaped_val = str(v).replace("'", "''")
-                    values.append(f"'{escaped_val}'")
-            
-            val_list = ", ".join(values)
-            con.execute(f"INSERT INTO {table_name} ({col_names}) VALUES ({val_list})")
-            
-            id_display = ", ".join(str(v) for v in id_key)
-            print(f"  INSERTED (new row): {id_display}")
-            inserted += 1
+            p = None
+        _write_table(con, table_name=table_name, df=excel_df, replace=False)
+        if p is not None:
+            p.update(1)
+            p.close()
+        print("Table created and data injected")
+        return
 
-    print(f"--- Finished {table_name}: Inserted {inserted}, Updated {updated}, Skipped {skipped} ---")
+    if tqdm is not None:
+        p = tqdm(total=2, desc=f"Comparing {table_name}", unit="step")
+    else:
+        p = None
+    db_df = _load_table_df(con, table_name)
+    if p is not None:
+        p.update(1)
+
+    changed, remark = _data_changed(excel_df, db_df, table_name=table_name)
+    if p is not None:
+        p.update(1)
+        p.close()
+
+    if not changed:
+        print(remark)
+        return
+
+    print(remark)
+    if tqdm is not None:
+        p2 = tqdm(total=1, desc=f"Updating {table_name}", unit="step")
+    else:
+        p2 = None
+    _write_table(con, table_name=table_name, df=excel_df, replace=True)
+    if p2 is not None:
+        p2.update(1)
+        p2.close()
+    print("Data updated due to change detected")
+
 
 # -----------------------------
-# Entry Point
+# Entry point
 # -----------------------------
 
-def main():
-    if not DESIGN_DATA_DIR.exists():
-        print(f"Error: Directory '{DESIGN_DATA_DIR}' not found. Please create it and add your Excel files.")
-        sys.exit(1)
-    
-    # Connect to the DB (it will create master.duckdb if not present)
-    con = duckdb.connect(DB_PATH)
+def ingest_design_data(*, db_path: str, design_dir: Path) -> int:
+    array_file = design_dir / "array_details.xlsx"
+    plant_file = design_dir / "plant_details.xlsx"
 
+    if not design_dir.exists():
+        print(f"Error: Directory '{design_dir}' not found.")
+        return 1
+
+    if not plant_file.exists():
+        print(f"Error: Missing required file: {plant_file}")
+        return 1
+
+    if not array_file.exists():
+        print(f"Error: Missing required file: {array_file}")
+        return 1
+
+    # Load Excel (progress)
+    if tqdm is not None:
+        p = tqdm(total=2, desc="Loading design Excel files", unit="file")
+    else:
+        p = None
+    plant_df = _read_excel_single_dataset(plant_file)
+    if p is not None:
+        p.update(1)
+    array_df = _read_excel_union_all_sheets(array_file)
+    if p is not None:
+        p.update(1)
+        p.close()
+
+    con = duckdb.connect(db_path)
     try:
-        # Identity columns based on your Excel structures:
-        # plant_details: 'category' + 'tags' uniquely defines a metric row
-        ingest_table(
-            con=con, 
-            table_name="plant_details", 
-            excel_path=PLANT_FILE, 
-            identity_cols=["category", "tags"]
-        )
-
-        # array_details: 'tag_name' is the unique equipment identifier
-        ingest_table(
-            con=con, 
-            table_name="array_details", 
-            excel_path=ARRAY_FILE, 
-            identity_cols=["tag_name"]
-        )
+        process_table(con, table_name="plant_details", excel_df=plant_df)
+        process_table(con, table_name="array_details", excel_df=array_df)
     finally:
         con.close()
 
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Ingest design Excel files into DuckDB (safe + idempotent).")
+    parser.add_argument("--db", default=DEFAULT_DB_PATH, help="DuckDB path (default: master.duckdb)")
+    parser.add_argument("--design-dir", default=str(DEFAULT_DESIGN_DIR), help="Design data dir (default: design_data/)")
+    args = parser.parse_args(argv)
+    return ingest_design_data(db_path=str(args.db), design_dir=Path(args.design_dir))
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
