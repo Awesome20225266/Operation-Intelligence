@@ -369,45 +369,31 @@ def _upsert_site_df(
     df: pd.DataFrame,
     existing_dates: Optional[set[str]] = None,
     overwrite: bool = False,
-) -> int:
+) -> tuple[int, int]:
+    """
+    Upsert dataframe into site table with NULL-aware updates.
+    Returns: (updated_count, inserted_count) tuple
+    """
     if df is None or df.empty:
-        return 0
+        return (0, 0)
 
-    # Filter out dates that already exist (idempotent behavior), unless overwrite is requested
-    if not overwrite:
-        if existing_dates is None:
-            existing_dates = _get_existing_dates(con, table=table)
-        
-        if existing_dates:
-            df_filtered = df[~df["date"].isin(existing_dates)].copy()
-            skipped_dates = sorted(set(df["date"].unique()) & existing_dates)
-            if skipped_dates:
-                LOGGER.info('Date data already exists in DB: "%s" (%s) (skipped)', table, ", ".join(skipped_dates))
-        else:
-            df_filtered = df.copy()
-    else:
-        df_filtered = df.copy()
-    
-    if df_filtered.empty:
-        return 0
-
-    scb_cols = [c for c in df_filtered.columns if str(c).upper().startswith("SCB")]
+    scb_cols = [c for c in df.columns if str(c).upper().startswith("SCB")]
     _ensure_site_table(con, table, scb_cols)
 
     # Align df to table columns (base + sorted scbs)
     insert_cols = MANDATORY_BASE_COLS + sorted(scb_cols)
     for c in insert_cols:
-        if c not in df_filtered.columns:
-            df_filtered[c] = None
-    df2 = df_filtered[insert_cols].copy()
+        if c not in df.columns:
+            df[c] = None
+    df2 = df[insert_cols].copy()
 
-    # Register + TEMP TABLE for set-based delete/insert
+    # Register + TEMP TABLE for incoming data
     con.register("_apollo_incoming_df", df2)
     con.execute('CREATE OR REPLACE TEMP TABLE _apollo_incoming AS SELECT * FROM _apollo_incoming_df')
 
-    # If overwriting, delete existing rows for incoming dates first
     if overwrite:
-        con.execute(
+        # Overwrite mode: delete existing matching rows, then insert all incoming
+        deleted = con.execute(
             f"""
             DELETE FROM "{table}" AS t
             USING _apollo_incoming AS s
@@ -417,14 +403,93 @@ def _upsert_site_df(
                 AND t.inv_stn_name = s.inv_stn_name
                 AND t.inv_name = s.inv_name
             """
-        )
-
-    # Insert new data (existing dates already filtered out if not overwriting)
-    col_list = ", ".join([f'"{c}"' for c in insert_cols])
-    con.execute(f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM _apollo_incoming')
-    inserted = int(con.execute("SELECT COUNT(*) FROM _apollo_incoming").fetchone()[0])
+        ).fetchone()
+        col_list = ", ".join([f'"{c}"' for c in insert_cols])
+        con.execute(f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM _apollo_incoming')
+        inserted = int(con.execute("SELECT COUNT(*) FROM _apollo_incoming").fetchone()[0])
+        updated = 0  # Overwrite doesn't count as updates
+    else:
+        # NULL-aware upsert mode: update existing rows to fill NULLs, insert new rows
+        # Step 0: Count rows that will be updated (matching rows with NULLs to fill) BEFORE update
+        updated = 0
+        if scb_cols:
+            # Count distinct matching rows that have at least one NULL SCB column that will be filled
+            updated_count_result = con.execute(
+                f"""
+                SELECT COUNT(DISTINCT t.date || '|' || t.timestamp || '|' || t.inv_stn_name || '|' || t.inv_name)
+                FROM "{table}" AS t
+                INNER JOIN _apollo_incoming AS s
+                ON t.date = s.date
+                AND t.timestamp = s.timestamp
+                AND t.inv_stn_name = s.inv_stn_name
+                AND t.inv_name = s.inv_name
+                WHERE (
+                    -- At least one SCB column has NULL in existing and value in incoming
+                    {' OR '.join([f'(t."{scb_col}" IS NULL AND s."{scb_col}" IS NOT NULL)' for scb_col in sorted(scb_cols)])}
+                )
+                """
+            ).fetchone()
+            updated = int(updated_count_result[0]) if updated_count_result else 0
+        
+        # Step 1: Update existing rows - fill NULL SCB columns with incoming values
+        if scb_cols and updated > 0:
+            scb_update_parts = []
+            for scb_col in sorted(scb_cols):
+                # COALESCE: use existing value if not NULL, otherwise use incoming value
+                scb_update_parts.append(f'"{scb_col}" = COALESCE(t."{scb_col}", s."{scb_col}")')
+            
+            update_sql = f"""
+                UPDATE "{table}" AS t
+                SET {', '.join(scb_update_parts)}
+                FROM _apollo_incoming AS s
+                WHERE
+                    t.date = s.date
+                    AND t.timestamp = s.timestamp
+                    AND t.inv_stn_name = s.inv_stn_name
+                    AND t.inv_name = s.inv_name
+                    AND (
+                        -- Only update if at least one SCB column has NULL in existing and value in incoming
+                        {' OR '.join([f'(t."{scb_col}" IS NULL AND s."{scb_col}" IS NOT NULL)' for scb_col in sorted(scb_cols)])}
+                    )
+            """
+            con.execute(update_sql)
+        
+        # Step 2: Insert rows that don't exist yet (no matching date/timestamp/inv_stn_name/inv_name)
+        # Count BEFORE inserting (after insert, NOT EXISTS will return 0 since rows now exist)
+        inserted_result = con.execute(
+            f"""
+            SELECT COUNT(*) FROM _apollo_incoming AS s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{table}" AS t
+                WHERE t.date = s.date
+                AND t.timestamp = s.timestamp
+                AND t.inv_stn_name = s.inv_stn_name
+                AND t.inv_name = s.inv_name
+            )
+            """
+        ).fetchone()
+        inserted = int(inserted_result[0]) if inserted_result else 0
+        
+        # Now perform the INSERT
+        if inserted > 0:
+            col_list = ", ".join([f'"{c}"' for c in insert_cols])
+            insert_sql = f"""
+                INSERT INTO "{table}" ({col_list})
+                SELECT {col_list}
+                FROM _apollo_incoming AS s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM "{table}" AS t
+                    WHERE
+                        t.date = s.date
+                        AND t.timestamp = s.timestamp
+                        AND t.inv_stn_name = s.inv_stn_name
+                        AND t.inv_name = s.inv_name
+                )
+            """
+            con.execute(insert_sql)
+    
     con.unregister("_apollo_incoming_df")
-    return inserted
+    return (updated, inserted)
 
 
 def ingest_apollo(*, input_dir: Path, db_path: Path, verbose: bool = False, no_progress: bool = False, overwrite: bool = False) -> int:
@@ -494,7 +559,8 @@ def ingest_apollo(*, input_dir: Path, db_path: Path, verbose: bool = False, no_p
 
     con = duckdb.connect(str(db_path))
     try:
-        total = 0
+        total_updated = 0
+        total_inserted = 0
         for site_name, df_site in df_all.groupby("site_name", dropna=False):
             if site_name is None or str(site_name).strip() == "" or str(site_name).lower() == "nan":
                 LOGGER.info("Skipping group with empty site_name")
@@ -502,11 +568,23 @@ def ingest_apollo(*, input_dir: Path, db_path: Path, verbose: bool = False, no_p
             table = _sanitize_table_name(str(site_name))
             # Check existing dates once per site table for efficiency (unless overwriting)
             existing_dates = _get_existing_dates(con, table=table) if not overwrite else None
-            inserted = _upsert_site_df(con, table=table, df=df_site, existing_dates=existing_dates, overwrite=overwrite)
-            total += inserted
-            if inserted > 0:
-                LOGGER.info('Inserted into "%s": %d rows', table, inserted)
-        LOGGER.info("Done. Total rows inserted: %d", total)
+            updated, inserted = _upsert_site_df(con, table=table, df=df_site, existing_dates=existing_dates, overwrite=overwrite)
+            total_updated += updated
+            total_inserted += inserted
+            if overwrite:
+                if inserted > 0:
+                    LOGGER.info('Overwrote "%s": %d rows (deleted and re-inserted)', table, inserted)
+            else:
+                if updated > 0 and inserted > 0:
+                    LOGGER.info('Upserted into "%s": %d rows updated (NULLs filled), %d rows inserted', table, updated, inserted)
+                elif updated > 0:
+                    LOGGER.info('Updated "%s": %d rows (NULLs filled, no new rows)', table, updated)
+                elif inserted > 0:
+                    LOGGER.info('Inserted into "%s": %d new rows', table, inserted)
+        if overwrite:
+            LOGGER.info("Done. Total rows overwritten: %d", total_inserted)
+        else:
+            LOGGER.info("Done. Total rows updated (NULLs filled): %d, Total rows inserted: %d", total_updated, total_inserted)
         return 0
     finally:
         con.close()

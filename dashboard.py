@@ -700,7 +700,7 @@ def page_dashboard(db_path: str, f: Filters) -> None:
                 title="Generation: Actual vs Target (Last 24h)",
                 y_title="kWh",
             )
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
         except Exception as e:
             st.error(f"Error rendering generation chart: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -730,7 +730,7 @@ def page_dashboard(db_path: str, f: Filters) -> None:
                 title="Irradiance: Actual vs Target (Last 24h)",
                 y_title="W/m²",
             )
-            st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
         except Exception as e:
             st.error(f"Error rendering irradiance chart: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -756,7 +756,7 @@ def page_inverter_bd(db_path: str, f: Filters) -> None:
             x_title="PR (%)",
             color=PLOTLY_COLORS["accent"],
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     except Exception as e:
         st.error(f"Error rendering inverter chart: {e}")
 
@@ -781,7 +781,7 @@ def page_string_bd(db_path: str, f: Filters) -> None:
             x_title="SYD (%)",
             color=PLOTLY_COLORS["actual"],
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     except Exception as e:
         st.error(f"Error rendering string chart: {e}")
 
@@ -829,7 +829,7 @@ def page_losses(db_path: str, f: Filters) -> None:
         )
         fig.update_layout(**_plotly_base_layout("Loss Breakdown", y_title="kWh"))
         fig.update_xaxes(showgrid=False)
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     except Exception as e:
         st.error(f"Error rendering loss chart: {e}")
 

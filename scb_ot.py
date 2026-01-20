@@ -33,9 +33,9 @@ from datetime import date
 import re
 from typing import Iterable, Optional
 
+import numpy as np
 import duckdb
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 from aws_duckdb import get_duckdb_connection
@@ -51,11 +51,196 @@ TIME_END = "23:59:59"
 ABS_SCB_MAX = 1000.0
 
 
+# -----------------------------------------------------------------------------
+# REUSABLE PLOTLY HELPER: Inverter–SCB Diagnostic Map (VISUALIZATION ONLY)
+# -----------------------------------------------------------------------------
+def _build_inverter_scb_diagnostic_map(
+    *,
+    pivot_dev: pd.DataFrame,
+    pivot_disc: pd.DataFrame,
+    inverter_order: list,
+    scb_order: list,
+    title: str = "Inverter–SCB Performance & Fault Diagnostic Map",
+):
+    """
+    Builds a responsive 2-panel Plotly diagnostic map:
+    - Left: Heatmap (Deviation %)
+    - Right: Horizontal bar chart (Total Disconnected Strings)
+
+    Assumes all computation is already done.
+    Returns a Plotly Figure ready for st.plotly_chart().
+    """
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+
+    # -----------------------------
+    # Normal heatmap diagnostic map (previous behavior)
+    # - Left: heatmap of deviation (%) by inverter block vs SCB position
+    # - Right: total disconnected strings per inverter block (barh)
+    # -----------------------------
+    n_scb = len(scb_order)
+    n_inv = len(inverter_order)
+
+    # Dynamic width ratios (simple + stable)
+    heatmap_width_ratio = min(0.85, max(0.65, n_scb / (n_scb + 6))) if n_scb else 0.75
+    bar_width_ratio = 1 - heatmap_width_ratio
+
+    # Disconnected strings summary (hide zeros, sort desc)
+    inv_disc_sum = pivot_disc.fillna(0).sum(axis=1)
+    inv_disc_sum = inv_disc_sum[inv_disc_sum > 0].sort_values(ascending=False)
+
+    # Severity-based coloring for disconnected strings (UI only)
+    def _severity_color(v: int) -> str:
+        if v >= 9:
+            return "#7f1d1d"  # Critical (dark red)
+        elif v >= 6:
+            return "#dc2626"  # High (red)
+        elif v >= 3:
+            return "#f97316"  # Medium (orange)
+        else:
+            return "#fca5a5"  # Low (light red)
+
+    # Dynamic sizing (works across ASPL/GSPL)
+    row_height = 42 if n_inv >= 10 else 40
+    calculated_height = max(500, n_inv * row_height)
+
+    if n_inv >= 20:
+        colorbar_y = -0.35
+    elif n_inv >= 10:
+        colorbar_y = -0.32
+    else:
+        colorbar_y = -0.28
+
+    bottom_margin = max(120, 100 + int(n_inv / 3))
+
+    # Heatmap text: show disconnected strings ONLY if > 0
+    disc_vals = pivot_disc.fillna(0).to_numpy()
+    disc_int = disc_vals.astype(int, copy=False)
+    text_vals = np.where(disc_int > 0, disc_int.astype(str), "")
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        shared_yaxes=True,
+        column_widths=[heatmap_width_ratio, bar_width_ratio],
+        horizontal_spacing=0.12,  # Increased gap to prevent text overlap
+    )
+
+    # Disable hover on "gaps" (NaN/None cells). This prevents tooltips for SCBs
+    # that are not present after threshold filtering (or missing per inverter).
+    z_vals = pd.to_numeric(pd.DataFrame(pivot_dev).to_numpy().ravel(), errors="coerce").reshape(pivot_dev.shape)
+
+    fig.add_trace(
+        go.Heatmap(
+            z=z_vals,
+            x=scb_order,
+            y=inverter_order,
+            colorscale="RdYlGn",
+            zmid=0,
+            text=text_vals,
+            texttemplate="%{text}",
+            textfont=dict(color="black", size=9),
+            hovertemplate=(
+                "<span style='font-size:15px'><b>Inverter:</b> %{y}</span><br>"
+                "<span style='font-size:15px'><b>SCB:</b> %{x}</span><br><br>"
+                "<span style='font-size:14px'><b>Deviation:</b> %{z:.2f}%</span><br>"
+                "<span style='font-size:14px'><b>Disconnected Strings:</b> %{text}</span>"
+                "<extra></extra>"
+            ),
+            hoverlabel=dict(font_size=15),
+            hoverongaps=False,
+            showscale=False,  # Remove colorbar completely
+        ),
+        row=1,
+        col=1,
+    )
+
+    # -----------------------------
+    # RIGHT: BAR CHART
+    # -----------------------------
+    if not inv_disc_sum.empty:
+        fig.add_trace(
+            go.Bar(
+                x=inv_disc_sum.values,
+                y=inv_disc_sum.index,
+                orientation="h",
+                marker=dict(color=[_severity_color(int(v)) for v in inv_disc_sum.values]),
+                text=[int(v) for v in inv_disc_sum.values],
+                textposition="outside",
+                hovertemplate=(
+                    "<span style='font-size:15px'><b>Inverter:</b> %{y}</span><br>"
+                    "<span style='font-size:14px'><b>Total Disconnected Strings:</b> %{x}</span>"
+                    "<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=2,
+        )
+
+    # Axes configuration
+    fig.update_xaxes(
+        title=dict(text="<b>SCB Number (Position)</b>", standoff=12, font=dict(size=16)),
+        automargin=True,
+        row=1,
+        col=1,
+    )
+
+    # Left heatmap: Y-axis
+    fig.update_yaxes(
+        title=dict(text="<b>Inverter (IS–INV)</b>", standoff=30),
+        autorange="reversed",
+        automargin=True,
+        row=1,
+        col=1,
+    )
+
+    # Right bar chart: Y-axis (NO title — shared axis, labels already visible)
+    fig.update_yaxes(
+        title=None,
+        automargin=True,
+        showticklabels=True,
+        row=1,
+        col=2,
+    )
+
+    # Bold inverter labels on BOTH panels (tick text + consistent font)
+    bold_ticks = [f"<b>{y}</b>" for y in inverter_order]
+    fig.update_yaxes(tickfont=dict(size=13, color="black"), row=1, col=1)
+    fig.update_yaxes(tickfont=dict(size=13, color="black"), row=1, col=2)
+    fig.update_layout(
+        yaxis=dict(ticktext=bold_ticks, tickvals=inverter_order),
+        yaxis2=dict(ticktext=bold_ticks, tickvals=inverter_order),
+    )
+
+    # Right bar chart: Bottom X-axis
+    fig.update_xaxes(
+        title=dict(text="<b>Total Disconnected Strings</b>", standoff=12, font=dict(size=16)),
+        automargin=True,
+        row=1,
+        col=2,
+    )
+
+    # Top X-axis labels removed per user request
+
+    # Layout safety net
+    fig.update_layout(
+        title=dict(text=f"<b>{title}</b>", x=0.01, font=dict(size=18)),
+        template="plotly_white",
+        height=calculated_height,
+        margin=dict(l=80, r=50, t=110, b=bottom_margin),
+    )
+
+    return fig
+
+
 def _connect(db_path: str) -> duckdb.DuckDBPyConnection:
     # Centralized read-only connection (same approach used by dashboard.py)
     return get_duckdb_connection(db_local=db_path)
 
 
+# -----------------------------------------------------------------------------
+# REUSABLE PLOTLY HELPER: "Hierarchical Pulse" (VISUALIZATION ONLY)
+# -----------------------------------------------------------------------------
 def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -691,7 +876,8 @@ def build_scb_insight_summary(remarks_df: pd.DataFrame) -> pd.DataFrame:
         tmp.groupby("Explanation")
         .agg(
             Count=("scb_label", "count"),
-            Details=("message", lambda x: ", ".join(sorted(set(x)))),
+            # Show impacted SCB labels (analyst-friendly), not the raw message text
+            Details=("scb_label", lambda x: ", ".join(sorted(set(map(str, x))))),
         )
         .reset_index()
     )
@@ -1263,8 +1449,12 @@ def render_scb_ot(db_path: str) -> None:
 
     st.caption(f"Time window is enforced internally (SQL): **{TIME_START} onward** (data before is ignored).")
 
-    prog = st.progress(0, text="Starting…")
-    prog.progress(0.2, text="Fetching SCB data…")
+    import time
+
+    prog = st.progress(0, text="🩺 Initializing SCB Operation Theatre…")
+    time.sleep(0.3)
+
+    prog.progress(0.12, text="📥 Loading inverter & SCB telemetry…")
     df_raw = _fetch_raw_scb_data(
         db_path=db_path,
         table=table,
@@ -1272,13 +1462,17 @@ def render_scb_ot(db_path: str) -> None:
         to_date=to_date,
         scb_cols=scb_cols,
     )
+    time.sleep(0.3)
 
     if df_raw.empty:
         prog.progress(1.0, text="No data")
         st.info("No data found for the selected filters/time window.")
         return
 
-    prog.progress(0.5, text="Applying elimination and normalization…")
+    prog.progress(0.32, text="🧹 Cleaning raw SCB signals & removing noise…")
+    time.sleep(0.2)
+
+    prog.progress(0.52, text="⚙️ Applying SCB elimination & validation rules…")
     dev, remarks_df, abort_reason = _compute_scb_ot_peak_pipeline(
         df_raw=df_raw,
         site_name=site_name,
@@ -1288,6 +1482,7 @@ def render_scb_ot(db_path: str) -> None:
         scb_cols=list(scb_cols),
         db_path=db_path,
     )
+    time.sleep(0.3)
     if abort_reason == "median_zero":
         prog.progress(1.0, text="Aborted")
         st.warning("Abort: median(normalized_value) is zero. Cannot compute deviations.")
@@ -1304,12 +1499,16 @@ def render_scb_ot(db_path: str) -> None:
             st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
         return
 
-    prog.progress(0.8, text="Computing deviation & disconnected strings…")
+    prog.progress(0.72, text="📊 Computing deviation benchmarks & fault signals…")
+    time.sleep(0.2)
+
+    prog.progress(0.90, text="🎨 Preparing diagnostic visuals…")
     # Strict hierarchical sorting (IS -> INV -> SCB) before plotting.
     dev = dev.copy()
     dev["sort_key"] = dev["scb_label"].apply(_parse_scb_label)
     dev = dev.sort_values(["sort_key"], ascending=True).reset_index(drop=True)
-    prog.progress(1.0, text="SCB OT results ready")
+    time.sleep(0.2)
+    prog.progress(1.0, text="✅ SCB OT results ready")
 
     st.markdown("### Results")
     st.caption("Outliers are removed per SCB (cells nullified), peaks are selected per SCB, and normalization uses string_num (no DB writes).")
@@ -1376,19 +1575,14 @@ def render_scb_ot(db_path: str) -> None:
 
             pass
 
-    # Threshold behavior (IMPORTANT CORRECTION):
-    # Threshold acts as FILTER + RED COLOR.
+    # Threshold behavior:
+    # Threshold acts as FILTER for the diagnostic map.
     if threshold_val is None:
         dev_plot = dev.copy()
-        bar_color = "#60a5fa"  # default
         title = f"SCB Deviation % — {site_name}"
     else:
         dev_plot = dev[dev["deviation_pct"] <= float(threshold_val)].copy()
-        bar_color = "#ef4444"  # all displayed bars must be red
         title = f"SCB Deviation % (≤ {threshold_val}%) — {site_name}"
-
-    # Preserve deterministic x-axis order
-    x_order = dev_plot["scb_label"].tolist()
 
     if dev_plot.empty:
         st.info("No SCBs meet the threshold filter.")
@@ -1402,17 +1596,56 @@ def render_scb_ot(db_path: str) -> None:
             st.dataframe(display_df, width="stretch", hide_index=True)
         return
 
-    fig = px.bar(
-        dev_plot,
-        x="scb_label",
-        y="deviation_pct",
-        title=title,
-        labels={"scb_label": "SCB (inv_stn_name-inv_name-SCBx)", "deviation_pct": "Deviation (%)"},
-        category_orders={"scb_label": x_order},
-    )
-    fig.update_traces(marker_color=bar_color)
-    fig.update_layout(height=520, xaxis_tickangle=-45)
-    st.plotly_chart(fig, use_container_width=True)
+    # -----------------------------
+    # SCB Deviation Section (VISUALIZATION ONLY)
+    # Uses the reusable helper _build_inverter_scb_diagnostic_map() which handles:
+    # - Responsive column widths
+    # - No overlapping text
+    # - Top X-axis via annotation (Plotly constraint)
+    # - Proper standoff for axis titles
+    # - Zero-value bar filtering + descending sort
+    #
+    # IMPORTANT: Computation is sacrosanct. We ONLY use the already computed dev_plot.
+    # -----------------------------
+
+    with st.container(border=True):
+        # Structural parsing from scb_label (MANDATORY)
+        df = dev_plot[["scb_label", "deviation_pct", "disconnected_strings"]].copy()
+        if df.empty:
+            st.info("No SCB deviation or fault data available for the selected filters.")
+        else:
+            df["IS_num"] = pd.to_numeric(df["scb_label"].astype(str).str.extract(r"IS(\d+)", expand=False), errors="coerce")
+            df["INV_num"] = pd.to_numeric(df["scb_label"].astype(str).str.extract(r"INV(\d+)", expand=False), errors="coerce")
+            df["SCB_id"] = pd.to_numeric(df["scb_label"].astype(str).str.extract(r"SCB(\d+)", expand=False), errors="coerce")
+            df["Block_Inv"] = df["scb_label"].astype(str).str.rsplit("-", n=1).str[0]
+
+            # Keep only numeric SCB positions for the heatmap (SCBML etc. are excluded)
+            df = df.dropna(subset=["IS_num", "INV_num", "SCB_id", "Block_Inv"]).copy()
+            if df.empty:
+                st.info("Diagnostic map needs numeric labels (ISx-INVy-SCBz). No numeric SCBs found after filtering.")
+            else:
+                df["IS_num"] = df["IS_num"].astype(int)
+                df["INV_num"] = df["INV_num"].astype(int)
+                df["SCB_id"] = df["SCB_id"].astype(int)
+
+                df = df.sort_values(["IS_num", "INV_num", "SCB_id"])
+                inverter_order = df["Block_Inv"].unique().tolist()
+                scb_order = sorted(df["SCB_id"].unique().tolist())
+
+                # Pivot for heatmap and faults
+                pivot_dev = df.pivot(index="Block_Inv", columns="SCB_id", values="deviation_pct").reindex(inverter_order).reindex(columns=scb_order)
+                pivot_disc = df.pivot(index="Block_Inv", columns="SCB_id", values="disconnected_strings").reindex(inverter_order).reindex(columns=scb_order)
+
+                # Build responsive diagnostic map using the reusable helper
+                fig = _build_inverter_scb_diagnostic_map(
+                    pivot_dev=pivot_dev,
+                    pivot_disc=pivot_disc,
+                    inverter_order=inverter_order,
+                    scb_order=scb_order,
+                    title=title,
+                )
+
+                st.plotly_chart(fig, width="stretch")
 
     with st.expander("Show table"):
         show_cols = ["scb_label", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings"]
