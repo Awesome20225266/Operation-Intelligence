@@ -905,12 +905,16 @@ def render(db_path: str) -> None:
     
     with col_select1:
         # Determine default selection based on Select All state
-        default_selection = plants if st.session_state['select_all_plants'] else []
+        # Use session state key for persistence across tab switches
+        if "dsm_selected_plants" not in st.session_state:
+            st.session_state["dsm_selected_plants"] = plants if st.session_state['select_all_plants'] else []
+        elif st.session_state['select_all_plants'] and not st.session_state["dsm_selected_plants"]:
+            st.session_state["dsm_selected_plants"] = plants
         
         selected_plants = st.multiselect(
             "Site Name",
             options=plants,
-            default=default_selection,
+            key="dsm_selected_plants",
             help="Select one or more plants for analysis"
         )
         

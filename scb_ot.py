@@ -36,6 +36,7 @@ from typing import Iterable, Optional
 import numpy as np
 import duckdb
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from aws_duckdb import get_duckdb_connection
@@ -1286,10 +1287,28 @@ def render_scb_ot(db_path: str) -> None:
         st.info("No sites found in array_details.site_name.")
         return
 
+    # Normalize site labels to prevent selection dropping on reruns (case/whitespace mismatches)
+    sites = sorted({str(s).strip() for s in sites if str(s).strip()})
+
     allowed_sites = allowed_sites_for_user(username)
     if allowed_sites:
         allowed_l = {str(x).strip().lower() for x in allowed_sites}
         sites = [s for s in sites if str(s).strip().lower() in allowed_l]
+
+    # Clamp previously selected sites (if any) onto current options so Streamlit doesn't drop the selection.
+    prev_sel = st.session_state.get("scb_ot_site_multiselect", [])
+    if isinstance(prev_sel, list) and prev_sel and sites:
+        opt_by_lower = {s.lower(): s for s in sites}
+        mapped = []
+        for v in prev_sel:
+            vv = str(v).strip()
+            if vv in sites:
+                mapped.append(vv)
+            else:
+                hit = opt_by_lower.get(vv.lower())
+                if hit:
+                    mapped.append(hit)
+        st.session_state["scb_ot_site_multiselect"] = mapped
 
     # UI REQUIREMENTS (STRICT):
     # - Site Name multiselect (MUST default empty)
@@ -1408,7 +1427,6 @@ def render_scb_ot(db_path: str) -> None:
     with c_btn:
         # Mandatory: disabled until at least one site is selected.
         plot_now = st.button("Plot Now", type="primary", disabled=(len(selected_sites) == 0), use_container_width=True)
-
     # Availability guidance (informational, not restrictive).
     if len(selected_sites) == 0:
         st.caption("Select a Site Name to see which dates have SCB data (06:00–18:00).")
@@ -1429,7 +1447,71 @@ def render_scb_ot(db_path: str) -> None:
         else:
             st.caption("No date information could be derived for the selected site table.")
 
+    def _render_cached_results() -> bool:
+        """
+        Render last computed SCB OT outputs without recomputation.
+        Returns True if something was rendered.
+        """
+        fig_last = st.session_state.get("scb_ot_last_fig")
+        dev_table_last = st.session_state.get("scb_ot_last_table")
+        comments_last = st.session_state.get("scb_ot_last_comments")
+        insight_last = st.session_state.get("scb_ot_last_insights")
+        kpis_last = st.session_state.get("scb_ot_last_kpis") or {}
+        meta_last = st.session_state.get("scb_ot_last_meta") or {}
+
+        if fig_last is None:
+            return False
+
+        site_lbl = meta_last.get("site_name") or ""
+        d1_lbl = meta_last.get("from_date") or ""
+        d2_lbl = meta_last.get("to_date") or ""
+        thr_lbl = meta_last.get("threshold")
+        thr_txt = f", Threshold={thr_lbl}%" if thr_lbl is not None else ""
+        if site_lbl and d1_lbl and d2_lbl:
+            st.caption(f"Showing last computed results: **{site_lbl}** ({d1_lbl} → {d2_lbl}{thr_txt}). Change filters and click **Plot Now** to refresh.")
+        else:
+            st.caption("Showing last computed results. Change filters and click **Plot Now** to refresh.")
+
+        if isinstance(insight_last, pd.DataFrame) and not insight_last.empty:
+            st.markdown("### 🧠 SCB Health Insights")
+            st.dataframe(insight_last, hide_index=True, width="stretch")
+
+        # Keep heatmap BELOW insights (matches original SCB OT layout)
+        st.plotly_chart(fig_last, width="stretch", key="scb_ot_last_fig")
+
+        if isinstance(dev_table_last, pd.DataFrame) and not dev_table_last.empty:
+            with st.expander("Show table", expanded=False):
+                st.dataframe(dev_table_last, width="stretch", hide_index=True)
+
+        st.markdown("### SCB Comments")
+        # Cached KPI bar (so it doesn't disappear on tab switch)
+        try:
+            below_cnt = kpis_last.get("below_threshold")
+            with_comments_cnt = kpis_last.get("with_comments")
+            if below_cnt is not None and with_comments_cnt is not None:
+                k1, k2 = st.columns(2)
+                with k1:
+                    st.metric("Total SCBs below threshold", f"{int(below_cnt)}")
+                with k2:
+                    st.metric("Total SCBs with comments", f"{int(with_comments_cnt)}")
+        except Exception:
+            pass
+
+        if isinstance(comments_last, pd.DataFrame) and not comments_last.empty:
+            try:
+                import add_comments
+
+                add_comments._render_aggrid_table(comments_last, key="scb_ot_scb_comments_cached", height=360)  # type: ignore[attr-defined]
+            except Exception:
+                st.dataframe(comments_last, width="stretch", hide_index=True)
+        else:
+            st.caption("No cached SCB comments. Click **Plot Now** to fetch and compute comments for the selected window.")
+
+        return True
+
     if not plot_now:
+        if _render_cached_results():
+            return
         st.caption("Click Plot Now to run the computation.")
         return
 
@@ -1644,7 +1726,6 @@ def render_scb_ot(db_path: str) -> None:
                     scb_order=scb_order,
                     title=title,
                 )
-
                 st.plotly_chart(fig, width="stretch")
 
     with st.expander("Show table"):
@@ -1721,6 +1802,10 @@ def render_scb_ot(db_path: str) -> None:
             st.metric("Total SCBs below threshold", f"{len(below_set)}")
         with k2:
             st.metric("Total SCBs with comments", f"{len(below_set.intersection(comment_set))}")
+        st.session_state["scb_ot_last_kpis"] = {
+            "below_threshold": len(below_set),
+            "with_comments": len(below_set.intersection(comment_set)),
+        }
     except Exception:
         pass
 
@@ -1732,5 +1817,32 @@ def render_scb_ot(db_path: str) -> None:
             add_comments._render_aggrid_table(scb_comments, key="scb_ot_scb_comments", height=360)  # type: ignore[attr-defined]
         except Exception:
             st.dataframe(scb_comments, width="stretch", hide_index=True)
+
+    # Persist state for tab-switch preservation (no recompute unless Plot Now clicked again)
+    try:
+        st.session_state["scb_ot_last_fig"] = fig
+    except Exception:
+        pass
+    try:
+        st.session_state["scb_ot_last_table"] = display_df
+    except Exception:
+        pass
+    try:
+        st.session_state["scb_ot_last_comments"] = scb_comments
+    except Exception:
+        pass
+    try:
+        st.session_state["scb_ot_last_insights"] = insight_df
+    except Exception:
+        pass
+    try:
+        st.session_state["scb_ot_last_meta"] = {
+            "site_name": site_name,
+            "from_date": str(from_date) if from_date else "",
+            "to_date": str(to_date) if to_date else "",
+            "threshold": threshold_val,
+        }
+    except Exception:
+        pass
 
 

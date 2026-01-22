@@ -299,7 +299,8 @@ def render(db_path: str) -> None:
 
     with c_site:
         options = ["Portfolio", *sites]
-        selected = st.multiselect("Site Name", options=options, default=[])
+        # Use stable key for multiselect to preserve selection across tab switches
+        selected = st.multiselect("Site Name", options=options, default=[], key="pa_site_multiselect")
         # If Portfolio is chosen, it overrides other selections
         if "Portfolio" in selected:
             selected_sites = sites
@@ -319,7 +320,18 @@ def render(db_path: str) -> None:
     with c_btn:
         plot = st.button("Plot Now", type="primary", disabled=not valid, use_container_width=True)
 
-    if not plot and "pa_last_fig" in st.session_state and "pa_last_raw" in st.session_state:
+    if not plot and st.session_state.get("pa_last_fig") is not None and st.session_state.get("pa_last_raw") is not None:
+        # Show meta info about cached results
+        meta = st.session_state.get("pa_last_meta") or {}
+        meta_sites = meta.get("sites") or []
+        meta_from = meta.get("from")
+        meta_to = meta.get("to")
+        if meta_sites and meta_from and meta_to:
+            site_label = "Portfolio" if len(meta_sites) > 3 else ", ".join(meta_sites)
+            st.caption(f"Showing last computed results: **{site_label}** ({meta_from} → {meta_to}). Change filters and click **Plot Now** to refresh.")
+        else:
+            st.caption("Showing last computed results. Change filters and click **Plot Now** to refresh.")
+
         st.download_button(
             "Download Raw Data (CSV)",
             data=st.session_state["pa_last_raw"].to_csv(index=False).encode("utf-8"),
@@ -346,6 +358,7 @@ def render(db_path: str) -> None:
 
     st.session_state["pa_last_raw"] = raw
     st.session_state["pa_last_fig"] = fig
+    st.session_state["pa_last_meta"] = {"sites": selected_sites, "from": d1, "to": d2}
 
     # Download raw data (for audit)
     st.download_button(

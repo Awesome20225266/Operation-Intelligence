@@ -473,7 +473,9 @@ def render(db_path: str) -> None:
         )
 
     st.markdown("### Upload filled Excel")
-    up = st.file_uploader("Upload the filled template (.xlsx)", type=["xlsx"], key="scb_comment_uploader")
+    # Use a rotating key so tab re-entry reset can reliably clear uploaded file state
+    up_counter = int(st.session_state.get("scb_comment_uploader_counter", 0) or 0)
+    up = st.file_uploader("Upload the filled template (.xlsx)", type=["xlsx"], key=f"scb_comment_uploader_{up_counter}")
 
     # If Excel is uploaded, auto-derive site + dates so submission works without reselection.
     excel_df = pd.DataFrame()

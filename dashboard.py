@@ -19,6 +19,7 @@ import meta_viewer
 import reconnect_dsm
 import scb_ot
 import scb_comment
+import raw_analyser
 from aws_duckdb import get_duckdb_connection
 import auth
 from access_control import is_admin
@@ -880,8 +881,77 @@ def page_operation_theatre() -> None:
     st.markdown("# Operation Theatre")
     st.info("Operation Theatre page - Coming soon")
 
+def _init_app_state() -> None:
+    """
+    Initialize global application state for all tabs.
+    This ensures each tab has its own isolated state namespace.
+    Tab switching NEVER resets state - only explicit user actions do.
+    """
+    # Global defaults (only set if not already present)
+    defaults = {
+        # Navigation
+        "nav_page": "portfolio",
+
+        # Portfolio Analytics state
+        "pa_last_fig": None,
+        "pa_last_raw": None,
+        "pa_last_meta": None,
+
+        # Operation Theatre state
+        "ot_last_fig": None,
+        "ot_last_df": None,
+        "ot_last_meta_universe": None,
+        "ot_last_meta_d1": None,
+        "ot_last_meta_d2": None,
+        "ot_last_plot_sites": None,
+        "ot_last_plot_d1": None,
+        "ot_last_plot_d2": None,
+
+        # SCB OT state
+        "scb_ot_last_fig": None,
+        "scb_ot_last_table": None,
+        "scb_ot_last_insights": None,
+        "scb_ot_last_comments": None,
+        "scb_ot_last_meta": None,
+
+        # Raw Analyser state
+        "raw_analyser_last_df": None,
+        "raw_analyser_last_site": None,
+        "raw_analyser_last_table": None,
+        "raw_analyser_last_filters": None,
+        "raw_analyser_last_display_map": None,
+        "raw_analyser_last_scb_cols": None,
+        "raw_analyser_last_string_num_map": None,
+        "raw_analyser_norm_df": None,
+        "raw_analyser_applied_norm_method": None,
+
+        # Reconnect DSM state
+        "dsm_results_df": None,
+        "dsm_detailed_df": None,
+        "dsm_from_date": None,
+        "dsm_to_date": None,
+        "dsm_last_fig": None,
+        "dsm_last_summary": None,
+
+        # Meta Viewer state
+        "mv_last_df": None,
+        "mv_last_meta": None,
+
+        # Add Comments state (form persistence)
+        "comments_edit_id": None,
+        "comments_edit_row": None,
+    }
+
+    for key, default_value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+
+
 def main() -> None:
     _inject_css()
+
+    # Initialize global state for ALL tabs (bidirectional persistence)
+    _init_app_state()
 
     # Sidebar navigation state (matches the UI you shared)
     if "nav_page" not in st.session_state:
@@ -891,11 +961,11 @@ def main() -> None:
     username = user_info.get("username")
 
     if is_admin(username):
-        allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot", "scb_comment"}
+        allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot", "scb_comment", "raw_analyser"}
         default_page = "portfolio"
     else:
         # Restricted users: ONLY these tabs must exist in the UI.
-        allowed_pages = {"scb_ot", "scb_comment"}
+        allowed_pages = {"scb_ot", "scb_comment", "raw_analyser"}
         default_page = "scb_ot"
 
     if st.session_state.nav_page not in allowed_pages:
@@ -954,11 +1024,13 @@ def main() -> None:
                     ("visual_analyser", "🖥️  Visual Analyser"),
                     ("meta_viewer", "🧭  Meta Viewer"),
                     ("scb_ot", "⚡  SCB OT"),
+                    ("raw_analyser", "🧪  Raw Analyser"),
                 ]
             else:
                 nav_items = [
                     ("scb_ot", "⚡  SCB OT"),
                     ("scb_comment", "🧾  SCB Comment"),
+                    ("raw_analyser", "🧪  Raw Analyser"),
                 ]
 
             for key, label in nav_items:
@@ -977,12 +1049,53 @@ def main() -> None:
         # Fallback: show sidebar content in main area for debugging
         st.sidebar.write("Sidebar content (fallback)")
 
+    # Tab-enter hooks (run-once per navigation)
+    prev_page = st.session_state.get("_last_nav_page")
+    page = st.session_state.nav_page
+    entered_new_page = prev_page != page
+    st.session_state["_last_nav_page"] = page
+
+    def _reset_scb_comment_state_on_enter() -> None:
+        """
+        SCB Comment should ALWAYS reload fresh on tab entry (per requirement),
+        because it is an input/write workflow.
+        """
+        for k in list(st.session_state.keys()):
+            if k.startswith("scb_comment_"):
+                st.session_state.pop(k, None)
+        # Also clear non-prefixed SCB-comment-specific flags if any
+        st.session_state.pop("scb_comment_success_until", None)
+
+        # Force clean defaults for SCB Comment widgets (prevents any stale widget restoration)
+        st.session_state["scb_comment_site"] = "(select)"
+        st.session_state["scb_comment_site_locked"] = None
+        st.session_state["scb_comment_threshold"] = -3.0
+        st.session_state["scb_comment_from"] = None
+        st.session_state["scb_comment_to"] = None
+
+        # View/Edit section defaults
+        st.session_state["scb_comment_ve_site"] = "(select)"
+        st.session_state["scb_comment_ve_site_locked"] = None
+        st.session_state["scb_comment_ve_from"] = None
+        st.session_state["scb_comment_ve_to"] = None
+
+        # Rotate file_uploader key so uploaded file is ALWAYS cleared on re-entry
+        st.session_state["scb_comment_uploader_counter"] = int(st.session_state.get("scb_comment_uploader_counter", 0) or 0) + 1
+
+    if entered_new_page and page == "scb_comment":
+        _reset_scb_comment_state_on_enter()
+
+    # Broadcast a per-page "entered" flag for feature modules to consume (pop) on render.
+    # This enables restore-on-tab-enter without fighting widget ❌ behavior on normal reruns.
+    if entered_new_page:
+        st.session_state[f"_entered_{page}"] = True
+
     # Route to pages
     f = Filters(site_name=site_name, as_of_date=as_of_date, tariff_inr_per_kwh=float(tariff))
     page = st.session_state.nav_page
 
     # Defensive routing safety: restricted users cannot access hidden pages even if nav_page is tampered.
-    if not is_admin(username) and page not in {"scb_ot", "scb_comment"}:
+    if not is_admin(username) and page not in {"scb_ot", "scb_comment", "raw_analyser"}:
         st.error("Unauthorized page access")
         return
 
@@ -1006,6 +1119,8 @@ def main() -> None:
         scb_ot.render_scb_ot(db_path)
     elif page == "scb_comment":
         scb_comment.render(db_path)
+    elif page == "raw_analyser":
+        raw_analyser.render(db_path)
     else:
         st.error("Unknown page")
 

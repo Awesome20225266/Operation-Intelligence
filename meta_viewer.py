@@ -264,6 +264,64 @@ def render(db_path: str) -> None:
         st.info("Select at least one equipment to use equipment-level tags.")
         return
 
+    # ---- Fetch button (user-driven, not auto-triggered) ----
+    fetch_now = st.button("Fetch Now", type="primary", use_container_width=False)
+
+    # Helper to render cached results
+    def _render_cached_mv() -> bool:
+        """Render last fetched results without re-querying. Returns True if rendered."""
+        last_df = st.session_state.get("mv_last_df")
+        last_meta = st.session_state.get("mv_last_meta") or {}
+        if last_df is None or last_df.empty:
+            return False
+
+        # Show meta info
+        m_site = last_meta.get("site_name") or ""
+        m_from = last_meta.get("start_date") or ""
+        m_to = last_meta.get("end_date") or ""
+        if m_site and m_from and m_to:
+            st.caption(f"Showing last fetched data: **{m_site}** ({m_from} → {m_to}). Change filters and click **Fetch Now** to refresh.")
+        else:
+            st.caption("Showing last fetched data. Change filters and click **Fetch Now** to refresh.")
+
+        st.markdown("### Output")
+        st.dataframe(last_df, use_container_width=True, hide_index=True, height=520)
+
+        # Downloads (use cached df)
+        st.markdown("### Download")
+        d1, d2 = st.columns([1.2, 1.2])
+        with d1:
+            st.download_button(
+                "Download CSV",
+                data=last_df.to_csv(index=False).encode("utf-8"),
+                file_name="meta_viewer.csv",
+                mime="text/csv",
+                key="mv_download_csv_cached",
+            )
+        with d2:
+            try:
+                buf = BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    last_df.to_excel(writer, index=False, sheet_name="meta_viewer")
+                buf.seek(0)
+                st.download_button(
+                    "Download Excel",
+                    data=buf.getvalue(),
+                    file_name="meta_viewer.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="mv_download_xlsx_cached",
+                )
+            except Exception:
+                st.caption("Excel download unavailable.")
+        return True
+
+    if not fetch_now:
+        # Show cached results if available
+        if _render_cached_mv():
+            return
+        st.caption("Select filters and click **Fetch Now** to load data.")
+        return
+
     # ---- Fetch + display ----
     with st.spinner("Fetching from DuckDB..."):
         df = _fetch_meta_view(
@@ -282,6 +340,16 @@ def render(db_path: str) -> None:
     # Put id columns first
     id_cols = ["date"] + (["equipment_name"] if "equipment_name" in df_display.columns else [])
     df_display = df_display[id_cols + [c for c in selected_tags if c in df_display.columns]]
+
+    # Cache results for tab-switch persistence
+    st.session_state["mv_last_df"] = df_display
+    st.session_state["mv_last_meta"] = {
+        "site_name": site_name,
+        "start_date": start_date,
+        "end_date": end_date,
+        "equipment_names": equipment_names,
+        "tags": selected_tags,
+    }
 
     st.markdown("### Output")
     st.dataframe(df_display, use_container_width=True, hide_index=True, height=520)
