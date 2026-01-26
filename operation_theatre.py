@@ -1015,9 +1015,15 @@ def render(db_path: str) -> None:
     with c_btn:
         plot = st.button("Plot Now", type="primary", disabled=not valid, use_container_width=True)
 
-    if not plot and "ot_last_fig" in st.session_state and "ot_last_df" in st.session_state:
+    # Reuse cached plot on reruns (e.g., after download clicks), but ONLY if cache is valid.
+    # `dashboard.py` initializes these keys to None, so checking mere presence is not enough.
+    fig_last = st.session_state.get("ot_last_fig")
+    df_last = st.session_state.get("ot_last_df")
+    has_valid_cache = isinstance(fig_last, go.Figure) and isinstance(df_last, pd.DataFrame) and not df_last.empty
+
+    if not plot and has_valid_cache:
         # Meta (only appears once a plot exists) — rendered right above the chart
-        universe = st.session_state.get("ot_last_meta_universe", _meta_universe_from_plot_df(st.session_state["ot_last_df"]))
+        universe = st.session_state.get("ot_last_meta_universe", _meta_universe_from_plot_df(df_last))
         _render_meta_panel(
             db_path,
             universe=universe,
@@ -1025,12 +1031,12 @@ def render(db_path: str) -> None:
             d2=st.session_state.get("ot_last_meta_d2"),
         )
 
-        st.plotly_chart(st.session_state["ot_last_fig"], use_container_width=True, config={"displayModeBar": True})
+        st.plotly_chart(fig_last, use_container_width=True, config={"displayModeBar": True})
 
         # Comments table below plot (collapsed by default)
         _render_comments_panel_for_plot(
             db_path,
-            st.session_state["ot_last_df"],
+            df_last,
             selected_sites=st.session_state.get("ot_last_plot_sites", []),
             start=st.session_state.get("ot_last_plot_d1"),
             end=st.session_state.get("ot_last_plot_d2"),
@@ -1039,12 +1045,12 @@ def render(db_path: str) -> None:
         # Download buttons (always shown when plot exists)
         st.download_button(
             "Download Raw Data (CSV)",
-            data=st.session_state["ot_last_df"].to_csv(index=False).encode("utf-8"),
+            data=df_last.to_csv(index=False).encode("utf-8"),
             file_name="operation_theatre_syd.csv",
             mime="text/csv",
         )
         try:
-            png_bytes = pio.to_image(st.session_state["ot_last_fig"], format="png", width=1400, height=700, scale=2)
+            png_bytes = pio.to_image(fig_last, format="png", width=1400, height=700, scale=2)
             st.download_button(
                 "Download Chart (PNG)",
                 data=png_bytes,

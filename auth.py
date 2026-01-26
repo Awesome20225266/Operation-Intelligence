@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import streamlit as st
 import base64
 from pathlib import Path
+
+import streamlit as st
+import streamlit.components.v1 as components
 
 from supabase_link import get_supabase_client
 
 
-def get_base64_of_bin_file(bin_file):
+@st.cache_data(show_spinner=False)
+def get_base64_of_bin_file(bin_file: str):
     """Reads a binary file and converts it to base64 for CSS usage."""
     try:
         with open(bin_file, 'rb') as f:
@@ -20,14 +23,34 @@ def get_base64_of_bin_file(bin_file):
 def check_password() -> bool:
     """Returns True if the user had the correct password."""
 
-    # CRITICAL: Check authentication state FIRST before rendering anything
-    # This prevents double form flash during successful login
+    # CRITICAL: Check authentication state FIRST before rendering ANYTHING
+    # This prevents any flash/intermediate screen
     if st.session_state.get("password_correct") is True:
         return True
 
-    # --- Load Background Image (Optional) ---
-    # Make sure 'login_bg.png' is in the same folder as auth.py
-    # If using a different format (jpg), change the mime type below.
+    # ---------------------------------------------------------------------
+    # Anti-flash bootstrap:
+    # On initial load (or after logout), the browser can briefly show the last
+    # rendered app DOM until the login UI paints. Force an immediate dark paint
+    # before any expensive IO (e.g., reading background image).
+    # ---------------------------------------------------------------------
+    st.markdown(
+        """
+        <style>
+          html, body { background: #0f172a !important; }
+          /* Hide existing app content immediately to prevent "intermediate screen" flash */
+          .stApp { opacity: 0 !important; transition: none !important; }
+          header { visibility: hidden; }
+          [data-testid="stSidebar"] { display: none !important; }
+          #MainMenu { visibility: hidden; }
+          footer { visibility: hidden; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Inject CSS IMMEDIATELY to prevent any unstyled flash ---
+    # Load background image (optional)
     bin_str = get_base64_of_bin_file("login_bg.png")
     
     bg_style = ""
@@ -49,12 +72,15 @@ def check_password() -> bool:
             }
         """
 
-    # --- Inject CSS only once (cached in session state) ---
+    # --- Always inject CSS first (idempotent, prevents flash) ---
+    # This must run BEFORE any other content to prevent unstyled flash
     if "login_css_injected" not in st.session_state:
         st.markdown(f"""
             <style>
             /* 1. Set Background on the main App container */
             {bg_style}
+            /* Make login UI visible (paired with bootstrap hide above) */
+            .stApp {{ opacity: 1 !important; }}
             
             /* 2. Hide the standard Streamlit header/menu on login screen for immersion */
             header {{visibility: hidden;}}
@@ -229,7 +255,7 @@ def check_password() -> bool:
     # 1. Header (Inside the glass card)
     st.markdown("""
         <div class="brand-header">
-            <h1>Zelestra Energy</h1>
+            <h1>Zel - EYE: OI</h1>
         </div>
     """, unsafe_allow_html=True)
     
@@ -244,11 +270,15 @@ def check_password() -> bool:
         
         st.markdown("<br>", unsafe_allow_html=True)  # Spacer
         
-        submit = st.form_submit_button("Log In", type="primary", use_container_width=True)
+        submit = st.form_submit_button("Log In", type="primary", width="stretch")
         
         if submit:
-            with st.spinner("Authenticating..."):
-                authenticate()
+            # Progress-first UX (no spinner): mounts immediately, then runs auth
+            slot = st.empty()
+            prog = slot.progress(0, text="Authenticating... (0%)")
+            for p, msg in [(10, "Validating inputs..."), (35, "Checking credentials..."), (70, "Starting session..."), (100, "Done")]:
+                prog.progress(p, text=f"{msg} ({p}%)")
+            authenticate()
     
     return False
 

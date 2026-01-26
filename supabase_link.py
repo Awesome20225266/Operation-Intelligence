@@ -51,6 +51,12 @@ def get_supabase_client(*, prefer_service_role: bool = True) -> Client:
             "URL must start with http:// or https:// (e.g., https://your-project.supabase.co)"
         )
 
+    # UI/terminal hygiene: some Supabase Storage endpoints warn if the base URL
+    # doesn't have a trailing slash. This does NOT change any business logic;
+    # it only prevents noisy warnings in the terminal.
+    if not url_str.endswith("/"):
+        url_str = url_str + "/"
+
     anon_key = _get_secret("SUPABASE_ANON_KEY")
     service_key = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
 

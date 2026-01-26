@@ -1424,9 +1424,23 @@ def render_scb_ot(db_path: str) -> None:
         )
         st.session_state["scb_ot_to_date"] = d2
 
+    # Plot Now (queued) — ensures progress bar mounts BEFORE heavy compute
+    if "scb_ot_plot_requested" not in st.session_state:
+        st.session_state["scb_ot_plot_requested"] = False
+
+    def _on_plot_now() -> None:
+        st.session_state["scb_ot_plot_requested"] = True
+
     with c_btn:
         # Mandatory: disabled until at least one site is selected.
-        plot_now = st.button("Plot Now", type="primary", disabled=(len(selected_sites) == 0), use_container_width=True)
+        st.button(
+            "Plot Now",
+            type="primary",
+            disabled=(len(selected_sites) == 0),
+            on_click=_on_plot_now,
+            width="stretch",
+            key="scb_ot_plot_now_btn",
+        )
     # Availability guidance (informational, not restrictive).
     if len(selected_sites) == 0:
         st.caption("Select a Site Name to see which dates have SCB data (06:00–18:00).")
@@ -1509,11 +1523,14 @@ def render_scb_ot(db_path: str) -> None:
 
         return True
 
-    if not plot_now:
+    if not st.session_state.get("scb_ot_plot_requested"):
         if _render_cached_results():
             return
         st.caption("Click Plot Now to run the computation.")
         return
+
+    # Consume flag (prevents double-run on reruns)
+    st.session_state["scb_ot_plot_requested"] = False
 
     # Plot Now validation (strict)
     if len(selected_sites) != 1:
@@ -1533,10 +1550,20 @@ def render_scb_ot(db_path: str) -> None:
 
     import time
 
-    prog = st.progress(0, text="🩺 Initializing SCB Operation Theatre…")
-    time.sleep(0.3)
+    # % incremental progress bar (1 → 100)
+    prog_slot = st.empty()
+    prog = prog_slot.progress(0, text="🩺 Initializing SCB Operation Theatre… (0%)")
+    time.sleep(0.05)
 
-    prog.progress(0.12, text="📥 Loading inverter & SCB telemetry…")
+    def _p(pct: int, msg: str) -> None:
+        prog.progress(int(pct), text=f"{msg} ({int(pct)}%)")
+
+    # Smooth perceived progress up front
+    for p in range(1, 8):
+        _p(p, "Warming up…")
+        time.sleep(0.01)
+
+    _p(12, "📥 Loading inverter & SCB telemetry…")
     df_raw = _fetch_raw_scb_data(
         db_path=db_path,
         table=table,
@@ -1544,17 +1571,18 @@ def render_scb_ot(db_path: str) -> None:
         to_date=to_date,
         scb_cols=scb_cols,
     )
-    time.sleep(0.3)
+    time.sleep(0.05)
 
     if df_raw.empty:
-        prog.progress(1.0, text="No data")
+        _p(100, "No data")
         st.info("No data found for the selected filters/time window.")
+        prog_slot.empty()
         return
 
-    prog.progress(0.32, text="🧹 Cleaning raw SCB signals & removing noise…")
-    time.sleep(0.2)
+    _p(32, "🧹 Cleaning raw SCB signals & removing noise…")
+    time.sleep(0.05)
 
-    prog.progress(0.52, text="⚙️ Applying SCB elimination & validation rules…")
+    _p(52, "⚙️ Applying SCB elimination & validation rules…")
     dev, remarks_df, abort_reason = _compute_scb_ot_peak_pipeline(
         df_raw=df_raw,
         site_name=site_name,
@@ -1564,33 +1592,36 @@ def render_scb_ot(db_path: str) -> None:
         scb_cols=list(scb_cols),
         db_path=db_path,
     )
-    time.sleep(0.3)
+    time.sleep(0.05)
     if abort_reason == "median_zero":
-        prog.progress(1.0, text="Aborted")
+        _p(100, "Aborted")
         st.warning("Abort: median(normalized_value) is zero. Cannot compute deviations.")
         # Still show remarks if present (mandatory).
         if remarks_df is not None and not remarks_df.empty:
             st.markdown("### Remarks")
             st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
+        prog_slot.empty()
         return
     if dev is None or dev.empty:
-        prog.progress(1.0, text="No results")
+        _p(100, "No results")
         st.warning("Unable to compute deviations (no SCBs remained after elimination/skip rules).")
         if remarks_df is not None and not remarks_df.empty:
             st.markdown("### Remarks")
             st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
+        prog_slot.empty()
         return
 
-    prog.progress(0.72, text="📊 Computing deviation benchmarks & fault signals…")
-    time.sleep(0.2)
+    _p(72, "📊 Computing deviation benchmarks & fault signals…")
+    time.sleep(0.05)
 
-    prog.progress(0.90, text="🎨 Preparing diagnostic visuals…")
+    _p(90, "🎨 Preparing diagnostic visuals…")
     # Strict hierarchical sorting (IS -> INV -> SCB) before plotting.
     dev = dev.copy()
     dev["sort_key"] = dev["scb_label"].apply(_parse_scb_label)
     dev = dev.sort_values(["sort_key"], ascending=True).reset_index(drop=True)
-    time.sleep(0.2)
-    prog.progress(1.0, text="✅ SCB OT results ready")
+    time.sleep(0.05)
+    _p(100, "✅ SCB OT results ready")
+    prog_slot.empty()
 
     st.markdown("### Results")
     st.caption("Outliers are removed per SCB (cells nullified), peaks are selected per SCB, and normalization uses string_num (no DB writes).")

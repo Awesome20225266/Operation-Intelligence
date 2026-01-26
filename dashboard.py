@@ -20,6 +20,9 @@ import reconnect_dsm
 import scb_ot
 import scb_comment
 import raw_analyser
+import S1
+import S2
+import S3
 from aws_duckdb import get_duckdb_connection
 import auth
 from access_control import is_admin
@@ -28,7 +31,7 @@ from access_control import is_admin
 # App config
 # -----------------------------
 
-APP_NAME = "Zelestra Energy"
+APP_NAME = "Zel - EYE: OI"
 DB_DEFAULT = "master.duckdb"
 
 st.set_page_config(
@@ -59,28 +62,103 @@ _BASE_CSS = """
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
   html, body, [class*="css"]  { font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
 
-  /* Hide Deploy + MainMenu + footer; keep toolbar for hamburger */
-  .stDeployButton { display: none !important; }
-  #MainMenu { visibility: hidden; }
-  footer { visibility: hidden; }
+  /* ============================================================
+     HIDE ALL DEFAULT STREAMLIT WIDGETS (Production Lock-Down)
+     ============================================================ */
+  
+  /* Hide Deploy button completely */
+  .stDeployButton,
+  [data-testid="stDeployButton"],
+  button[kind="deploy"],
+  .stApp header button[kind="header"] { 
+    display: none !important; 
+    visibility: hidden !important;
+    pointer-events: none !important;
+  }
+  
+  /* Hide hamburger menu / MainMenu */
+  #MainMenu,
+  [data-testid="stMainMenu"],
+  button[kind="headerNoPadding"],
+  .stApp header [data-testid="stToolbarActions"] > button:first-child {
+    display: none !important;
+    visibility: hidden !important;
+  }
+  
+  /* Hide footer ("Made with Streamlit") */
+  footer,
+  .stApp footer,
+  [data-testid="stFooter"] { 
+    display: none !important; 
+    visibility: hidden !important;
+  }
+  
+  /* Hide toolbar actions (settings, fullscreen, etc.) but keep sidebar toggle */
+  div[data-testid="stToolbar"] {
+    visibility: visible !important;
+  }
+  div[data-testid="stToolbarActions"] {
+    display: none !important;
+  }
+  
+  /* Keep ONLY the sidebar collapse/expand control visible */
+  [data-testid="collapsedControl"] {
+    display: inline-flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+  }
 
-  /* Transparent header to remove white band, but keep native hamburger */
+  /* Transparent header to remove white band */
   header[data-testid="stHeader"] {
     background: transparent !important;
     box-shadow: none !important;
     border-bottom: none !important;
   }
 
-  /* Ensure the toolbar (hamburger) stays visible */
-  div[data-testid="stToolbar"] {
-    display: flex !important;
-    visibility: visible !important;
+  /* ============================================================
+     SMOOTH TRANSITIONS - Prevent UI Ghosting
+     ============================================================ */
+  
+  /* Smooth fade-in for main content area */
+  .main .block-container {
+    animation: contentFadeIn 0.25s ease-out;
   }
-  [data-testid="collapsedControl"] {
-    display: inline-flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    pointer-events: auto !important;
+  
+  @keyframes contentFadeIn {
+    from { opacity: 0.3; }
+    to { opacity: 1; }
+  }
+  
+  /* Prevent flash of unstyled content */
+  .stApp {
+    opacity: 1;
+    transition: opacity 0.15s ease-in-out;
+  }
+  
+  /* Tab panel transitions */
+  .stTabs [data-baseweb="tab-panel"] {
+    animation: tabPanelFadeIn 0.2s ease-out;
+  }
+  
+  @keyframes tabPanelFadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  
+  /* NOTE: Do NOT hide tab-panels based on aria-hidden.
+     Streamlit doesn't set aria-hidden consistently, which can blank tab content.
+     If we need to hide inactive panels, rely on the native [hidden] attribute inside
+     individual pages (S1/S2/S3) where Streamlit actually sets it. */
+  
+  /* Ensure only one main content block is visible */
+  .element-container:empty {
+    display: none !important;
+  }
+  
+  /* Prevent stale content flash during page transitions */
+  .stale-content, .old-content {
+    display: none !important;
   }
 
   /* Content padding */
@@ -272,6 +350,210 @@ _BASE_CSS = """
 
 def _inject_css() -> None:
     st.markdown(_BASE_CSS, unsafe_allow_html=True)
+
+
+# =============================================================================
+# REUSABLE SECTION-LEVEL LOADER UTILITY
+# =============================================================================
+
+def create_section_loader(container=None):
+    """
+    Create a section-level loader that shows a progress bar instead of ghosting.
+    
+    Usage:
+        loader = create_section_loader()
+        loader.start("Loading data...")
+        # ... do work ...
+        loader.update(50, "Processing...")
+        # ... more work ...
+        loader.finish()
+    
+    Returns:
+        SectionLoader instance with start(), update(), finish() methods.
+    """
+    import time as _time
+    
+    class SectionLoader:
+        def __init__(self, container):
+            self._container = container or st.empty()
+            self._progress = None
+            self._progress_slot = None
+            self._started = False
+        
+        def start(self, message: str = "Loading...") -> None:
+            """Clear any existing content and show progress bar at 0%."""
+            self._container.empty()  # Clear old content immediately
+            with self._container.container():
+                self._progress_slot = st.empty()
+                self._progress = self._progress_slot.progress(0, text=f"{message} (0%)")
+            self._started = True
+        
+        def update(self, percent: int, message: str = "") -> None:
+            """Update progress bar to given percentage."""
+            if self._progress and self._started:
+                text = f"{message} ({percent}%)" if message else f"Loading... ({percent}%)"
+                self._progress_slot.progress(min(100, max(0, percent)), text=text)
+        
+        def smooth_progress(self, start: int, end: int, message: str = "", duration: float = 0.3) -> None:
+            """Smoothly animate progress from start to end percentage."""
+            if not self._started:
+                return
+            steps = max(1, abs(end - start) // 3)
+            delay = duration / steps if steps > 0 else 0.01
+            current = start
+            step_size = (end - start) / steps if steps > 0 else end - start
+            for _ in range(steps):
+                current = min(end, current + step_size)
+                self.update(int(current), message)
+                _time.sleep(delay)
+            self.update(end, message)
+        
+        def finish(self) -> None:
+            """Clear the loader - content will be rendered after this."""
+            if self._started:
+                self._container.empty()
+                self._started = False
+        
+        def get_container(self):
+            """Get the container for rendering final content."""
+            return self._container
+    
+    return SectionLoader(container)
+
+
+def _show_page_transition(page: str) -> None:
+    """
+    Show a smooth, modern page transition animation when switching tabs.
+    Uses an incremental progress bar (1% → 100%) for professional UX.
+    """
+    import time
+    
+    # Page display names for the loading message
+    page_names = {
+        "portfolio": "Portfolio Analytics",
+        "operation": "Operation Theatre",
+        "reconnect": "Reconnect DSM",
+        "add_comments": "Add Comments",
+        "dfm": "Digital Fault Monitoring",
+        "visual_analyser": "Visual Analyser",
+        "meta_viewer": "Meta Viewer",
+        "scb_ot": "SCB Operation Theatre",
+        "scb_comment": "SCB Comment",
+        "raw_analyser": "Raw Analyser",
+        "s1": "S1 Portal",
+        "s2": "S2 Portal",
+        "s3": "S3 Portal",
+    }
+    display_name = page_names.get(page, page.replace("_", " ").title())
+    
+    # Page icons
+    page_icons = {
+        "portfolio": "📊",
+        "operation": "🏥",
+        "reconnect": "🔌",
+        "add_comments": "📝",
+        "dfm": "🛠️",
+        "visual_analyser": "🖥️",
+        "meta_viewer": "🧭",
+        "scb_ot": "⚡",
+        "scb_comment": "🧾",
+        "raw_analyser": "🧪",
+        "s1": "📋",
+        "s2": "📝",
+        "s3": "✅",
+    }
+    icon = page_icons.get(page, "⚡")
+    
+    # Create container for the entire transition (prevents ghosting)
+    transition_container = st.empty()
+    
+    # Show initial loading state with styled container
+    with transition_container.container():
+        # Inject transition-specific CSS
+        st.markdown(
+            """
+            <style>
+            @keyframes fadeInUp {
+                from { opacity: 0; transform: translateY(12px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            @keyframes pulse {
+                0%, 100% { opacity: 0.7; transform: scale(1); }
+                50% { opacity: 1; transform: scale(1.05); }
+            }
+            .page-loader-container {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 2.5rem 2rem;
+                animation: fadeInUp 0.2s ease-out;
+                background: linear-gradient(135deg, rgba(241,245,249,0.95) 0%, rgba(248,250,252,0.95) 100%);
+                border-radius: 16px;
+                margin: 1rem 0;
+                box-shadow: 0 4px 20px rgba(15,23,42,0.06);
+            }
+            .page-loader-icon {
+                font-size: 2.5rem;
+                margin-bottom: 0.75rem;
+                animation: pulse 1.2s ease-in-out infinite;
+            }
+            .page-loader-title {
+                font-size: 1.35rem;
+                font-weight: 700;
+                color: #1e293b;
+                margin-bottom: 0.25rem;
+            }
+            .page-loader-subtitle {
+                font-size: 0.9rem;
+                color: #64748b;
+                margin-bottom: 1rem;
+            }
+            .page-loader-percent {
+                font-size: 0.85rem;
+                font-weight: 600;
+                color: #3b82f6;
+                margin-top: 0.5rem;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        
+        st.markdown(
+            f"""
+            <div class="page-loader-container">
+                <div class="page-loader-icon">{icon}</div>
+                <div class="page-loader-title">{display_name}</div>
+                <div class="page-loader-subtitle">Loading your workspace...</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        
+        # Show actual progress bar with percentage updates
+        progress_bar = st.progress(0, text="Initializing...")
+        
+        # Smooth incremental progress (perceived progress)
+        stages = [
+            (15, "Loading components..."),
+            (35, "Preparing interface..."),
+            (60, "Fetching data..."),
+            (85, "Rendering content..."),
+            (100, "Ready!"),
+        ]
+        
+        current = 0
+        for target, msg in stages:
+            # Smooth incremental updates
+            step = max(1, (target - current) // 5)
+            while current < target:
+                current = min(current + step, target)
+                progress_bar.progress(current, text=f"{msg} ({current}%)")
+                time.sleep(0.02)  # Fast but visible increments
+    
+    # Clear the transition - new page content will render
+    transition_container.empty()
 
 
 # -----------------------------
@@ -961,7 +1243,7 @@ def main() -> None:
     username = user_info.get("username")
 
     if is_admin(username):
-        allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot", "scb_comment", "raw_analyser"}
+        allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot", "scb_comment", "raw_analyser", "s1", "s2", "s3"}
         default_page = "portfolio"
     else:
         # Restricted users: ONLY these tabs must exist in the UI.
@@ -1025,6 +1307,9 @@ def main() -> None:
                     ("meta_viewer", "🧭  Meta Viewer"),
                     ("scb_ot", "⚡  SCB OT"),
                     ("raw_analyser", "🧪  Raw Analyser"),
+                    ("s1", "📋  S1"),
+                    ("s2", "📝  S2"),
+                    ("s3", "✅  S3"),
                 ]
             else:
                 nav_items = [
@@ -1089,6 +1374,8 @@ def main() -> None:
     # This enables restore-on-tab-enter without fighting widget ❌ behavior on normal reruns.
     if entered_new_page:
         st.session_state[f"_entered_{page}"] = True
+        # Show smooth page transition animation
+        _show_page_transition(page)
 
     # Route to pages
     f = Filters(site_name=site_name, as_of_date=as_of_date, tariff_inr_per_kwh=float(tariff))
@@ -1099,6 +1386,26 @@ def main() -> None:
         st.error("Unauthorized page access")
         return
 
+    # =========================================================================
+    # ANTI-GHOSTING: Create isolated page container
+    # This prevents old page content from persisting during navigation
+    # =========================================================================
+    
+    # Clear any stale page content from previous navigation
+    # by using a unique key per page that forces Streamlit to re-create container
+    page_container_key = f"_page_container_{page}"
+    
+    # Track which page was last rendered to detect navigation
+    last_rendered_page = st.session_state.get("_last_rendered_page")
+    if last_rendered_page != page:
+        # Page changed - clear cached content keys to prevent ghosting
+        for key in list(st.session_state.keys()):
+            # Clear page-specific UI caches but preserve form data
+            if key.startswith("_page_container_") and key != page_container_key:
+                st.session_state.pop(key, None)
+        st.session_state["_last_rendered_page"] = page
+    
+    # Route to page content (only ONE page renders per execution)
     if page == "portfolio":
         portfolio_analytics.render(db_path)
     elif page == "operation":
@@ -1121,6 +1428,12 @@ def main() -> None:
         scb_comment.render(db_path)
     elif page == "raw_analyser":
         raw_analyser.render(db_path)
+    elif page == "s1":
+        S1.render(db_path)
+    elif page == "s2":
+        S2.render(db_path)
+    elif page == "s3":
+        S3.render(db_path)
     else:
         st.error("Unknown page")
 
