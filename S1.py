@@ -2033,6 +2033,7 @@ def _render_request_ptw() -> None:
                     st.session_state["ptw_selected_wo_id"] = None if raw == "(select work order)" else raw
                     st.session_state["ptw_wo_loading"] = bool(st.session_state.get("ptw_selected_wo_id"))
                     st.session_state["ptw_wo_details"] = None
+                    # NOTE: Do not call st.rerun() inside a widget callback (Streamlit warns it's a no-op).
 
                 selected_wo_id = st.selectbox(
                     "Select Work Order ID",
@@ -2112,185 +2113,187 @@ def _render_request_ptw() -> None:
 
         st.caption("Start Time and End Time are automatically recorded when you submit the PTW (End = Start + 8 hours).")
 
-    # Wrap the selector block in a fragment if supported (prevents whole page re-render feel)
-    if callable(_frag):
-        _render_work_order_selection = _frag(_render_work_order_selection_block)
-        _render_work_order_selection()
-    else:
+    # Wrap the WHOLE Request PTW interactive body in a fragment (if supported)
+    # so Work Order selection triggers re-render of the dependent form below.
+    def _render_request_ptw_interactive_body() -> None:
         _render_work_order_selection_block()
 
-    # Read from session after selector block (fragment-safe)
-    selected_wo_id = st.session_state.get("ptw_selected_wo_id")
-    permit_validity_date = st.session_state.get("ptw_validity_date", date.today())
+        # Read from session after selector block (fragment-safe)
+        selected_wo_id = st.session_state.get("ptw_selected_wo_id")
+        permit_validity_date = st.session_state.get("ptw_validity_date", date.today())
 
-    # Check if we can proceed with the form
-    if not selected_wo_id:
-        st.warning("Please select a Work Order ID to continue with the PTW request.")
-        return
+        # Check if we can proceed with the form
+        if not selected_wo_id:
+            st.warning("Please select a Work Order ID to continue with the PTW request.")
+            return
 
-    # Store for use in form submission
-    st.session_state["ptw_selected_wo_id"] = selected_wo_id
-    # These are set in the selector block once WO details are loaded
-    st.session_state["ptw_site_name"] = st.session_state.get("ptw_site_name", "")
-    st.session_state["ptw_work_location"] = st.session_state.get("ptw_work_location", "")
+        # Store for use in form submission
+        st.session_state["ptw_selected_wo_id"] = selected_wo_id
+        st.session_state["ptw_site_name"] = st.session_state.get("ptw_site_name", "")
+        st.session_state["ptw_work_location"] = st.session_state.get("ptw_work_location", "")
 
-    # Prevent Enter key from implicitly submitting the form (UI-only safety)
-    # Allow Enter inside TEXTAREA for multi-line notes.
-    components.html(
-        """
-        <script>
-          (function() {
-            const handler = (e) => {
-              if (e.key === 'Enter') {
-                const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
-                if (tag !== 'TEXTAREA') {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }
-              }
-            };
-            window.removeEventListener('keydown', handler, true);
-            window.addEventListener('keydown', handler, true);
-          })();
-        </script>
-        """,
-        height=0,
-    )
-
-    # If Submit PTW was clicked, avoid rebuilding the whole form before showing progress.
-    # We run the existing submit handler using values already stored in session_state.
-    if "ptw_submit_requested" not in st.session_state:
-        st.session_state["ptw_submit_requested"] = False
-
-    if st.session_state.get("ptw_submit_requested", False):
-        st.session_state["ptw_submit_requested"] = False
-
-        # Mount progress UI immediately (top of section)
-        st.markdown('<div class="section-title">🚀 Submitting PTW</div>', unsafe_allow_html=True)
-
-        def _ss(k: str, default: Any) -> Any:
-            return st.session_state.get(k, default)
-
-        work_order_id = _ss("ptw_selected_wo_id", "")
-        site_name = _ss("ptw_site_name", "")
-        work_location = _ss("ptw_work_location", "")
-
-        _handle_ptw_submit(
-            work_order_id=work_order_id,
-            permit_validity_date=_ss("ptw_validity_date", date.today()),
-            site_name=site_name,
-            work_location=work_location,
-            work_description=_ss("ptw_work_desc", ""),
-            contractor_name=_ss("ptw_contractor", ""),
-            # Hazards
-            hz_live_dc_cables=_ss("hz_live_dc_cables", False),
-            hz_loose_connectors=_ss("hz_loose_connectors", False),
-            hz_tracker_parts=_ss("hz_tracker_parts", False),
-            hz_dust=_ss("hz_dust", False),
-            hz_high_dc=_ss("hz_high_dc", False),
-            hz_poor_grounding=_ss("hz_poor_grounding", False),
-            hz_heavy_panels=_ss("hz_heavy_panels", False),
-            hz_wildlife=_ss("hz_wildlife", False),
-            hz_arc_flash=_ss("hz_arc_flash", False),
-            hz_working_height=_ss("hz_working_height", False),
-            hz_sharp_edges=_ss("hz_sharp_edges", False),
-            hz_lightning=_ss("hz_lightning", False),
-            hz_improper_grounding=_ss("hz_improper_grounding", False),
-            hz_wet_surfaces=_ss("hz_wet_surfaces", False),
-            hz_heat=_ss("hz_heat", False),
-            hz_overload=_ss("hz_overload", False),
-            hz_manual_handling=_ss("hz_manual_handling", False),
-            hz_overhead_line=_ss("hz_overhead_line", False),
-            hz_others_text=_ss("hz_others_text", ""),
-            # Risks
-            rk_electrocution=_ss("rk_electrocution", False),
-            rk_electric_shock=_ss("rk_electric_shock", False),
-            rk_fall=_ss("rk_fall", False),
-            rk_tripping=_ss("rk_tripping", False),
-            rk_burns=_ss("rk_burns", False),
-            rk_fire=_ss("rk_fire", False),
-            rk_back_injury=_ss("rk_back_injury", False),
-            rk_unexpected_energization=_ss("rk_unexpected_energization", False),
-            rk_crushing=_ss("rk_crushing", False),
-            rk_bites=_ss("rk_bites", False),
-            rk_heat_stress=_ss("rk_heat_stress", False),
-            rk_electric_burn=_ss("rk_electric_burn", False),
-            rk_falling_particles=_ss("rk_falling_particles", False),
-            rk_others_text=_ss("rk_others_text", ""),
-            # PPE
-            ppe_helmet=_ss("ppe_helmet", False),
-            ppe_shoes=_ss("ppe_shoes", False),
-            ppe_reflective_vest=_ss("ppe_reflective_vest", False),
-            ppe_goggles=_ss("ppe_goggles", False),
-            ppe_hrc_suit=_ss("ppe_hrc_suit", False),
-            ppe_electrical_mat=_ss("ppe_electrical_mat", False),
-            ppe_face_shield=_ss("ppe_face_shield", False),
-            ppe_insulated_tools=_ss("ppe_insulated_tools", False),
-            ppe_respirator=_ss("ppe_respirator", False),
-            ppe_dust_mask=_ss("ppe_dust_mask", False),
-            ppe_ear_plugs=_ss("ppe_ear_plugs", False),
-            ppe_electrical_gloves=_ss("ppe_electrical_gloves", False),
-            ppe_harness=_ss("ppe_harness", False),
-            ppe_lifeline=_ss("ppe_lifeline", False),
-            ppe_cut_gloves=_ss("ppe_cut_gloves", False),
-            ppe_others_text=_ss("ppe_others_text", ""),
-            # Safety Precautions
-            sp_electrical_isolation=_ss("sp_electrical_isolation", False),
-            sp_fire_extinguisher=_ss("sp_fire_extinguisher", False),
-            sp_proper_isolation=_ss("sp_proper_isolation", False),
-            sp_authorized_personnel=_ss("sp_authorized_personnel", False),
-            sp_loto=_ss("sp_loto", False),
-            sp_signage=_ss("sp_signage", False),
-            sp_rescue_equipment=_ss("sp_rescue_equipment", False),
-            sp_zero_voltage=_ss("sp_zero_voltage", False),
-            sp_pre_job_meeting=_ss("sp_pre_job_meeting", False),
-            sp_illumination=_ss("sp_illumination", False),
-            sp_earthing=_ss("sp_earthing", False),
-            sp_insulated_tools=_ss("sp_insulated_tools", False),
-            sp_escape_route=_ss("sp_escape_route", False),
-            sp_others_text=_ss("sp_others_text", ""),
-            # Associated Permits
-            ap_hot_work=_ss("ap_hot_work", False),
-            ap_general_work=_ss("ap_general_work", False),
-            ap_loto=_ss("ap_loto", False),
-            ap_night_work=_ss("ap_night_work", False),
-            ap_excavation=_ss("ap_excavation", False),
-            ap_confined_space=_ss("ap_confined_space", False),
-            ap_height_work=_ss("ap_height_work", False),
-            ap_lifting=_ss("ap_lifting", False),
-            ap_others_text=_ss("ap_others_text", ""),
-            # Tools
-            tools_equipment=_ss("tools_equipment", ""),
-            # Checklist (Y/N/NA)
-            chk_jsa=_ss("chk_jsa", None),
-            chk_environment=_ss("chk_environment", None),
-            chk_loto=_ss("chk_loto", None),
-            chk_firefighting=_ss("chk_firefighting", None),
-            chk_energized_ppe=_ss("chk_energized_ppe", None),
-            chk_rescue=_ss("chk_rescue", None),
-            chk_workers_fit=_ss("chk_workers_fit", None),
-            chk_grounded=_ss("chk_grounded", None),
-            chk_tools=_ss("chk_tools", None),
-            chk_lighting=_ss("chk_lighting", None),
-            chk_rescue_plan=_ss("chk_rescue_plan", None),
-            chk_signage=_ss("chk_signage", None),
-            chk_testing_equipment=_ss("chk_testing_equipment", None),
-            chk_conductive_removed=_ss("chk_conductive_removed", None),
-            chk_line_clearance=_ss("chk_line_clearance", None),
-            chk_briefing=_ss("chk_briefing", None),
-            # Undertaking
-            undertaking_accept=_ss("ptw_undertaking", False),
-            # People
-            receiver_name=_ss("ptw_receiver", ""),
-            coworker_1=_ss("ptw_coworker1", ""),
-            coworker_2=_ss("ptw_coworker2", ""),
-            coworker_3=_ss("ptw_coworker3", ""),
-            coworker_4=_ss("ptw_coworker4", ""),
-            coworker_5=_ss("ptw_coworker5", ""),
-            coworker_6=_ss("ptw_coworker6", ""),
+        # Prevent Enter key from implicitly submitting the form (UI-only safety)
+        # Allow Enter inside TEXTAREA for multi-line notes.
+        components.html(
+            """
+            <script>
+              (function() {
+                const handler = (e) => {
+                  if (e.key === 'Enter') {
+                    const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
+                    if (tag !== 'TEXTAREA') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                    }
+                  }
+                };
+                window.removeEventListener('keydown', handler, true);
+                window.addEventListener('keydown', handler, true);
+              })();
+            </script>
+            """,
+            height=0,
         )
 
-        st.stop()
+        # If Submit PTW was clicked, avoid rebuilding the whole form before showing progress.
+        if "ptw_submit_requested" not in st.session_state:
+            st.session_state["ptw_submit_requested"] = False
+
+        if st.session_state.get("ptw_submit_requested", False):
+            st.session_state["ptw_submit_requested"] = False
+
+            # Mount progress UI immediately (top of section)
+            st.markdown('<div class="section-title">🚀 Submitting PTW</div>', unsafe_allow_html=True)
+
+            def _ss(k: str, default: Any) -> Any:
+                return st.session_state.get(k, default)
+
+            work_order_id = _ss("ptw_selected_wo_id", "")
+            site_name = _ss("ptw_site_name", "")
+            work_location = _ss("ptw_work_location", "")
+
+            _handle_ptw_submit(
+                work_order_id=work_order_id,
+                permit_validity_date=_ss("ptw_validity_date", date.today()),
+                site_name=site_name,
+                work_location=work_location,
+                work_description=_ss("ptw_work_desc", ""),
+                contractor_name=_ss("ptw_contractor", ""),
+                # Hazards
+                hz_live_dc_cables=_ss("hz_live_dc_cables", False),
+                hz_loose_connectors=_ss("hz_loose_connectors", False),
+                hz_tracker_parts=_ss("hz_tracker_parts", False),
+                hz_dust=_ss("hz_dust", False),
+                hz_high_dc=_ss("hz_high_dc", False),
+                hz_poor_grounding=_ss("hz_poor_grounding", False),
+                hz_heavy_panels=_ss("hz_heavy_panels", False),
+                hz_wildlife=_ss("hz_wildlife", False),
+                hz_arc_flash=_ss("hz_arc_flash", False),
+                hz_working_height=_ss("hz_working_height", False),
+                hz_sharp_edges=_ss("hz_sharp_edges", False),
+                hz_lightning=_ss("hz_lightning", False),
+                hz_improper_grounding=_ss("hz_improper_grounding", False),
+                hz_wet_surfaces=_ss("hz_wet_surfaces", False),
+                hz_heat=_ss("hz_heat", False),
+                hz_overload=_ss("hz_overload", False),
+                hz_manual_handling=_ss("hz_manual_handling", False),
+                hz_overhead_line=_ss("hz_overhead_line", False),
+                hz_others_text=_ss("hz_others_text", ""),
+                # Risks
+                rk_electrocution=_ss("rk_electrocution", False),
+                rk_electric_shock=_ss("rk_electric_shock", False),
+                rk_fall=_ss("rk_fall", False),
+                rk_tripping=_ss("rk_tripping", False),
+                rk_burns=_ss("rk_burns", False),
+                rk_fire=_ss("rk_fire", False),
+                rk_back_injury=_ss("rk_back_injury", False),
+                rk_unexpected_energization=_ss("rk_unexpected_energization", False),
+                rk_crushing=_ss("rk_crushing", False),
+                rk_bites=_ss("rk_bites", False),
+                rk_heat_stress=_ss("rk_heat_stress", False),
+                rk_electric_burn=_ss("rk_electric_burn", False),
+                rk_falling_particles=_ss("rk_falling_particles", False),
+                rk_others_text=_ss("rk_others_text", ""),
+                # PPE
+                ppe_helmet=_ss("ppe_helmet", False),
+                ppe_shoes=_ss("ppe_shoes", False),
+                ppe_reflective_vest=_ss("ppe_reflective_vest", False),
+                ppe_goggles=_ss("ppe_goggles", False),
+                ppe_hrc_suit=_ss("ppe_hrc_suit", False),
+                ppe_electrical_mat=_ss("ppe_electrical_mat", False),
+                ppe_face_shield=_ss("ppe_face_shield", False),
+                ppe_insulated_tools=_ss("ppe_insulated_tools", False),
+                ppe_respirator=_ss("ppe_respirator", False),
+                ppe_dust_mask=_ss("ppe_dust_mask", False),
+                ppe_ear_plugs=_ss("ppe_ear_plugs", False),
+                ppe_electrical_gloves=_ss("ppe_electrical_gloves", False),
+                ppe_harness=_ss("ppe_harness", False),
+                ppe_lifeline=_ss("ppe_lifeline", False),
+                ppe_cut_gloves=_ss("ppe_cut_gloves", False),
+                ppe_others_text=_ss("ppe_others_text", ""),
+                # Safety Precautions
+                sp_electrical_isolation=_ss("sp_electrical_isolation", False),
+                sp_fire_extinguisher=_ss("sp_fire_extinguisher", False),
+                sp_proper_isolation=_ss("sp_proper_isolation", False),
+                sp_authorized_personnel=_ss("sp_authorized_personnel", False),
+                sp_loto=_ss("sp_loto", False),
+                sp_signage=_ss("sp_signage", False),
+                sp_rescue_equipment=_ss("sp_rescue_equipment", False),
+                sp_zero_voltage=_ss("sp_zero_voltage", False),
+                sp_pre_job_meeting=_ss("sp_pre_job_meeting", False),
+                sp_illumination=_ss("sp_illumination", False),
+                sp_earthing=_ss("sp_earthing", False),
+                sp_insulated_tools=_ss("sp_insulated_tools", False),
+                sp_escape_route=_ss("sp_escape_route", False),
+                sp_others_text=_ss("sp_others_text", ""),
+                # Associated Permits
+                ap_hot_work=_ss("ap_hot_work", False),
+                ap_general_work=_ss("ap_general_work", False),
+                ap_loto=_ss("ap_loto", False),
+                ap_night_work=_ss("ap_night_work", False),
+                ap_excavation=_ss("ap_excavation", False),
+                ap_confined_space=_ss("ap_confined_space", False),
+                ap_height_work=_ss("ap_height_work", False),
+                ap_lifting=_ss("ap_lifting", False),
+                ap_others_text=_ss("ap_others_text", ""),
+                # Tools
+                tools_equipment=_ss("tools_equipment", ""),
+                # Checklist (Y/N/NA)
+                chk_jsa=_ss("chk_jsa", None),
+                chk_environment=_ss("chk_environment", None),
+                chk_loto=_ss("chk_loto", None),
+                chk_firefighting=_ss("chk_firefighting", None),
+                chk_energized_ppe=_ss("chk_energized_ppe", None),
+                chk_rescue=_ss("chk_rescue", None),
+                chk_workers_fit=_ss("chk_workers_fit", None),
+                chk_grounded=_ss("chk_grounded", None),
+                chk_tools=_ss("chk_tools", None),
+                chk_lighting=_ss("chk_lighting", None),
+                chk_rescue_plan=_ss("chk_rescue_plan", None),
+                chk_signage=_ss("chk_signage", None),
+                chk_testing_equipment=_ss("chk_testing_equipment", None),
+                chk_conductive_removed=_ss("chk_conductive_removed", None),
+                chk_line_clearance=_ss("chk_line_clearance", None),
+                chk_briefing=_ss("chk_briefing", None),
+                # Undertaking
+                undertaking_accept=_ss("ptw_undertaking", False),
+                # People
+                receiver_name=_ss("ptw_receiver", ""),
+                coworker_1=_ss("ptw_coworker1", ""),
+                coworker_2=_ss("ptw_coworker2", ""),
+                coworker_3=_ss("ptw_coworker3", ""),
+                coworker_4=_ss("ptw_coworker4", ""),
+                coworker_5=_ss("ptw_coworker5", ""),
+                coworker_6=_ss("ptw_coworker6", ""),
+            )
+            st.stop()
+
+        # Otherwise, continue with normal form rendering below (existing code)
+
+    if callable(_frag):
+        st.fragment(_render_request_ptw_interactive_body)()
+    else:
+        _render_request_ptw_interactive_body()
 
     with st.form(form_key):
         # Manual entry fields with better styling
