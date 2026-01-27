@@ -516,7 +516,7 @@ def generate_ptw_pdf_with_attachments(
         progress_callback(30, "Generating PTW document...")
     
     doc_data = build_doc_data(updated_form_data)
-    main_pdf = generate_ptw_pdf(template_bytes, doc_data)
+    main_pdf = generate_ptw_pdf(template_bytes, doc_data, progress_callback=progress_callback)
     
     if progress_callback:
         progress_callback(50, "Fetching evidence files...")

@@ -69,7 +69,10 @@ _BASE_CSS = """
   /* Hide Deploy button completely */
   .stDeployButton,
   [data-testid="stDeployButton"],
-  button[kind="deploy"] { 
+  button[kind="deploy"],
+  /* Streamlit variants */
+  header button[title="Deploy"],
+  header button[aria-label="Deploy"] { 
     display: none !important; 
     visibility: hidden !important;
     pointer-events: none !important;

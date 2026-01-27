@@ -949,7 +949,115 @@ def generate_ptw_docx_from_template(template_bytes: bytes, form_data: dict) -> b
     return buffer.read()
 
 
-def convert_docx_to_pdf(docx_bytes: bytes) -> bytes:
+def _get_setting(name: str) -> str | None:
+    """Read from Streamlit secrets when available; fallback to environment variables."""
+    try:
+        import streamlit as _st  # type: ignore
+
+        v = _st.secrets.get(name)  # type: ignore[attr-defined]
+        if v is not None and str(v).strip() != "":
+            return str(v)
+    except Exception:
+        pass
+    v = os.getenv(name)
+    return str(v) if v is not None and str(v).strip() != "" else None
+
+
+def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180) -> bytes | None:
+    """
+    CloudConvert DOCX→PDF conversion (robust for hosted deployments).
+
+    Requires: CLOUDCONVERT_API_KEY in Streamlit secrets or environment variables.
+    Returns PDF bytes on success, or None if not configured / failed.
+    """
+    api_key = _get_setting("CLOUDCONVERT_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        import time
+        import requests
+
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        # Create a job: import/upload -> convert -> export/url
+        job_req = {
+            "tasks": {
+                "import-ptw": {"operation": "import/upload"},
+                "convert-ptw": {
+                    "operation": "convert",
+                    "input": "import-ptw",
+                    "output_format": "pdf",
+                    "engine": "libreoffice",
+                },
+                "export-ptw": {"operation": "export/url", "input": "convert-ptw"},
+            }
+        }
+
+        r = requests.post(
+            "https://api.cloudconvert.com/v2/jobs",
+            headers={**headers, "Content-Type": "application/json"},
+            json=job_req,
+            timeout=30,
+        )
+        r.raise_for_status()
+        job = r.json().get("data") or {}
+        job_id = job.get("id")
+        tasks = job.get("tasks") or []
+
+        import_task = next((t for t in tasks if t.get("name") == "import-ptw"), None) or {}
+        form = (import_task.get("result") or {}).get("form") or {}
+        upload_url = form.get("url")
+        upload_params = form.get("parameters") or {}
+        if not upload_url or not upload_params or not job_id:
+            return None
+
+        # Upload file to CloudConvert
+        files = {
+            "file": (
+                "ptw.docx",
+                docx_bytes,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        }
+        ur = requests.post(upload_url, data=upload_params, files=files, timeout=60)
+        ur.raise_for_status()
+
+        # Poll job status
+        deadline = time.time() + max(30, int(timeout_s))
+        export_url: str | None = None
+        while time.time() < deadline:
+            jr = requests.get(f"https://api.cloudconvert.com/v2/jobs/{job_id}", headers=headers, timeout=30)
+            jr.raise_for_status()
+            job_data = jr.json().get("data") or {}
+            status = job_data.get("status")
+            tasks2 = job_data.get("tasks") or []
+
+            if status == "error":
+                return None
+            if status == "finished":
+                export_task = next((t for t in tasks2 if t.get("name") == "export-ptw"), None) or {}
+                files_out = ((export_task.get("result") or {}).get("files")) or []
+                if files_out and isinstance(files_out, list):
+                    export_url = files_out[0].get("url")
+                break
+
+            time.sleep(0.8)
+
+        if not export_url:
+            return None
+
+        pdf_r = requests.get(export_url, timeout=60)
+        pdf_r.raise_for_status()
+        pdf_bytes = pdf_r.content
+        if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes[:4] == b"%PDF":
+            return bytes(pdf_bytes)
+        return None
+    except Exception:
+        return None
+
+
+def convert_docx_to_pdf(docx_bytes: bytes, *, progress_callback=None) -> bytes:
     """
     Convert DOCX bytes to PDF bytes using MS Word (pywin32).
     
@@ -960,6 +1068,7 @@ def convert_docx_to_pdf(docx_bytes: bytes) -> bytes:
         Original DOCX bytes if conversion fails (caller should check).
     """
     import logging
+    import shutil
     logger = logging.getLogger(__name__)
     
     # Create temp files in a simple path (avoid special characters)
@@ -971,6 +1080,19 @@ def convert_docx_to_pdf(docx_bytes: bytes) -> bytes:
         # Write DOCX to temp file
         docx_path.write_bytes(docx_bytes)
         
+        # Mode: cloud-first / local-first (default) / cloud-only
+        mode = (_get_setting("PTW_PDF_CONVERTER_MODE") or "auto").strip().lower()
+        cloud_first = mode in {"cloud", "cloud_first", "cloud-first"}
+        cloud_only = mode in {"cloud_only", "cloud-only"}
+
+        # Cloud-first (robust for hosted deployments)
+        if cloud_first or cloud_only:
+            cloud_pdf = _convert_docx_to_pdf_cloudconvert(docx_bytes)
+            if cloud_pdf is not None:
+                return cloud_pdf
+            if cloud_only:
+                return docx_bytes  # caller will raise with compliance message
+
         # Method 1: Try pywin32 (win32com.client) - most reliable on Windows
         if os.name == 'nt':
             try:
@@ -1019,23 +1141,63 @@ def convert_docx_to_pdf(docx_bytes: bytes) -> bytes:
             logger.warning(f"docx2pdf conversion failed: {e}")
         
         # Method 3: Try LibreOffice
-        soffice_paths = [
-            r"C:\Program Files\LibreOffice\program\soffice.exe",
-            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
-        ]
+        soffice_paths: list[str] = []
+        # Prefer PATH-based discovery (works on Linux/Cloud/Mac when LibreOffice is installed)
+        for cmd in ("soffice", "libreoffice"):
+            p = shutil.which(cmd)
+            if p:
+                soffice_paths.append(p)
+        # Common install locations
+        soffice_paths.extend(
+            [
+                # Windows
+                r"C:\Program Files\LibreOffice\program\soffice.exe",
+                r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+                # Linux
+                "/usr/bin/soffice",
+                "/usr/bin/libreoffice",
+                "/snap/bin/libreoffice",
+                "/usr/lib/libreoffice/program/soffice",
+                "/usr/lib64/libreoffice/program/soffice",
+                # macOS
+                "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            ]
+        )
+        # De-dup while preserving order
+        seen = set()
+        soffice_paths = [p for p in soffice_paths if p and (p not in seen and not seen.add(p))]
+
         for sp in soffice_paths:
-            if Path(sp).exists():
-                try:
-                    result = subprocess.run(
-                        [sp, "--headless", "--convert-to", "pdf", "--outdir", str(temp_dir), str(docx_path)],
-                        capture_output=True,
-                        timeout=60,
-                    )
-                    if pdf_path.exists() and pdf_path.stat().st_size > 0:
-                        return pdf_path.read_bytes()
-                except Exception as e:
-                    logger.warning(f"LibreOffice conversion failed: {e}")
-                break
+            if not Path(sp).exists():
+                continue
+            try:
+                # LibreOffice writes <basename>.pdf into outdir
+                subprocess.run(
+                    [
+                        sp,
+                        "--headless",
+                        "--nologo",
+                        "--nolockcheck",
+                        "--norestore",
+                        "--convert-to",
+                        "pdf",
+                        "--outdir",
+                        str(temp_dir),
+                        str(docx_path),
+                    ],
+                    capture_output=True,
+                    timeout=120,
+                )
+                if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                    return pdf_path.read_bytes()
+            except Exception as e:
+                logger.warning(f"LibreOffice conversion failed ({sp}): {e}")
+
+        # Local-first fallback to CloudConvert (works on hosted deployments)
+        if not cloud_only:
+            cloud_pdf = _convert_docx_to_pdf_cloudconvert(docx_bytes)
+            if cloud_pdf is not None:
+                return cloud_pdf
                 
     finally:
         # Clean up temp files
@@ -1176,7 +1338,7 @@ def _s1_inject_approval_times(form_data: dict, work_order_id: str) -> tuple[dict
     return updated, approval_times
 
 
-def generate_ptw_pdf(template_bytes: bytes, form_data: dict) -> bytes:
+def generate_ptw_pdf(template_bytes: bytes, form_data: dict, *, progress_callback=None) -> bytes:
     """
     Generate PTW document as PDF (PDF-only).
     
@@ -1191,7 +1353,12 @@ def generate_ptw_pdf(template_bytes: bytes, form_data: dict) -> bytes:
         RuntimeError if PDF conversion failed (DOCX must never be exposed as a downloadable artifact).
     """
     docx_bytes = generate_ptw_docx_from_template(template_bytes, form_data)
-    pdf_bytes = convert_docx_to_pdf(docx_bytes)
+    if progress_callback:
+        try:
+            progress_callback(60, "Converting DOCX → PDF...")
+        except Exception:
+            pass
+    pdf_bytes = convert_docx_to_pdf(docx_bytes, progress_callback=progress_callback)
 
     # Check if we got PDF (PDF starts with %PDF)
     if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes[:4] == b"%PDF":

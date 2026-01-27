@@ -927,7 +927,7 @@ def _render_post_approval_view(*, work_order_id: str, site_name: str, ptw_map: d
                 progress_callback(30, "Downloading template...")
                 tpl = _download_template_from_supabase()
                 progress_callback(70, "Rendering PTW PDF...")
-                pdf_bytes = generate_ptw_pdf(tpl, build_doc_data(updated_form))
+                pdf_bytes = generate_ptw_pdf(tpl, build_doc_data(updated_form), progress_callback=progress_callback)
                 progress_callback(90, "Done")
             
             # Step 4: Apply APPROVED stamp overlay to the PDF (S3 approved PDFs only)
@@ -1073,7 +1073,7 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
                 progress_callback(30, "Downloading template...")
                 tpl = _download_template_from_supabase()
                 progress_callback(70, "Rendering PTW PDF...")
-                pdf_bytes = generate_ptw_pdf(tpl, build_doc_data(updated))
+                pdf_bytes = generate_ptw_pdf(tpl, build_doc_data(updated), progress_callback=progress_callback)
                 progress_callback(100, "Done")
             
             # Note: Preview PDF does NOT get APPROVED stamp (only approved PDFs do)
