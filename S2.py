@@ -1739,7 +1739,7 @@ def _handle_s2_submit(
         progress.empty()
         status_msg.empty()
         st.error(f"Failed to submit: {e}")
-        st.exception(e)
+        # Avoid showing stack traces to end users in production UI
         return None
 
 

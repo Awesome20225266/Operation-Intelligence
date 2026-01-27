@@ -545,6 +545,7 @@ _highlight_open_status = _highlight_status
 # Template storage bucket name in Supabase
 SUPABASE_TEMPLATE_BUCKET = "ptw-templates"
 TEMPLATE_FILE_NAME = "Electrical_PTW_TEMPLATE.docx"
+TEMPLATE_PDF_FILE_NAME = "PDF_Electrical_PTW_TEMPLATE.pdf"  # ReportLab overlay template
 
 
 def _ptw_exists_for_work_order(work_order_id: str) -> tuple[bool, str | None]:
@@ -644,27 +645,36 @@ def _download_template_from_supabase() -> bytes:
     """
     sb = get_supabase_client(prefer_service_role=True)
     
-    try:
-        # Download from Supabase storage
-        response = sb.storage.from_(SUPABASE_TEMPLATE_BUCKET).download(TEMPLATE_FILE_NAME)
-        
-        if response and len(response) > 0:
-            return response
-        else:
+    preferred = (_get_setting("PTW_TEMPLATE_FORMAT") or "auto").strip().lower()
+    if preferred in {"docx", "docx_first", "docx-first"}:
+        candidates = [TEMPLATE_FILE_NAME, TEMPLATE_PDF_FILE_NAME]
+    elif preferred in {"pdf", "pdf_first", "pdf-first"}:
+        candidates = [TEMPLATE_PDF_FILE_NAME, TEMPLATE_FILE_NAME]
+    else:
+        # auto: try PDF first then DOCX
+        candidates = [TEMPLATE_PDF_FILE_NAME, TEMPLATE_FILE_NAME]
+
+    last_err: Exception | None = None
+    for fname in candidates:
+        try:
+            response = sb.storage.from_(SUPABASE_TEMPLATE_BUCKET).download(fname)
+            if isinstance(response, (bytes, bytearray)) and len(response) > 0:
+                return bytes(response)
             raise RuntimeError("Empty template file received from Supabase storage")
-            
-    except Exception as e:
-        error_msg = str(e)
-        raise RuntimeError(
-            f"Failed to download template from Supabase storage.\n"
-            f"Bucket: {SUPABASE_TEMPLATE_BUCKET}\n"
-            f"File: {TEMPLATE_FILE_NAME}\n"
-            f"Error: {error_msg}\n\n"
-            f"Please ensure:\n"
-            f"1. The bucket '{SUPABASE_TEMPLATE_BUCKET}' exists in Supabase Storage\n"
-            f"2. The file '{TEMPLATE_FILE_NAME}' is uploaded to the bucket\n"
-            f"3. Your service role key has read access to the bucket"
-        ) from e
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(
+        f"Failed to download template from Supabase storage.\n"
+        f"Bucket: {SUPABASE_TEMPLATE_BUCKET}\n"
+        f"Tried: {', '.join(candidates)}\n"
+        f"Error: {last_err}\n\n"
+        f"Please ensure:\n"
+        f"1. The bucket '{SUPABASE_TEMPLATE_BUCKET}' exists in Supabase Storage\n"
+        f"2. At least one of these files is uploaded: {', '.join(candidates)}\n"
+        f"3. Your service role key has read access to the bucket"
+    ) from last_err
 
 
 def _tick(val: bool | str | None) -> str:
@@ -963,14 +973,19 @@ def _get_setting(name: str) -> str | None:
     return str(v) if v is not None and str(v).strip() != "" else None
 
 
-def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180) -> bytes | None:
+def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180, progress_callback=None) -> bytes | None:
     """
     CloudConvert DOCX→PDF conversion (robust for hosted deployments).
 
     Requires: CLOUDCONVERT_API_KEY in Streamlit secrets or environment variables.
     Returns PDF bytes on success, or None if not configured / failed.
     """
-    api_key = _get_setting("CLOUDCONVERT_API_KEY")
+    # Support multiple secret names for convenience in hosted environments
+    api_key = (
+        _get_setting("CLOUDCONVERT_API_KEY")
+        or _get_setting("CLOUD_CONVERT_API_KEY")
+        or _get_setting("CLOUDCONVERT_KEY")
+    )
     if not api_key:
         return None
 
@@ -980,6 +995,12 @@ def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180
 
         headers = {"Authorization": f"Bearer {api_key}"}
 
+        if progress_callback:
+            try:
+                progress_callback(62, "Starting cloud PDF conversion...")
+            except Exception:
+                pass
+
         # Create a job: import/upload -> convert -> export/url
         job_req = {
             "tasks": {
@@ -988,7 +1009,6 @@ def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180
                     "operation": "convert",
                     "input": "import-ptw",
                     "output_format": "pdf",
-                    "engine": "libreoffice",
                 },
                 "export-ptw": {"operation": "export/url", "input": "convert-ptw"},
             }
@@ -1003,16 +1023,35 @@ def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180
         r.raise_for_status()
         job = r.json().get("data") or {}
         job_id = job.get("id")
-        tasks = job.get("tasks") or []
+        if not job_id:
+            return None
 
-        import_task = next((t for t in tasks if t.get("name") == "import-ptw"), None) or {}
-        form = (import_task.get("result") or {}).get("form") or {}
-        upload_url = form.get("url")
-        upload_params = form.get("parameters") or {}
-        if not upload_url or not upload_params or not job_id:
+        # Poll until import/upload task contains the upload form (CloudConvert can be async)
+        deadline = time.time() + max(30, int(timeout_s))
+        upload_url = None
+        upload_params: dict | None = None
+        while time.time() < deadline and (not upload_url or not upload_params):
+            jr0 = requests.get(f"https://api.cloudconvert.com/v2/jobs/{job_id}", headers=headers, timeout=30)
+            jr0.raise_for_status()
+            job0 = jr0.json().get("data") or {}
+            tasks0 = job0.get("tasks") or []
+            import_task = next((t for t in tasks0 if t.get("name") == "import-ptw"), None) or {}
+            form = (import_task.get("result") or {}).get("form") or {}
+            upload_url = form.get("url")
+            upload_params = form.get("parameters") or None
+            if upload_url and upload_params:
+                break
+            time.sleep(0.4)
+
+        if not upload_url or not upload_params:
             return None
 
         # Upload file to CloudConvert
+        if progress_callback:
+            try:
+                progress_callback(70, "Uploading document to converter...")
+            except Exception:
+                pass
         files = {
             "file": (
                 "ptw.docx",
@@ -1024,7 +1063,6 @@ def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180
         ur.raise_for_status()
 
         # Poll job status
-        deadline = time.time() + max(30, int(timeout_s))
         export_url: str | None = None
         while time.time() < deadline:
             jr = requests.get(f"https://api.cloudconvert.com/v2/jobs/{job_id}", headers=headers, timeout=30)
@@ -1038,21 +1076,554 @@ def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180
             if status == "finished":
                 export_task = next((t for t in tasks2 if t.get("name") == "export-ptw"), None) or {}
                 files_out = ((export_task.get("result") or {}).get("files")) or []
-                if files_out and isinstance(files_out, list):
+                if files_out and isinstance(files_out, list) and files_out[0].get("url"):
                     export_url = files_out[0].get("url")
-                break
+                    break
 
             time.sleep(0.8)
 
         if not export_url:
             return None
 
+        if progress_callback:
+            try:
+                progress_callback(90, "Downloading PDF...")
+            except Exception:
+                pass
         pdf_r = requests.get(export_url, timeout=60)
         pdf_r.raise_for_status()
         pdf_bytes = pdf_r.content
         if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes[:4] == b"%PDF":
+            if progress_callback:
+                try:
+                    progress_callback(98, "PDF ready")
+                except Exception:
+                    pass
             return bytes(pdf_bytes)
         return None
+    except Exception:
+        return None
+
+
+# =============================================================================
+# PDF TEMPLATE + REPORTLAB OVERLAY (NO DOCX/LIBREOFFICE/CLOUDCONVERT)
+# =============================================================================
+
+# Page-wise coordinate mapping for PDF overlay (A4: 595 x 842, bottom-left origin)
+# This is a CONTRACT — do not change without re-mapping the template
+
+_PDF_COORDS_PAGE1 = {
+    # HEADER
+    "permit_no": (150, 740),
+    "permit_validity_date": (420, 740),
+    "start_time": (150, 710),
+    "end_time": (420, 710),
+    "site_name": (150, 680),
+    "work_location": (420, 680),
+    "work_description_line1": (150, 650),
+    "work_description_line2": (150, 635),
+    "contractor_name": (150, 605),
+    # HAZARDS (checkmarks)
+    "hz_live_dc_cables": (65, 560),
+    "hz_loose_connectors": (205, 560),
+    "hz_tracker_parts": (350, 560),
+    "hz_dust": (500, 560),
+    "hz_high_dc": (65, 530),
+    "hz_poor_grounding": (205, 530),
+    "hz_heavy_panels": (350, 530),
+    "hz_wildlife": (500, 530),
+    "hz_arc_flash": (65, 500),
+    "hz_working_height": (205, 500),
+    "hz_sharp_edges": (350, 500),
+    "hz_lightning": (500, 500),
+    "hz_improper_grounding": (65, 470),
+    "hz_wet_surfaces": (205, 470),
+    "hz_heat": (350, 470),
+    "hz_overload": (500, 470),
+    "hz_manual_handling": (205, 440),
+    "hz_overhead_line": (350, 440),
+    "hz_others_text": (440, 440),
+    # RISK IDENTIFICATION (checkmarks)
+    "rk_electrocution": (65, 385),
+    "rk_burns": (205, 385),
+    "rk_unexpected_energization": (350, 385),
+    "rk_heat_stress": (500, 385),
+    "rk_electric_shock": (65, 355),
+    "rk_fire": (205, 355),
+    "rk_crushing": (350, 355),
+    "rk_others_text": (500, 355),
+    "rk_electric_burn": (65, 325),
+    "rk_fall": (205, 325),
+    "rk_back_injury": (350, 325),
+    "rk_bites": (65, 295),
+    "rk_falling_particles": (205, 295),
+    "rk_tripping": (350, 295),
+    # PPE (checkmarks)
+    "ppe_helmet": (65, 245),
+    "ppe_hrc_suit": (205, 245),
+    "ppe_respirators": (350, 245),
+    "ppe_harness": (500, 245),
+    "ppe_shoes": (65, 215),
+    "ppe_electrical_mat": (205, 215),
+    "ppe_dust_mask": (350, 215),
+    "ppe_lifeline": (500, 215),
+    "ppe_reflective_vest": (65, 185),
+    "ppe_face_shield": (205, 185),
+    "ppe_ear_plugs": (350, 185),
+    "ppe_cut_gloves": (500, 185),
+    "ppe_goggles": (65, 155),
+    "ppe_insulated_tools": (205, 155),
+    "ppe_electrical_gloves": (350, 155),
+    "ppe_others_text": (500, 155),
+    # SAFETY PRECAUTIONS (checkmarks)
+    "sp_electrical_isolation": (65, 105),
+    "sp_fire_extinguisher": (205, 105),
+    "sp_proper_isolation": (350, 105),
+    "sp_authorized_personnel": (500, 105),
+    "sp_loto": (65, 75),
+    "sp_signage": (205, 75),
+    "sp_rescue_equipment": (350, 75),
+    "sp_others_text": (500, 75),
+    "sp_zero_voltage": (65, 45),
+    "sp_earthing": (205, 45),
+    "sp_pre_job_meeting": (350, 45),
+    "sp_insulated_tools": (65, 15),
+    "sp_illumination": (205, 15),
+    "sp_escape_route": (350, 15),
+}
+
+_PDF_COORDS_PAGE2 = {
+    # ASSOCIATED PERMITS (checkmarks)
+    "ap_hot_work": (65, 700),
+    "ap_night_work": (205, 700),
+    "ap_height_work": (350, 700),
+    "ap_general_work": (65, 670),
+    "ap_excavation": (205, 670),
+    "ap_lifting": (350, 670),
+    "ap_loto": (65, 640),
+    "ap_confined_space": (205, 640),
+    "ap_others_text": (350, 640),
+    # TOOLS / EQUIPMENT (text, multiline)
+    "tools_equipment_line1": (65, 600),
+    "tools_equipment_line2": (65, 585),
+    "tools_equipment_line3": (65, 570),
+    # CHECK POINTS (Y/N/NA checkmarks) - left column
+    "chk_jsa": (300, 525),
+    "chk_loto": (300, 495),
+    "chk_energized_ppe": (300, 465),
+    "chk_workers_fit": (300, 435),
+    "chk_tools": (300, 405),
+    "chk_rescue_plan": (300, 375),
+    "chk_testing_equipment": (300, 345),
+    "chk_line_clearance": (300, 315),
+    # CHECK POINTS - right column
+    "chk_environment": (545, 525),
+    "chk_fire_fighting": (545, 495),
+    "chk_rescue": (545, 465),
+    "chk_grounded": (545, 435),
+    "chk_lighting": (545, 405),
+    "chk_signage": (545, 375),
+    "chk_conductive_removed": (545, 345),
+    "chk_briefing": (545, 315),
+    # UNDERTAKING
+    "undertaking_accept": (65, 255),
+}
+
+_PDF_COORDS_PAGE3 = {
+    # SIGNATURES
+    "receiver_name": (220, 705),
+    "receiver_datetime": (450, 705),
+    "holder_name": (220, 675),
+    "holder_datetime": (450, 675),
+    "issuer_name": (220, 620),
+    "issuer_datetime": (450, 620),
+    # CO-WORKERS
+    "coworker_1": (260, 645),
+    "coworker_2": (340, 645),
+    "coworker_3": (420, 645),
+    "coworker_4": (260, 615),
+    "coworker_5": (340, 615),
+    "coworker_6": (420, 615),
+    # EXTENSION
+    "ext_date": (95, 565),
+    "ext_from_time": (160, 565),
+    "ext_to_time": (215, 565),
+    "ext_holder_name": (295, 565),
+    "ext_receiver_name": (395, 565),
+    "ext_issuer_name": (500, 565),
+    "ext_remarks": (120, 535),
+    # PERMIT CLOSURE
+    "closure_receiver": (220, 480),
+    "closure_receiver_datetime": (450, 480),
+    "closure_holder": (220, 450),
+    "closure_holder_datetime": (450, 450),
+    "closure_issuer": (220, 420),
+    "closure_issuer_datetime": (450, 420),
+}
+
+# All checkmark/boolean fields (value should be rendered as ✔ if truthy)
+_CHECKBOX_FIELDS = {
+    # Hazards
+    "hz_live_dc_cables", "hz_loose_connectors", "hz_tracker_parts", "hz_dust",
+    "hz_high_dc", "hz_poor_grounding", "hz_heavy_panels", "hz_wildlife",
+    "hz_arc_flash", "hz_working_height", "hz_sharp_edges", "hz_lightning",
+    "hz_improper_grounding", "hz_wet_surfaces", "hz_heat", "hz_overload",
+    "hz_manual_handling", "hz_overhead_line",
+    # Risks
+    "rk_electrocution", "rk_burns", "rk_unexpected_energization", "rk_heat_stress",
+    "rk_electric_shock", "rk_fire", "rk_crushing", "rk_electric_burn",
+    "rk_fall", "rk_back_injury", "rk_bites", "rk_falling_particles", "rk_tripping",
+    # PPE
+    "ppe_helmet", "ppe_hrc_suit", "ppe_respirators", "ppe_harness",
+    "ppe_shoes", "ppe_electrical_mat", "ppe_dust_mask", "ppe_lifeline",
+    "ppe_reflective_vest", "ppe_face_shield", "ppe_ear_plugs", "ppe_cut_gloves",
+    "ppe_goggles", "ppe_insulated_tools", "ppe_electrical_gloves",
+    # Safety Precautions
+    "sp_electrical_isolation", "sp_fire_extinguisher", "sp_proper_isolation",
+    "sp_authorized_personnel", "sp_loto", "sp_signage", "sp_rescue_equipment",
+    "sp_zero_voltage", "sp_earthing", "sp_pre_job_meeting",
+    "sp_insulated_tools", "sp_illumination", "sp_escape_route",
+    # Associated Permits
+    "ap_hot_work", "ap_night_work", "ap_height_work",
+    "ap_general_work", "ap_excavation", "ap_lifting",
+    "ap_loto", "ap_confined_space",
+    # Undertaking
+    "undertaking_accept",
+    # Checkpoints
+    "chk_jsa", "chk_loto", "chk_energized_ppe", "chk_workers_fit",
+    "chk_tools", "chk_rescue_plan", "chk_testing_equipment", "chk_line_clearance",
+    "chk_environment", "chk_fire_fighting", "chk_rescue", "chk_grounded",
+    "chk_lighting", "chk_signage", "chk_conductive_removed", "chk_briefing",
+}
+
+# Global coordinate offset to correct template margin/scale mismatch.
+# Apply this to every drawString/textLine/tick (do not change individual coords).
+X_OFFSET = -6
+Y_OFFSET = 20
+
+
+def _draw_approved_stamp(canvas_obj: Any, approved_datetime: Any) -> None:
+    """
+    Draw APPROVED stamp (page 1 only).
+
+    Condition is handled by caller.
+    Data source: form_data["date_s3_approved"]
+    """
+    stamp_x = 380 + X_OFFSET
+    stamp_y = 770 + Y_OFFSET
+
+    # "APPROVED" in green
+    canvas_obj.setFont("Helvetica-Bold", 16)
+    canvas_obj.setFillColorRGB(0, 0.6, 0)
+    canvas_obj.drawString(stamp_x, stamp_y, "APPROVED")
+
+    # Date below, in black
+    canvas_obj.setFont("Helvetica", 9)
+    canvas_obj.setFillColorRGB(0, 0, 0)
+    canvas_obj.drawString(
+        stamp_x,
+        752 + Y_OFFSET,
+        f"Date: {'' if approved_datetime is None else str(approved_datetime)}",
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _download_pdf_template_from_supabase() -> bytes:
+    """
+    Download the PDF template specifically for ReportLab overlay approach.
+    Returns the PDF template bytes; raises RuntimeError if not found.
+    """
+    sb = get_supabase_client(prefer_service_role=True)
+    try:
+        response = sb.storage.from_(SUPABASE_TEMPLATE_BUCKET).download(TEMPLATE_PDF_FILE_NAME)
+        if isinstance(response, (bytes, bytearray)) and len(response) > 0:
+            if bytes(response)[:4] == b"%PDF":
+                return bytes(response)
+            raise RuntimeError(f"Downloaded file is not a valid PDF: {TEMPLATE_PDF_FILE_NAME}")
+        raise RuntimeError(f"Empty PDF template received: {TEMPLATE_PDF_FILE_NAME}")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to download PDF template from Supabase.\n"
+            f"Bucket: {SUPABASE_TEMPLATE_BUCKET}\n"
+            f"File: {TEMPLATE_PDF_FILE_NAME}\n"
+            f"Error: {e}\n\n"
+            f"Please upload '{TEMPLATE_PDF_FILE_NAME}' to the bucket."
+        ) from e
+
+
+def _is_truthy(val: Any) -> bool:
+    """Check if a value is truthy for checkbox rendering."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().upper() in {"Y", "YES", "TRUE", "1", "✓", "✔"}
+    return bool(val)
+
+
+def _prepare_overlay_data(form_data: dict) -> dict:
+    """
+    Prepare form_data for PDF overlay rendering.
+    - Split work_description into lines
+    - Split tools_equipment into lines
+    - Normalize checkbox values
+    """
+    data = dict(form_data)
+    
+    # Split work_description into two lines (max ~60 chars per line)
+    work_desc = str(data.get("work_description", "") or "")
+    if len(work_desc) > 60:
+        # Try to split at a space near the middle
+        split_idx = work_desc.rfind(" ", 0, 60)
+        if split_idx == -1:
+            split_idx = 60
+        data["work_description_line1"] = work_desc[:split_idx].strip()
+        data["work_description_line2"] = work_desc[split_idx:].strip()
+    else:
+        data["work_description_line1"] = work_desc
+        data["work_description_line2"] = ""
+    
+    # Split tools_equipment into three lines
+    tools = str(data.get("tools_equipment", "") or "")
+    lines = []
+    while tools and len(lines) < 3:
+        if len(tools) <= 70:
+            lines.append(tools)
+            break
+        split_idx = tools.rfind(" ", 0, 70)
+        if split_idx == -1:
+            split_idx = 70
+        lines.append(tools[:split_idx].strip())
+        tools = tools[split_idx:].strip()
+    while len(lines) < 3:
+        lines.append("")
+    data["tools_equipment_line1"] = lines[0]
+    data["tools_equipment_line2"] = lines[1]
+    data["tools_equipment_line3"] = lines[2]
+    
+    # Handle PPE field name variations (ppe_respirator vs ppe_respirators)
+    if "ppe_respirator" in data and "ppe_respirators" not in data:
+        data["ppe_respirators"] = data["ppe_respirator"]
+    
+    return data
+
+
+def _create_overlay_page(canvas_obj: Any, page_coords: dict, data: dict, font_size: int = 10) -> None:
+    """
+    Draw text/checkmarks on a ReportLab canvas for one page.
+    """
+    for key, (x, y) in page_coords.items():
+        val = data.get(key)
+        if val is None:
+            continue
+        
+        # Checkbox fields: render ✔ if truthy
+        if key in _CHECKBOX_FIELDS:
+            if _is_truthy(val):
+                canvas_obj.setFont("Helvetica-Bold", font_size + 2)
+                canvas_obj.drawString(x + X_OFFSET, y + Y_OFFSET, "✔")
+        else:
+            # Text fields
+            text = str(val).strip()
+            if text:
+                canvas_obj.setFont("Helvetica", font_size)
+                # Truncate very long text to prevent overflow
+                if len(text) > 80:
+                    text = text[:77] + "..."
+                canvas_obj.drawString(x + X_OFFSET, y + Y_OFFSET, text)
+
+
+def generate_ptw_pdf_from_template(form_data: dict, *, progress_callback=None) -> bytes:
+    """
+    Generate PTW PDF using PDF template + ReportLab overlay.
+    
+    This approach:
+    - Downloads the PDF template from Supabase
+    - Creates an overlay with text and checkmarks using ReportLab
+    - Merges the overlay with the template using PyPDF2
+    
+    NO DOCX. NO LibreOffice. NO paid services.
+    Works on Streamlit Cloud (Linux, no system binaries).
+    
+    Args:
+        form_data: Dictionary of PTW form field values
+        progress_callback: Optional callback(percent, message)
+    
+    Returns:
+        Final PDF bytes
+    
+    Raises:
+        RuntimeError if generation fails
+    """
+    try:
+        from reportlab.lib.pagesizes import A4  # type: ignore
+        from reportlab.pdfgen import canvas as rl_canvas  # type: ignore
+        from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(f"Required PDF libraries not installed: {e}") from e
+    
+    if progress_callback:
+        try:
+            progress_callback(5, "Downloading PDF template...")
+        except Exception:
+            pass
+    
+    # Download PDF template
+    template_bytes = _download_pdf_template_from_supabase()
+    
+    if progress_callback:
+        try:
+            progress_callback(20, "Preparing form data...")
+        except Exception:
+            pass
+    
+    # Prepare data for overlay
+    data = _prepare_overlay_data(form_data)
+    
+    # Read template to get number of pages
+    template_reader = PdfReader(BytesIO(template_bytes))
+    num_pages = len(template_reader.pages)
+    
+    if progress_callback:
+        try:
+            progress_callback(30, "Creating overlay...")
+        except Exception:
+            pass
+    
+    # Create overlay PDF with ReportLab (one page per template page)
+    overlay_buffer = BytesIO()
+    c = rl_canvas.Canvas(overlay_buffer, pagesize=A4)
+    
+    # Page coordinate mappings
+    page_coords_list = [
+        _PDF_COORDS_PAGE1,
+        _PDF_COORDS_PAGE2,
+        _PDF_COORDS_PAGE3,
+    ]
+    
+    for page_idx in range(num_pages):
+        if page_idx < len(page_coords_list):
+            _create_overlay_page(c, page_coords_list[page_idx], data)
+            # APPROVED stamp (page 1 only), in the new PDF pipeline
+            if (
+                page_idx == 0
+                and str(form_data.get("status", "")).strip().upper() == "APPROVED"
+            ):
+                _draw_approved_stamp(c, form_data.get("date_s3_approved"))
+        c.showPage()
+    
+    c.save()
+    overlay_buffer.seek(0)
+    
+    if progress_callback:
+        try:
+            progress_callback(60, "Merging PDF layers...")
+        except Exception:
+            pass
+    
+    # Read overlay PDF
+    overlay_reader = PdfReader(overlay_buffer)
+    
+    # Merge: for each page, merge template page with overlay page
+    writer = PdfWriter()
+    for page_idx in range(num_pages):
+        template_page = template_reader.pages[page_idx]
+        
+        if page_idx < len(overlay_reader.pages):
+            overlay_page = overlay_reader.pages[page_idx]
+            # Merge overlay on top of template
+            template_page.merge_page(overlay_page)
+        
+        writer.add_page(template_page)
+    
+    if progress_callback:
+        try:
+            progress_callback(90, "Finalizing PDF...")
+        except Exception:
+            pass
+    
+    # Write final PDF
+    output_buffer = BytesIO()
+    writer.write(output_buffer)
+    output_buffer.seek(0)
+    pdf_bytes = output_buffer.read()
+    
+    # Validate output
+    if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
+        raise RuntimeError("PDF generation failed: output is not a valid PDF")
+    
+    if progress_callback:
+        try:
+            progress_callback(100, "PDF ready!")
+        except Exception:
+            pass
+    
+    return pdf_bytes
+
+
+def _fill_pdf_template_acroform(pdf_template_bytes: bytes, data: dict) -> bytes | None:
+    """
+    Fill a PDF template that contains AcroForm fields.
+
+    - If the template has no AcroForm fields, returns None.
+    - Uses PyPDF2 to set field values and enables NeedAppearances.
+    """
+    try:
+        from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        reader = PdfReader(BytesIO(pdf_template_bytes))
+        fields = reader.get_fields() or {}
+        if not fields:
+            return None
+
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+
+        # Ensure appearances are generated in most PDF viewers
+        try:
+            if "/AcroForm" in reader.trailer["/Root"]:
+                acro = dict(reader.trailer["/Root"]["/AcroForm"])
+            else:
+                acro = {}
+            acro.update({"/NeedAppearances": True})
+            writer._root_object.update({"/AcroForm": acro})  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        # Only set values for fields that exist in the template
+        values: dict[str, Any] = {}
+        for name, field in fields.items():
+            if name not in data:
+                continue
+            v = data.get(name)
+            ft = None
+            try:
+                ft = field.get("/FT")
+            except Exception:
+                ft = None
+            if ft == "/Btn":
+                # Checkbox/radio buttons: map common tick marks / truthy strings to "Yes"
+                s = "" if v is None else str(v).strip()
+                values[name] = "Yes" if s in {"✓", "✔", "Y", "YES", "TRUE", "1"} else "Off"
+            else:
+                values[name] = "" if v is None else str(v)
+
+        for page in writer.pages:
+            try:
+                writer.update_page_form_field_values(page, values)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+        out = BytesIO()
+        writer.write(out)
+        out.seek(0)
+        pdf_bytes = out.read()
+        return pdf_bytes if pdf_bytes[:4] == b"%PDF" else None
     except Exception:
         return None
 
@@ -1087,7 +1658,7 @@ def convert_docx_to_pdf(docx_bytes: bytes, *, progress_callback=None) -> bytes:
 
         # Cloud-first (robust for hosted deployments)
         if cloud_first or cloud_only:
-            cloud_pdf = _convert_docx_to_pdf_cloudconvert(docx_bytes)
+            cloud_pdf = _convert_docx_to_pdf_cloudconvert(docx_bytes, progress_callback=progress_callback)
             if cloud_pdf is not None:
                 return cloud_pdf
             if cloud_only:
@@ -1195,7 +1766,7 @@ def convert_docx_to_pdf(docx_bytes: bytes, *, progress_callback=None) -> bytes:
 
         # Local-first fallback to CloudConvert (works on hosted deployments)
         if not cloud_only:
-            cloud_pdf = _convert_docx_to_pdf_cloudconvert(docx_bytes)
+            cloud_pdf = _convert_docx_to_pdf_cloudconvert(docx_bytes, progress_callback=progress_callback)
             if cloud_pdf is not None:
                 return cloud_pdf
                 
@@ -1342,32 +1913,80 @@ def generate_ptw_pdf(template_bytes: bytes, form_data: dict, *, progress_callbac
     """
     Generate PTW document as PDF (PDF-only).
     
+    PRIMARY METHOD: PDF Template + ReportLab overlay (no DOCX/LibreOffice/CloudConvert)
+    FALLBACK: DOCX conversion (local MS Word/LibreOffice or CloudConvert)
+    
     Args:
-        template_bytes: The template DOCX file as bytes (from Supabase storage)
+        template_bytes: The template file as bytes (ignored for primary method)
         form_data: Dictionary of placeholder keys to values
+        progress_callback: Optional callback(percent, message)
     
     Returns:
         PDF bytes.
 
     Raises:
-        RuntimeError if PDF conversion failed (DOCX must never be exposed as a downloadable artifact).
+        RuntimeError if PDF generation failed.
     """
-    docx_bytes = generate_ptw_docx_from_template(template_bytes, form_data)
-    if progress_callback:
-        try:
-            progress_callback(60, "Converting DOCX → PDF...")
-        except Exception:
-            pass
-    pdf_bytes = convert_docx_to_pdf(docx_bytes, progress_callback=progress_callback)
+    # -------------------------------------------------------------------------
+    # PRIMARY METHOD: PDF Template + ReportLab Overlay
+    # Works on Streamlit Cloud (Linux) without any system binaries or paid services
+    # -------------------------------------------------------------------------
+    try:
+        if progress_callback:
+            try:
+                progress_callback(5, "Generating PDF from template...")
+            except Exception:
+                pass
+        
+        pdf_bytes = generate_ptw_pdf_from_template(form_data, progress_callback=progress_callback)
+        
+        if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes[:4] == b"%PDF":
+            return bytes(pdf_bytes)
+    except Exception as template_err:
+        # Log the error but continue to fallback methods
+        import logging
+        logging.getLogger(__name__).warning(f"PDF template overlay failed: {template_err}")
+    
+    # -------------------------------------------------------------------------
+    # FALLBACK: AcroForm filling (if template_bytes is a fillable PDF)
+    # -------------------------------------------------------------------------
+    if isinstance(template_bytes, (bytes, bytearray)) and bytes(template_bytes)[:4] == b"%PDF":
+        if progress_callback:
+            try:
+                progress_callback(55, "Trying AcroForm fill...")
+            except Exception:
+                pass
+        filled = _fill_pdf_template_acroform(bytes(template_bytes), form_data)
+        if filled is not None:
+            return filled
 
-    # Check if we got PDF (PDF starts with %PDF)
-    if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes[:4] == b"%PDF":
-        return bytes(pdf_bytes)
+    # -------------------------------------------------------------------------
+    # FALLBACK: DOCX conversion (local MS Word/LibreOffice or CloudConvert)
+    # -------------------------------------------------------------------------
+    try:
+        docx_bytes = generate_ptw_docx_from_template(template_bytes, form_data)
+        if progress_callback:
+            try:
+                progress_callback(60, "Converting DOCX → PDF...")
+            except Exception:
+                pass
+        pdf_bytes = convert_docx_to_pdf(docx_bytes, progress_callback=progress_callback)
 
+        if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes[:4] == b"%PDF":
+            return bytes(pdf_bytes)
+    except Exception as docx_err:
+        import logging
+        logging.getLogger(__name__).warning(f"DOCX conversion fallback failed: {docx_err}")
+
+    # -------------------------------------------------------------------------
+    # All methods failed - provide actionable guidance
+    # -------------------------------------------------------------------------
     raise RuntimeError(
-        "PDF conversion failed on this machine. "
-        "Install Microsoft Word (recommended) or LibreOffice for DOCX→PDF conversion. "
-        "DOCX download is disabled for legal compliance."
+        "PDF generation failed.\n\n"
+        "Please ensure the PDF template is uploaded to Supabase Storage:\n"
+        f"  Bucket: {SUPABASE_TEMPLATE_BUCKET}\n"
+        f"  File: {TEMPLATE_PDF_FILE_NAME}\n\n"
+        "The PDF template is required for hosted deployments."
     )
 
 
@@ -2940,7 +3559,7 @@ def _handle_ptw_submit(**kwargs) -> None:
         status_placeholder.empty()
         msg_placeholder.empty()
         st.error(f"Error submitting PTW: {str(e)}")
-        st.exception(e)
+        # Avoid showing stack traces to end users in production UI
         st.session_state["s1_ptw_last_file"] = None
         st.session_state["s1_ptw_last_permit_no"] = None
         st.session_state["ptw_is_submitting"] = False
@@ -3080,7 +3699,13 @@ def _render_view_applied_ptw() -> None:
                     # Generate document
                     _smooth_progress(prog, 40, 85, text="Generating PDF...")
                     doc_data = build_doc_data(updated_form)
-                    pdf_bytes = generate_ptw_pdf(template_bytes, doc_data)  # PDF-only (raises if fails)
+                    def _progress_cb(pct: int, msg: str) -> None:
+                        try:
+                            prog.progress(int(pct), text=msg)
+                        except Exception:
+                            pass
+
+                    pdf_bytes = generate_ptw_pdf(template_bytes, doc_data, progress_callback=_progress_cb)  # PDF-only (raises if fails)
 
                     # Apply APPROVED stamp on every page if S3-approved
                     if approved_on:
@@ -3094,7 +3719,6 @@ def _render_view_applied_ptw() -> None:
                     st.session_state["s1_view_ptw_pdf_approved_on"] = approved_on
                 except Exception as e:
                     st.error(f"Failed to generate document: {e}")
-                    st.exception(e)
 
             cached_pdf = st.session_state.get("s1_view_ptw_pdf_bytes")
             cached_permit = st.session_state.get("s1_view_ptw_pdf_permit")
