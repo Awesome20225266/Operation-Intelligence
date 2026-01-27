@@ -29,17 +29,17 @@ def check_password() -> bool:
         return True
 
     # ---------------------------------------------------------------------
-    # Anti-flash bootstrap:
-    # On initial load (or after logout), the browser can briefly show the last
-    # rendered app DOM until the login UI paints. Force an immediate dark paint
-    # before any expensive IO (e.g., reading background image).
+    # Boot UX:
+    # On initial load (or after logout), users can see a brief blank/dark paint
+    # while the login UI initializes. Show an immediate progress bar so the
+    # experience is intentional and professional.
     # ---------------------------------------------------------------------
     st.markdown(
         """
         <style>
           html, body { background: #0f172a !important; }
-          /* Hide existing app content immediately to prevent "intermediate screen" flash */
-          .stApp { opacity: 0 !important; transition: none !important; }
+          /* Keep app visible so the boot progress bar can render */
+          .stApp { opacity: 1 !important; transition: none !important; }
           header { visibility: hidden; }
           [data-testid="stSidebar"] { display: none !important; }
           #MainMenu { visibility: hidden; }
@@ -48,6 +48,38 @@ def check_password() -> bool:
         """,
         unsafe_allow_html=True,
     )
+
+    # Immediate boot loader (progress bar) to avoid a blank/dark screen
+    import time as _time
+    _boot = st.empty()
+    with _boot.container():
+        st.markdown(
+            """
+            <div style="
+              max-width: 520px;
+              margin: 14vh auto 0 auto;
+              padding: 18px 20px;
+              border-radius: 16px;
+              background: rgba(255,255,255,0.06);
+              border: 1px solid rgba(255,255,255,0.12);
+              color: rgba(255,255,255,0.92);
+              font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+            ">
+              <div style="font-size:14px; font-weight:700; letter-spacing:0.3px; opacity:0.95;">
+                Opening dashboard…
+              </div>
+              <div style="font-size:12px; opacity:0.78; margin-top:6px;">
+                Preparing secure login
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        _p_slot = st.empty()
+        _p_slot.progress(0, text="Starting… (0%)")
+        for i in range(1, 26):
+            _p_slot.progress(i, text=f"Starting… ({i}%)")
+            _time.sleep(0.01)
 
     # --- Inject CSS IMMEDIATELY to prevent any unstyled flash ---
     # Load background image (optional)
@@ -79,7 +111,7 @@ def check_password() -> bool:
             <style>
             /* 1. Set Background on the main App container */
             {bg_style}
-            /* Make login UI visible (paired with bootstrap hide above) */
+            /* Make login UI visible */
             .stApp {{ opacity: 1 !important; }}
             
             /* 2. Hide the standard Streamlit header/menu on login screen for immersion */
@@ -169,6 +201,14 @@ def check_password() -> bool:
             </style>
         """, unsafe_allow_html=True)
         st.session_state["login_css_injected"] = True
+
+    # Finish boot loader and unmount it before showing the login form
+    try:
+        for i in range(26, 101, 4):
+            _p_slot.progress(min(100, i), text=f"Loading login… ({min(100, i)}%)")
+            _time.sleep(0.01)
+    finally:
+        _boot.empty()
 
     def authenticate() -> None:
         """Check credentials against Supabase - optimized for speed."""

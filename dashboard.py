@@ -69,8 +69,7 @@ _BASE_CSS = """
   /* Hide Deploy button completely */
   .stDeployButton,
   [data-testid="stDeployButton"],
-  button[kind="deploy"],
-  .stApp header button[kind="header"] { 
+  button[kind="deploy"] { 
     display: none !important; 
     visibility: hidden !important;
     pointer-events: none !important;
@@ -78,9 +77,7 @@ _BASE_CSS = """
   
   /* Hide hamburger menu / MainMenu */
   #MainMenu,
-  [data-testid="stMainMenu"],
-  button[kind="headerNoPadding"],
-  .stApp header [data-testid="stToolbarActions"] > button:first-child {
+  [data-testid="stMainMenu"] {
     display: none !important;
     visibility: hidden !important;
   }
@@ -102,7 +99,11 @@ _BASE_CSS = """
   }
   
   /* Keep ONLY the sidebar collapse/expand control visible */
-  [data-testid="collapsedControl"] {
+  [data-testid="collapsedControl"],
+  [data-testid="stSidebarCollapseButton"],
+  [data-testid="stSidebarCollapsedControl"],
+  button[aria-label*="sidebar"],
+  button[title*="sidebar"] {
     display: inline-flex !important;
     visibility: visible !important;
     opacity: 1 !important;
