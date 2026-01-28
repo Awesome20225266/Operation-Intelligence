@@ -15,6 +15,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 import add_comments
 import scb_ot
+from access_control import allowed_sites_for_user
 
 
 @dataclass(frozen=True)
@@ -349,29 +350,43 @@ def render(db_path: str) -> None:
     st.caption("Excel-driven SCB OT comments. SCB OT is the source of truth; this page only validates + writes comments to Supabase.")
 
     # Username-based access control (UI/data-filter driven)
-    from access_control import allowed_sites_for_user, is_admin, is_restricted_user
+    from access_control import is_admin, is_restricted_user
 
-    username = st.session_state.get("user_info", {}).get("username")
+    user_info = st.session_state.get("user_info", {})
+    username = user_info.get("username")
 
     # Persist success message for up to 60 seconds (or until tab switch).
     success_until = float(st.session_state.get("scb_comment_success_until", 0.0) or 0.0)
     if success_until and time.time() < success_until:
         st.success("SCB comments submitted successfully.")
 
-    sites = scb_ot.list_sites_from_array_details(db_path)
-    if not sites:
-        st.info("No sites found in array_details.site_name.")
+    all_sites = add_comments.list_sites_from_syd(db_path)
+    if not all_sites:
+        st.info("No sites found in `syd`.")
         return
 
     allowed_sites = allowed_sites_for_user(username)
     if allowed_sites:
-        allowed_l = {str(x).strip().lower() for x in allowed_sites}
-        sites = [s for s in sites if str(s).strip().lower() in allowed_l]
+        sites = [s for s in all_sites if str(s).strip().lower() in allowed_sites]
+    else:
+        sites = all_sites
+
+    # Normalize site labels to prevent selection dropping on reruns (case/whitespace mismatches)
+    sites = sorted({str(s).strip() for s in sites if str(s).strip()})
+
+    # Auto-select (and lock) restricted users to their single allowed site.
+    # Streamlit selectbox may keep an old/invalid session_state value for a key, so we clamp it.
+    default_index = 0 if len(sites) == 1 else 0
+    if is_restricted_user(username) and sites:
+        if st.session_state.get("scb_comment_site_locked") not in sites:
+            st.session_state["scb_comment_site_locked"] = sites[0]
+        if st.session_state.get("scb_comment_ve_site_locked") not in sites:
+            st.session_state["scb_comment_ve_site_locked"] = sites[0]
 
     c1, c2, c3, c4 = st.columns([2.6, 1.4, 1.6, 1.6], vertical_alignment="bottom")
     with c1:
         if not is_admin(username) and allowed_sites:
-            site_name = st.selectbox("Site Name", options=sites, index=0, disabled=True, key="scb_comment_site_locked")
+            site_name = st.selectbox("Site Name", options=sites, index=default_index, disabled=True, key="scb_comment_site_locked")
         else:
             site_name = st.selectbox("Site Name", options=["(select)", *sites], index=0, key="scb_comment_site")
             if site_name == "(select)":
@@ -587,7 +602,7 @@ def render(db_path: str) -> None:
     ve1, ve2, ve3 = st.columns([2.2, 1.4, 1.4], vertical_alignment="bottom")
     with ve1:
         if not is_admin(username) and allowed_sites:
-            ve_site = st.selectbox("Site Name", options=sites, index=0, disabled=True, key="scb_comment_ve_site_locked")
+            ve_site = st.selectbox("Site Name", options=sites, index=default_index, disabled=True, key="scb_comment_ve_site_locked")
         else:
             ve_site = st.selectbox("Site Name", options=["(select)", *sites], index=0, key="scb_comment_ve_site")
             if ve_site == "(select)":
