@@ -31,7 +31,7 @@ Pipeline (exact):
 
 from datetime import date
 import re
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 import duckdb
@@ -62,6 +62,8 @@ def _build_inverter_scb_diagnostic_map(
     inverter_order: list,
     scb_order: list,
     title: str = "Inverter–SCB Performance & Fault Diagnostic Map",
+    avg_da_by_inverter: Optional[dict[str, float]] = None,
+    valid_scb_count_by_inverter: Optional[dict[str, int]] = None,
 ):
     """
     Builds a responsive 2-panel Plotly diagnostic map:
@@ -89,6 +91,7 @@ def _build_inverter_scb_diagnostic_map(
     # Disconnected strings summary (hide zeros, sort desc)
     inv_disc_sum = pivot_disc.fillna(0).sum(axis=1)
     inv_disc_sum = inv_disc_sum[inv_disc_sum > 0].sort_values(ascending=False)
+    max_ds = float(inv_disc_sum.max()) if not inv_disc_sum.empty else 0.0
 
     # Severity-based coloring for disconnected strings (UI only)
     def _severity_color(v: int) -> str:
@@ -165,18 +168,67 @@ def _build_inverter_scb_diagnostic_map(
                 x=inv_disc_sum.values,
                 y=inv_disc_sum.index,
                 orientation="h",
+                name="DS",
+                showlegend=True,
                 marker=dict(color=[_severity_color(int(v)) for v in inv_disc_sum.values]),
                 text=[int(v) for v in inv_disc_sum.values],
                 textposition="outside",
                 hovertemplate=(
-                    "<span style='font-size:15px'><b>Inverter:</b> %{y}</span><br>"
-                    "<span style='font-size:14px'><b>Total Disconnected Strings:</b> %{x}</span>"
+                    "<span style='font-size:18px'><b>Inverter:</b> <b>%{y}</b></span><br>"
+                    "<span style='font-size:18px'><b>Total Disconnected Strings:</b> <b>%{x}</b></span>"
                     "<extra></extra>"
                 ),
             ),
             row=1,
             col=2,
         )
+
+    # -----------------------------
+    # RIGHT: LINE (Avg DA% per inverter) — NEW (visualization only)
+    # Source MUST be the final pipeline output (eligible SCBs only) aggregated in render_scb_ot.
+    # -----------------------------
+    if avg_da_by_inverter:
+        da_x: list[float] = []
+        da_y: list[str] = []
+        da_n: list[int] = []
+        for inv in inverter_order:
+            v = avg_da_by_inverter.get(str(inv))
+            if v is None or pd.isna(v):
+                continue
+            da_y.append(str(inv))
+            da_x.append(float(v))
+            if valid_scb_count_by_inverter:
+                da_n.append(int(valid_scb_count_by_inverter.get(str(inv), 0)))
+            else:
+                da_n.append(0)
+
+        if da_x and da_y:
+            # IMPORTANT:
+            # Do NOT pass row/col here. make_subplots() will override xaxis/yaxis to x2/y2,
+            # which would clip DA% values (0–100) against the DS bar x-axis range (typically 0–20).
+            da_text = [f"{float(v):.0f}%" for v in da_x]
+            fig.add_trace(
+                go.Scatter(
+                    x=da_x,
+                    y=da_y,
+                    mode="lines+markers+text",
+                    name="Avg DA%",
+                    xaxis="x3",
+                    yaxis="y2",
+                    line=dict(color="#0ea5a4", width=2),
+                    marker=dict(size=8, color="#0ea5a4"),
+                    text=da_text,
+                    textposition="top center",
+                    textfont=dict(size=11, color="rgba(2,6,23,0.70)"),
+                    customdata=da_n,
+                    hovertemplate=(
+                        "<span style='font-size:18px'><b>Inverter:</b> <b>%{y}</b></span><br>"
+                        "<span style='font-size:18px'><b>Average DA%:</b> <b>%{x:.2f}%</b></span><br>"
+                        "<span style='font-size:18px'><b>Valid SCBs:</b> <b>%{customdata}</b></span>"
+                        "<extra></extra>"
+                    ),
+                )
+            )
 
     # Axes configuration
     fig.update_xaxes(
@@ -217,8 +269,23 @@ def _build_inverter_scb_diagnostic_map(
     fig.update_xaxes(
         title=dict(text="<b>Total Disconnected Strings</b>", standoff=12, font=dict(size=16)),
         automargin=True,
+        range=[0, max_ds * 1.25] if max_ds > 0 else None,
         row=1,
         col=2,
+    )
+
+    # Right line chart: Top X-axis (secondary)
+    # IMPORTANT: Uses a secondary axis overlaying the right panel's x-axis.
+    fig.update_layout(
+        xaxis3=dict(
+            title=dict(text="<b>Avg DA% (0–100)</b>", standoff=12, font=dict(size=16)),
+            range=[0, 100],
+            overlaying="x2",
+            side="top",
+            ticksuffix="%",
+            showgrid=False,
+            anchor="y2",
+        )
     )
 
     # Top X-axis labels removed per user request
@@ -229,6 +296,7 @@ def _build_inverter_scb_diagnostic_map(
         template="plotly_white",
         height=calculated_height,
         margin=dict(l=80, r=50, t=110, b=bottom_margin),
+        hoverlabel=dict(font_size=18),
     )
 
     return fig
@@ -596,6 +664,38 @@ def _fetch_raw_scb_data_in_time_window(
 
 
 @st.cache_data(show_spinner=False)
+def fetch_scb_operational_data(
+    *,
+    db_path: str,
+    table: str,
+    from_date: date,
+    to_date: date,
+    scb_cols: tuple[str, ...],
+    start_time: str,
+    end_time: str,
+) -> pd.DataFrame:
+    """
+    PERFORMANCE ONLY (no logic change):
+    Cached raw SCB fetch for a given site table + date range + time window.
+
+    Cache key includes:
+    - table (site)
+    - from_date / to_date
+    - time window (start_time / end_time)
+    - scb_cols (schema-dependent)
+    """
+    return _fetch_raw_scb_data_in_time_window(
+        db_path=db_path,
+        table=table,
+        from_date=from_date,
+        to_date=to_date,
+        scb_cols=list(scb_cols),
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+@st.cache_data(show_spinner=False)
 def _infer_sampling_interval_seconds_from_table(
     db_path: str, table: str, from_date: date, to_date: date
 ) -> Optional[int]:
@@ -861,6 +961,10 @@ def build_scb_insight_summary(remarks_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["Explanation", "Count", "Details"])
 
     def classify(msg: str) -> str:
+        # NOTE: This is UI-only grouping derived from remarks.
+        # It must remain threshold-independent and must not affect computation.
+        if "night time bad value" in msg:
+            return "Night Time Bad Value"
         if "very low energy contribution" in msg:
             return "SCB eliminated: very low energy contribution"
         if "value constant throughout" in msg:
@@ -886,6 +990,251 @@ def build_scb_insight_summary(remarks_df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def _detect_night_time_bad_scbs(
+    *,
+    db_path: str,
+    table: str,
+    from_date: date,
+    to_date: date,
+    scb_cols: list[str],
+) -> set[str]:
+    """
+    Detect SCBs with abnormal night-time values in a raw time window.
+
+    IMPORTANT (by design):
+    - This runs independently of the main 06:00–18:00 analysis fetch.
+    - We do NOT change any existing 06:00–18:00 SQL filters.
+    - Instead, we query the site table directly with ONLY the 02:00–04:00 filter,
+      so elimination decisions are not influenced by operational-window filtering.
+
+    Rule (STRICT):
+    - Window: 02:00 ≤ timestamp ≤ 04:00 (SQL enforced)
+    - Metric: SUM(ABS(scb_value)) per SCB label
+    - Eliminate if sum > 30
+
+    Returns:
+      set[str] of scb_label values to eliminate.
+    """
+    if not scb_cols:
+        return set()
+
+    # Fetch raw SCB values in the night-time window (SQL time filter only).
+    night_df = _fetch_raw_scb_data_in_time_window(
+        db_path=db_path,
+        table=table,
+        from_date=from_date,
+        to_date=to_date,
+        scb_cols=scb_cols,
+        start_time="02:00",
+        end_time="04:00",
+    )
+    if night_df is None or night_df.empty:
+        return set()
+
+    base_cols = ["inv_stn_name", "inv_name"]
+    night_w = night_df.copy()
+    for c in base_cols:
+        night_w[c] = night_w[c].astype(str)
+
+    night_long = night_w.melt(
+        id_vars=base_cols,
+        value_vars=scb_cols,
+        var_name="scb_name",
+        value_name="scb_value",
+    )
+    night_long["scb_name"] = night_long["scb_name"].astype(str)
+    night_long["scb_value"] = pd.to_numeric(night_long["scb_value"], errors="coerce")
+
+    def _force_triplet_label(inv_stn: object, inv: object, scb: object) -> str:
+        def _digits(x: object) -> Optional[str]:
+            m = re.search(r"(\d+)", str(x).strip(), flags=re.IGNORECASE)
+            return m.group(1) if m else None
+
+        is_n = _digits(inv_stn)
+        inv_n = _digits(inv)
+        scb_n = _digits(scb)
+        is_part = f"IS{is_n}" if is_n is not None else str(inv_stn).strip()
+        inv_part = f"INV{inv_n}" if inv_n is not None else str(inv).strip()
+        scb_part = f"SCB{scb_n}" if scb_n is not None else str(scb).strip()
+        return f"{is_part}-{inv_part}-{scb_part}"
+
+    night_long["scb_label"] = night_long.apply(
+        lambda r: _force_triplet_label(r["inv_stn_name"], r["inv_name"], r["scb_name"]),
+        axis=1,
+    )
+
+    gcols = ["inv_stn_name", "inv_name", "scb_name", "scb_label"]
+    night_sums = (
+        night_long.groupby(gcols, dropna=False)["scb_value"]
+        .apply(lambda s: float(pd.to_numeric(s, errors="coerce").dropna().abs().sum()))
+        .reset_index(name="night_abs_sum")
+    )
+
+    bad = pd.to_numeric(night_sums["night_abs_sum"], errors="coerce") > 30.0
+    return set(night_sums.loc[bad, "scb_label"].astype(str).tolist())
+
+
+@st.cache_data(show_spinner=False)
+def _kpi_total_scb_count(*, db_path: str, site_name: str) -> int:
+    """
+    KPI-ONLY query (threshold-independent).
+
+    KPI 1 — Total SCB
+    Source: array_details
+    Logic (threshold-independent):
+    COUNT of SCB instances in the site based on array_details mapping.
+
+    NOTE:
+    Elimination rules operate on SCB instances (inv_stn_name, inv_name, scb_name) and produce scb_label.
+    To keep KPI 7 (Communicating SCB) consistent and non-negative, KPI 1 must count the same granularity.
+    """
+    con = _connect(db_path)
+    try:
+        info = con.execute("pragma table_info('array_details')").fetchdf()
+        cols = [str(x) for x in info.get("name", pd.Series(dtype=str)).tolist()]
+        required = {"site_name", "inv_stn_name", "inv_name", "scb_name"}
+        if not required.issubset(set(cols)):
+            return 0
+
+        row = con.execute(
+            """
+            select count(distinct (
+                lower(trim(cast(inv_stn_name as varchar))) || '|' ||
+                lower(trim(cast(inv_name as varchar))) || '|' ||
+                lower(trim(cast(scb_name as varchar)))
+            )) as n
+            from array_details
+            where lower(trim(site_name)) = lower(trim(?))
+              and scb_name is not null
+              and trim(cast(scb_name as varchar)) != ''
+            """,
+            [site_name],
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        con.close()
+
+
+@st.cache_data(show_spinner=False)
+def _kpi_total_scb_label_set(*, db_path: str, site_name: str) -> set[str]:
+    """
+    KPI-only base population (MANDATORY per requirements):
+
+    TOTAL_SCB_SET = distinct (inv_stn_name, inv_name, scb_name) from array_details for the selected site.
+
+    We return these as deterministic scb_label strings (ISx-INVy-SCBz) so we can perform set arithmetic
+    against remarks_df scb_label values without touching deviation/plot outputs.
+    """
+    con = _connect(db_path)
+    try:
+        info = con.execute("pragma table_info('array_details')").fetchdf()
+        cols = [str(x) for x in info.get("name", pd.Series(dtype=str)).tolist()]
+        required = {"site_name", "inv_stn_name", "inv_name", "scb_name"}
+        if not required.issubset(set(cols)):
+            return set()
+
+        df = con.execute(
+            """
+            select distinct
+              trim(cast(inv_stn_name as varchar)) as inv_stn_name,
+              trim(cast(inv_name as varchar)) as inv_name,
+              trim(cast(scb_name as varchar)) as scb_name
+            from array_details
+            where lower(trim(site_name)) = lower(trim(?))
+              and scb_name is not null
+              and trim(cast(scb_name as varchar)) != ''
+            """,
+            [site_name],
+        ).fetchdf()
+    finally:
+        con.close()
+
+    if df is None or df.empty:
+        return set()
+
+    def _force_triplet_label(inv_stn: object, inv: object, scb: object) -> str:
+        def _digits(x: object) -> Optional[str]:
+            m = re.search(r"(\d+)", str(x).strip(), flags=re.IGNORECASE)
+            return m.group(1) if m else None
+
+        is_n = _digits(inv_stn)
+        inv_n = _digits(inv)
+        scb_n = _digits(scb)
+        is_part = f"IS{is_n}" if is_n is not None else str(inv_stn).strip()
+        inv_part = f"INV{inv_n}" if inv_n is not None else str(inv).strip()
+        scb_part = f"SCB{scb_n}" if scb_n is not None else str(scb).strip()
+        return f"{is_part}-{inv_part}-{scb_part}"
+
+    labels = set()
+    for r in df.itertuples(index=False):
+        labels.add(_force_triplet_label(getattr(r, "inv_stn_name"), getattr(r, "inv_name"), getattr(r, "scb_name")))
+    return labels
+
+
+def _render_kpi_cards(kpis: dict[str, object]) -> None:
+    """
+    Presentational-only KPI cards (must not affect computation or plots).
+    """
+    st.markdown(
+        """
+<style>
+  .scbot-kpi-wrap { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 900px) { .scbot-kpi-wrap { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .scbot-kpi-card {
+    border: 1px solid rgba(148,163,184,0.35);
+    border-radius: 14px;
+    padding: 12px 14px;
+    background: linear-gradient(180deg, rgba(15,23,42,0.04), rgba(15,23,42,0.00));
+    box-shadow: 0 6px 18px rgba(2,6,23,0.06);
+  }
+  .scbot-kpi-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .scbot-kpi-title { font-size: 12px; font-weight: 600; color: rgba(30,41,59,0.85); }
+  .scbot-kpi-value { font-size: 22px; font-weight: 800; color: rgba(2,6,23,0.92); letter-spacing: 0.2px; }
+  .scbot-kpi-sub { margin-top: 4px; font-size: 11px; color: rgba(51,65,85,0.75); }
+  .scbot-kpi-ic { width: 30px; height: 30px; border-radius: 10px; display:flex; align-items:center; justify-content:center;
+                  background: rgba(59,130,246,0.10); border: 1px solid rgba(59,130,246,0.18); font-size: 16px; }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def _n(key: str) -> str:
+        v = kpis.get(key)
+        try:
+            return f"{int(v)}"
+        except Exception:
+            return "—"
+
+    cards = [
+        ("Total SCB", "🧱", _n("total_scb"), "From array_details (distinct inv_stn + inv + scb)"),
+        ("Communicating SCB", "📡", _n("communicating_scb"), "Total − all eliminated SCBs"),
+        ("Disconnected Strings", "🔌", _n("disconnected_strings"), "From insights classification"),
+        ("Night Time Bad Value", "🌙", _n("night_time_bad_value"), "Eliminated via 02:00–04:00 sum(|v|) > 30"),
+        ("Constant Value", "🧊", _n("constant_value"), "Eliminated (nunique == 1)"),
+        ("Low Energy", "⚡", _n("low_energy"), "KPI-only: excludes NULL-only SCBs"),
+        ("Bad Availability", "🕳️", _n("bad_availability"), "Eliminated (blank_ratio > 65%)"),
+    ]
+
+    html = ['<div class="scbot-kpi-wrap">']
+    for title, ic, value, sub in cards:
+        # IMPORTANT: Do not indent HTML here.
+        # In Markdown, leading spaces make Streamlit treat this as a code block and show raw tags.
+        html.append(
+            f"<div class='scbot-kpi-card'>"
+            f"<div class='scbot-kpi-row'>"
+            f"<div>"
+            f"<div class='scbot-kpi-title'>{title}</div>"
+            f"<div class='scbot-kpi-value'>{value}</div>"
+            f"</div>"
+            f"<div class='scbot-kpi-ic'>{ic}</div>"
+            f"</div>"
+            f"<div class='scbot-kpi-sub'>{sub}</div>"
+            f"</div>"
+        )
+    html.append("</div>")  # .scbot-kpi-wrap
+    st.markdown("\n".join(html), unsafe_allow_html=True)
+
+
 def _compute_scb_ot_peak_pipeline(
     *,
     df_raw: pd.DataFrame,
@@ -895,6 +1244,7 @@ def _compute_scb_ot_peak_pipeline(
     to_date: date,
     scb_cols: list[str],
     db_path: str,
+    progress_hook: Optional[Callable[[int, str], None]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
     """
     Implements the UPDATED computation pipeline (strict, in order):
@@ -911,6 +1261,15 @@ def _compute_scb_ot_peak_pipeline(
     """
     remarks: list[dict[str, object]] = []
 
+    # UI-only hook (must not affect computation). If provided, it allows the caller to
+    # animate a smooth, phase-based progress bar without changing outputs.
+    def _ph(pct: int, msg: str) -> None:
+        if progress_hook is not None:
+            try:
+                progress_hook(int(pct), str(msg))
+            except Exception:
+                pass
+
     base_cols = ["inv_stn_name", "inv_name"]
     if df_raw is None or df_raw.empty or not scb_cols:
         return (
@@ -918,6 +1277,28 @@ def _compute_scb_ot_peak_pipeline(
             pd.DataFrame(columns=["severity", "scb_label", "message"]),
             "no_data",
         )
+
+    # STEP 1 — NIGHT-TIME ELIMINATION (NEW, STRICT, ALL SITES)
+    # This MUST run before any stats/median/peak/normalization/deviation/disconnected-strings logic.
+    # NOTE: The main df_raw fetch is still 06:00–18:00 (unchanged). This step uses its own SQL query
+    # (02:00–04:00) so it is not affected by operational-window filtering.
+    night_bad_labels = _detect_night_time_bad_scbs(
+        db_path=db_path,
+        table=table,
+        from_date=from_date,
+        to_date=to_date,
+        scb_cols=list(scb_cols),
+    )
+    if night_bad_labels:
+        for lbl in sorted(night_bad_labels):
+            remarks.append(
+                {
+                    "severity": "eliminated",
+                    "scb_label": lbl,
+                    "message": "SCB eliminated: night time bad value",
+                }
+            )
+    _ph(20, "Applying elimination rules…")
 
     # STEP 2 — LONG FORMAT CONVERSION (unchanged)
     wide = df_raw.copy()
@@ -948,6 +1329,10 @@ def _compute_scb_ot_peak_pipeline(
         return f"{is_part}-{inv_part}-{scb_part}"
 
     long_df["scb_label"] = long_df.apply(lambda r: _force_triplet_label(r["inv_stn_name"], r["inv_name"], r["scb_name"]), axis=1)
+
+    # Remove night-eliminated SCBs BEFORE any downstream computations (stats, elimination rules, peaks, etc).
+    if night_bad_labels:
+        long_df = long_df[~long_df["scb_label"].isin(list(night_bad_labels))].copy()
 
     # Group stats per SCB
     gcols = ["inv_stn_name", "inv_name", "scb_name", "scb_label"]
@@ -994,17 +1379,21 @@ def _compute_scb_ot_peak_pipeline(
     # eliminate if blank_ratio > 0.65
     eligible_for_33 = stats.loc[~(const_mask | low_energy_mask), gcols].copy()
     bad_avail_labels: set[str] = set()
+    # PERFORMANCE: reuse 06:00–18:00 operational data + its long-form melt for both RULE 3.3 and DA%.
+    op_df_0618: Optional[pd.DataFrame] = None
+    op_long_0618: Optional[pd.DataFrame] = None
     if not eligible_for_33.empty:
         # Pull operational-window data via SQL (keeps time filtering at SQL level).
-        op_df = _fetch_raw_scb_data_in_time_window(
+        op_df = fetch_scb_operational_data(
             db_path=db_path,
             table=table,
             from_date=from_date,
             to_date=to_date,
-            scb_cols=scb_cols,
+            scb_cols=tuple(scb_cols),
             start_time="06:00",
             end_time="18:00",
         )
+        op_df_0618 = op_df
         # If no operational-window rows exist, we cannot compute availability reliably.
         # In that case we do not eliminate by 3.3 (avoid false positives).
         if op_df is not None and not op_df.empty:
@@ -1021,11 +1410,13 @@ def _compute_scb_ot_peak_pipeline(
 
                 if total_expected_slots > 0:
                     # Long form in 06:00–18:00; count non-blank per SCB.
+                    # PERFORMANCE: melt once and reuse later for DA%.
                     op_w = op_df.copy()
-                    for c in ["inv_stn_name", "inv_name"]:
-                        op_w[c] = op_w[c].astype(str)
+                    for c in ["date", "timestamp", "inv_stn_name", "inv_name"]:
+                        if c in op_w.columns:
+                            op_w[c] = op_w[c].astype(str)
                     op_long = op_w.melt(
-                        id_vars=["inv_stn_name", "inv_name"],
+                        id_vars=["date", "timestamp", "inv_stn_name", "inv_name"],
                         value_vars=scb_cols,
                         var_name="scb_name",
                         value_name="scb_value",
@@ -1033,6 +1424,7 @@ def _compute_scb_ot_peak_pipeline(
                     op_long["scb_name"] = op_long["scb_name"].astype(str)
                     op_long["scb_value"] = pd.to_numeric(op_long["scb_value"], errors="coerce")
                     op_long["scb_label"] = op_long.apply(lambda r: _force_triplet_label(r["inv_stn_name"], r["inv_name"], r["scb_name"]), axis=1)
+                    op_long_0618 = op_long
 
                     nonblank = (
                         op_long.groupby(["inv_stn_name", "inv_name", "scb_name", "scb_label"], dropna=False)["scb_value"]
@@ -1067,6 +1459,8 @@ def _compute_scb_ot_peak_pipeline(
             "all_eliminated",
         )
 
+    _ph(35, "Eliminations complete. Computing peaks & deviations…")
+
     # Join median back onto long_df for outlier nullification / peak selection
     long_ok = long_df.merge(
         eligible[gcols + ["scb_median"]],
@@ -1084,7 +1478,15 @@ def _compute_scb_ot_peak_pipeline(
 
     # STEP 5 — PEAK SELECTION LOGIC (CORE CHANGE)
     peaks_rows: list[dict[str, object]] = []
+    n_peak = int(getattr(eligible, "shape", [0])[0]) if eligible is not None else 0
+    step = max(1, n_peak // 30) if n_peak > 0 else 999999
+    i_peak = 0
     for rr in eligible.itertuples(index=False):
+        i_peak += 1
+        # Keep progress moving during heavy peak selection (GSPL can be slow here).
+        if (i_peak % step) == 0:
+            pct = 35 + int((float(i_peak) / float(max(n_peak, 1))) * 25)  # 35 → 60
+            _ph(pct, "Selecting SCB peaks…")
         inv_stn = getattr(rr, "inv_stn_name")
         inv = getattr(rr, "inv_name")
         scb = getattr(rr, "scb_name")
@@ -1126,6 +1528,7 @@ def _compute_scb_ot_peak_pipeline(
         )
 
     # STEP 6 — STRING-BASED NORMALIZATION (UPDATED)
+    _ph(62, "Normalizing & computing median benchmark…")
     # Join string_num from array_details
     string_df = get_array_string_nums(db_path, site_name)
     if string_df.empty:
@@ -1241,6 +1644,7 @@ def _compute_scb_ot_peak_pipeline(
     # - Non-GSPL keeps the historical scalar median behavior.
     # - GSPL must use the SAME unit-wise median_value already attached per row (no new median computation).
     is_gspl = str(site_name).strip().upper() == "GSPL"
+    _ph(65, "Computing deviations & fault signals…")
     if is_gspl:
         mv_series = pd.to_numeric(joined["median_value"], errors="coerce")
         disconnected_check = ((mv_series * pd.to_numeric(joined["string_num"], errors="coerce")) - pd.to_numeric(joined["scb_peak"], errors="coerce")) / mv_series
@@ -1263,7 +1667,74 @@ def _compute_scb_ot_peak_pipeline(
         if ds > 0:
             remarks.append({"severity": "insight", "scb_label": lbl, "message": f"Possible disconnected strings detected: {ds} (sum = {int(ds)})"})
 
-    out = joined[[*base_cols, "scb_name", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings", "scb_label"]].copy()
+    # STEP 10 — DATA AVAILABILITY % (DA%) (NEW, OBSERVATIONAL)
+    # IMPORTANT:
+    # - DA% is computed ONLY for eligible SCBs (those in the final output).
+    # - Uses SQL-level 06:00–18:00 filtering as required.
+    # - Must not change elimination/deviation logic (purely an added column).
+    _ph(75, "Calculating Data Availability (DA%)…")
+    da_map: dict[str, str] = {}
+    try:
+        # PERFORMANCE: reuse 06:00–18:00 df + melt if already available from RULE 3.3.
+        op_df = op_df_0618
+        if op_df is None:
+            op_df = fetch_scb_operational_data(
+                db_path=db_path,
+                table=table,
+                from_date=from_date,
+                to_date=to_date,
+                scb_cols=tuple(scb_cols),
+                start_time="06:00",
+                end_time="18:00",
+            )
+        total_ts = 0
+        if op_df is not None and not op_df.empty and "date" in op_df.columns and "timestamp" in op_df.columns:
+            total_ts = (
+                op_df[["date", "timestamp"]]
+                .astype(str)
+                .dropna()
+                .drop_duplicates()
+                .shape[0]
+            )
+
+        eligible_labels = set(joined["scb_label"].astype(str).tolist())
+        if total_ts > 0 and eligible_labels:
+            op_long = op_long_0618
+            if op_long is None:
+                op_w = op_df.copy()
+                for c in ["date", "timestamp", "inv_stn_name", "inv_name"]:
+                    if c in op_w.columns:
+                        op_w[c] = op_w[c].astype(str)
+                op_long = op_w.melt(
+                    id_vars=["date", "timestamp", "inv_stn_name", "inv_name"],
+                    value_vars=list(scb_cols),
+                    var_name="scb_name",
+                    value_name="scb_value",
+                )
+                op_long["scb_name"] = op_long["scb_name"].astype(str)
+                op_long["scb_value"] = pd.to_numeric(op_long["scb_value"], errors="coerce")
+                op_long["scb_label"] = op_long.apply(lambda r: _force_triplet_label(r["inv_stn_name"], r["inv_name"], r["scb_name"]), axis=1)
+
+            # available = scb_value > 0 (strict)
+            ok = op_long[(op_long["scb_label"].isin(eligible_labels)) & (pd.to_numeric(op_long["scb_value"], errors="coerce") > 0)].copy()
+            ok["_dt"] = ok["date"].astype(str) + "|" + ok["timestamp"].astype(str)
+            avail = ok.groupby("scb_label", dropna=False)["_dt"].nunique()
+
+            for lbl in eligible_labels:
+                a = int(avail.get(lbl, 0))
+                da = (float(a) / float(total_ts)) * 100.0 if total_ts > 0 else 0.0
+                da_map[str(lbl)] = f"{da:.2f}%"
+        else:
+            for lbl in eligible_labels:
+                da_map[str(lbl)] = "0.00%"
+    except Exception:
+        # Fail-safe: never crash computation if DA% cannot be computed.
+        da_map = {}
+
+    joined["DA%"] = joined["scb_label"].astype(str).map(da_map).fillna("0.00%")
+    _ph(85, "Insights ready. Rendering results…")
+
+    out = joined[[*base_cols, "scb_name", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings", "scb_label", "DA%"]].copy()
     remarks_df = pd.DataFrame(remarks, columns=["severity", "scb_label", "message"])
     return out, remarks_df, None
 
@@ -1310,6 +1781,25 @@ def render_scb_ot(db_path: str) -> None:
                     mapped.append(hit)
         st.session_state["scb_ot_site_multiselect"] = mapped
 
+    def _reset_scb_ot_visual_state() -> None:
+        """
+        UI-only hard reset to prevent 'ghost' plots when switching sites.
+        Does NOT touch computation logic; it only clears cached render outputs.
+        """
+        for k in [
+            "scb_ot_last_fig",
+            "scb_ot_last_table",
+            "scb_ot_last_comments",
+            "scb_ot_last_insights",
+            "scb_ot_last_kpis",
+            "scb_ot_last_meta",
+        ]:
+            try:
+                st.session_state.pop(k, None)
+            except Exception:
+                pass
+        st.session_state["scb_ot_plot_requested"] = False
+
     # UI REQUIREMENTS (STRICT):
     # - Site Name multiselect (MUST default empty)
     # - Threshold % (numeric, optional)
@@ -1331,7 +1821,13 @@ def render_scb_ot(db_path: str) -> None:
             )
         else:
             # Admin behavior remains unchanged (empty by default).
-            selected_sites = st.multiselect("Site Name", options=sites, default=[], key="scb_ot_site_multiselect")
+            selected_sites = st.multiselect(
+                "Site Name",
+                options=sites,
+                default=[],
+                key="scb_ot_site_multiselect",
+                on_change=_reset_scb_ot_visual_state,
+            )
 
     # Defensive guard (safety net)
     if is_restricted_user(username):
@@ -1476,6 +1972,17 @@ def render_scb_ot(db_path: str) -> None:
         if fig_last is None:
             return False
 
+        # Hard-reset behavior: if the currently selected site differs from the cached result's site,
+        # do not show any old plots/tables (prevents ghost/overlap UI). User must click Plot Now again.
+        try:
+            cached_site = str(meta_last.get("site_name") or "").strip()
+            current_site = str(selected_sites[0]).strip() if isinstance(selected_sites, list) and len(selected_sites) == 1 else ""
+            if cached_site and current_site and cached_site.lower() != current_site.lower():
+                _reset_scb_ot_visual_state()
+                return False
+        except Exception:
+            pass
+
         site_lbl = meta_last.get("site_name") or ""
         d1_lbl = meta_last.get("from_date") or ""
         d2_lbl = meta_last.get("to_date") or ""
@@ -1485,6 +1992,11 @@ def render_scb_ot(db_path: str) -> None:
             st.caption(f"Showing last computed results: **{site_lbl}** ({d1_lbl} → {d2_lbl}{thr_txt}). Change filters and click **Plot Now** to refresh.")
         else:
             st.caption("Showing last computed results. Change filters and click **Plot Now** to refresh.")
+
+        # KPI cards: presentational only, threshold-independent.
+        if isinstance(kpis_last, dict) and kpis_last:
+            st.markdown("### 📌 KPIs")
+            _render_kpi_cards(kpis_last)
 
         if isinstance(insight_last, pd.DataFrame) and not insight_last.empty:
             st.markdown("### 🧠 SCB Health Insights")
@@ -1550,39 +2062,59 @@ def render_scb_ot(db_path: str) -> None:
 
     import time
 
-    # % incremental progress bar (1 → 100)
+    # Smooth, progressive progress bar (phase-based, no jumps).
+    # IMPORTANT: UI-only. Must not affect computation.
     prog_slot = st.empty()
-    prog = prog_slot.progress(0, text="🩺 Initializing SCB Operation Theatre… (0%)")
-    time.sleep(0.05)
+    status_text = st.empty()
+    progress_bar = prog_slot.progress(0)
 
-    def _p(pct: int, msg: str) -> None:
-        prog.progress(int(pct), text=f"{msg} ({int(pct)}%)")
+    current_pct = 0
 
-    # Smooth perceived progress up front
-    for p in range(1, 8):
-        _p(p, "Warming up…")
-        time.sleep(0.01)
+    def _delay(p: int) -> float:
+        # 0–35 a bit slower, 35–80 faster, 80–90 slight ease, 90–100 slower (intentional finish).
+        if p >= 90:
+            return 0.11
+        if p >= 80:
+            return 0.07
+        if p >= 35:
+            return 0.05
+        return 0.08
 
-    _p(12, "📥 Loading inverter & SCB telemetry…")
-    df_raw = _fetch_raw_scb_data(
+    def _animate_to(target: int, msg: str) -> None:
+        nonlocal current_pct
+        target = int(max(min(target, 100), 0))
+        if target < current_pct:
+            # Never move backwards.
+            return
+        status_text.caption(msg)
+        for i in range(current_pct + 1, target + 1):
+            progress_bar.progress(i, text=f"{msg} — {i}%")
+            time.sleep(_delay(i))
+        current_pct = target
+
+    # Phase 1 — Data fetch (0 → 15)
+    _animate_to(5, "Preparing SCB OT…")
+    _animate_to(10, "Fetching SCB data (06:00–18:00)…")
+    # PERFORMANCE: cached raw operational fetch (same SQL semantics; faster on reruns).
+    df_raw = fetch_scb_operational_data(
         db_path=db_path,
         table=table,
         from_date=from_date,
         to_date=to_date,
-        scb_cols=scb_cols,
+        scb_cols=tuple(scb_cols),
+        start_time=TIME_START,
+        end_time=TIME_END,
     )
-    time.sleep(0.05)
-
     if df_raw.empty:
-        _p(100, "No data")
+        _animate_to(100, "No data found for the selected window.")
         st.info("No data found for the selected filters/time window.")
         prog_slot.empty()
+        status_text.empty()
         return
 
-    _p(32, "🧹 Cleaning raw SCB signals & removing noise…")
-    time.sleep(0.05)
+    _animate_to(15, "Data fetched. Applying elimination rules…")
 
-    _p(52, "⚙️ Applying SCB elimination & validation rules…")
+    # Phase 2–4 are driven from inside the pipeline via progress_hook checkpoints.
     dev, remarks_df, abort_reason = _compute_scb_ot_peak_pipeline(
         df_raw=df_raw,
         site_name=site_name,
@@ -1591,44 +2123,142 @@ def render_scb_ot(db_path: str) -> None:
         to_date=to_date,
         scb_cols=list(scb_cols),
         db_path=db_path,
+        progress_hook=_animate_to,
     )
-    time.sleep(0.05)
     if abort_reason == "median_zero":
-        _p(100, "Aborted")
+        _animate_to(100, "Aborted: median(normalized_value) is zero.")
         st.warning("Abort: median(normalized_value) is zero. Cannot compute deviations.")
         # Still show remarks if present (mandatory).
         if remarks_df is not None and not remarks_df.empty:
             st.markdown("### Remarks")
             st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
         prog_slot.empty()
+        status_text.empty()
         return
     if dev is None or dev.empty:
-        _p(100, "No results")
+        _animate_to(100, "No results (all SCBs eliminated/skipped).")
         st.warning("Unable to compute deviations (no SCBs remained after elimination/skip rules).")
         if remarks_df is not None and not remarks_df.empty:
             st.markdown("### Remarks")
             st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
         prog_slot.empty()
+        status_text.empty()
         return
 
-    _p(72, "📊 Computing deviation benchmarks & fault signals…")
-    time.sleep(0.05)
-
-    _p(90, "🎨 Preparing diagnostic visuals…")
+    # Phase 5 — Rendering (85 → 100)
+    _animate_to(90, "Rendering results…")
     # Strict hierarchical sorting (IS -> INV -> SCB) before plotting.
     dev = dev.copy()
     dev["sort_key"] = dev["scb_label"].apply(_parse_scb_label)
     dev = dev.sort_values(["sort_key"], ascending=True).reset_index(drop=True)
-    time.sleep(0.05)
-    _p(100, "✅ SCB OT results ready")
+    _animate_to(100, "SCB OT analysis completed.")
     prog_slot.empty()
+    status_text.empty()
 
     st.markdown("### Results")
     st.caption("Outliers are removed per SCB (cells nullified), peaks are selected per SCB, and normalization uses string_num (no DB writes).")
 
-    # KPIs above remarks table (SCB-count-based, not reason-count-based)
-    below_threshold_count = 0
-    with_comments_count = 0
+    # KPI computation layer (NEW, NON-INTRUSIVE)
+    # IMPORTANT:
+    # - KPIs are threshold-independent (threshold is only a plot filter).
+    # - KPIs must not affect deviation/plot logic; they read from array_details + remarks only.
+    def _compute_kpis_for_run() -> dict[str, int]:
+        total_scb = _kpi_total_scb_count(db_path=db_path, site_name=str(site_name))
+
+        if remarks_df is None or remarks_df.empty:
+            return {
+                "total_scb": int(total_scb),
+                "communicating_scb": int(total_scb),
+                "disconnected_strings": 0,
+                "night_time_bad_value": 0,
+                "constant_value": 0,
+                "low_energy": 0,
+                "bad_availability": 0,
+            }
+
+        tmp = remarks_df.copy()
+        tmp["severity"] = tmp.get("severity", "").astype(str).str.lower()
+        tmp["message"] = tmp.get("message", "").astype(str)
+        msg_l = tmp["message"].astype(str).str.lower()
+
+        eliminated_labels = set(tmp.loc[tmp["severity"] == "eliminated", "scb_label"].astype(str).tolist())
+
+        def _labels(sev: str, substr: str) -> set[str]:
+            m = (tmp["severity"] == sev.lower()) & msg_l.str.contains(substr.lower(), na=False)
+            return set(tmp.loc[m, "scb_label"].astype(str).tolist())
+
+        night_bad = _labels("eliminated", "night time bad value")
+        const_bad = _labels("eliminated", "value constant throughout")
+        low_energy = _labels("eliminated", "very low energy contribution")
+        bad_avail = _labels("eliminated", "data missing for more than 65%")
+        disconnected = _labels("insight", "possible disconnected strings detected")
+
+        # Communicating SCB (AUTHORITATIVE):
+        # TOTAL_SCB_SET comes ONLY from array_details (design level).
+        # ELIMINATED_SCB_SET is the UNION of the four elimination categories below (set semantics, no double-count).
+        total_set = _kpi_total_scb_label_set(db_path=db_path, site_name=str(site_name))
+        eliminated_set = set(night_bad) | set(const_bad) | set(low_energy) | set(bad_avail)
+        communicating_cnt = int(len(total_set - eliminated_set))
+
+        # KPI 5 correction (KPI-only): exclude NULL-only SCBs from low-energy count.
+        null_only_labels: set[str] = set()
+        try:
+            base_cols = ["inv_stn_name", "inv_name"]
+            _w = df_raw.copy()
+            for c in base_cols:
+                _w[c] = _w[c].astype(str)
+            _long = _w.melt(id_vars=base_cols, value_vars=list(scb_cols), var_name="scb_name", value_name="scb_value")
+            _long["scb_name"] = _long["scb_name"].astype(str)
+            _long["scb_value"] = pd.to_numeric(_long["scb_value"], errors="coerce")
+
+            def _force_triplet_label(inv_stn: object, inv: object, scb: object) -> str:
+                def _digits(x: object) -> Optional[str]:
+                    m = re.search(r"(\d+)", str(x).strip(), flags=re.IGNORECASE)
+                    return m.group(1) if m else None
+
+                is_n = _digits(inv_stn)
+                inv_n = _digits(inv)
+                scb_n = _digits(scb)
+                is_part = f"IS{is_n}" if is_n is not None else str(inv_stn).strip()
+                inv_part = f"INV{inv_n}" if inv_n is not None else str(inv).strip()
+                scb_part = f"SCB{scb_n}" if scb_n is not None else str(scb).strip()
+                return f"{is_part}-{inv_part}-{scb_part}"
+
+            _long["scb_label"] = _long.apply(lambda r: _force_triplet_label(r["inv_stn_name"], r["inv_name"], r["scb_name"]), axis=1)
+            nn = (
+                _long.groupby(["inv_stn_name", "inv_name", "scb_name", "scb_label"], dropna=False)["scb_value"]
+                .apply(lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum()))
+                .reset_index(name="n_nonnull")
+            )
+            null_only_labels = set(nn.loc[pd.to_numeric(nn["n_nonnull"], errors="coerce").fillna(0).astype(int) == 0, "scb_label"].astype(str).tolist())
+        except Exception:
+            null_only_labels = set()
+
+        low_energy_kpi = set(low_energy) - set(null_only_labels)
+
+        return {
+            "total_scb": int(total_scb),
+            # Computed via TOTAL_SCB_SET − ELIMINATED_SCB_SET (independent of deviation/threshold/plots).
+            "communicating_scb": communicating_cnt,
+            "disconnected_strings": int(len(disconnected)),
+            "night_time_bad_value": int(len(night_bad)),
+            "constant_value": int(len(const_bad)),
+            "low_energy": int(len(low_energy_kpi)),
+            "bad_availability": int(len(bad_avail)),
+        }
+
+    kpis = _compute_kpis_for_run()
+    st.markdown("### 📌 KPIs")
+    _render_kpi_cards(kpis)
+
+    # Persist KPIs early so they remain stable on threshold-only reruns (Plot Now not clicked).
+    try:
+        existing = st.session_state.get("scb_ot_last_kpis") or {}
+        merged = dict(existing)
+        merged.update(kpis)
+        st.session_state["scb_ot_last_kpis"] = merged
+    except Exception:
+        pass
 
     st.markdown("### 🧠 SCB Health Insights")
     insight_df = build_scb_insight_summary(remarks_df)
@@ -1700,7 +2330,7 @@ def render_scb_ot(db_path: str) -> None:
     if dev_plot.empty:
         st.info("No SCBs meet the threshold filter.")
         with st.expander("Show full table (unfiltered)", expanded=False):
-            show_cols = ["scb_label", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings"]
+            show_cols = ["scb_label", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings", "DA%"]
             present = [c for c in show_cols if c in dev.columns]
             display_df = dev[present].drop(columns=["scb_median"], errors="ignore").copy()
             if "scb_label" in display_df.columns:
@@ -1749,6 +2379,27 @@ def render_scb_ot(db_path: str) -> None:
                 pivot_dev = df.pivot(index="Block_Inv", columns="SCB_id", values="deviation_pct").reindex(inverter_order).reindex(columns=scb_order)
                 pivot_disc = df.pivot(index="Block_Inv", columns="SCB_id", values="disconnected_strings").reindex(inverter_order).reindex(columns=scb_order)
 
+                # Avg DA% per inverter (visualization only)
+                # IMPORTANT: Must use final pipeline output (eligible SCBs only) and must not depend on threshold filtering.
+                avg_da_by_inv: dict[str, float] = {}
+                valid_scb_n_by_inv: dict[str, int] = {}
+                try:
+                    base_out = dev.copy()
+                    base_out["Block_Inv"] = base_out["scb_label"].astype(str).str.rsplit("-", n=1).str[0]
+                    da_num = (
+                        base_out.get("DA%", pd.Series(dtype=str))
+                        .astype(str)
+                        .str.replace("%", "", regex=False)
+                    )
+                    base_out["_da_num"] = pd.to_numeric(da_num, errors="coerce")
+                    valid = base_out.dropna(subset=["Block_Inv", "_da_num"]).copy()
+                    if not valid.empty:
+                        avg_da_by_inv = valid.groupby("Block_Inv")["_da_num"].mean().to_dict()
+                        valid_scb_n_by_inv = valid.groupby("Block_Inv")["_da_num"].count().astype(int).to_dict()
+                except Exception:
+                    avg_da_by_inv = {}
+                    valid_scb_n_by_inv = {}
+
                 # Build responsive diagnostic map using the reusable helper
                 fig = _build_inverter_scb_diagnostic_map(
                     pivot_dev=pivot_dev,
@@ -1756,11 +2407,13 @@ def render_scb_ot(db_path: str) -> None:
                     inverter_order=inverter_order,
                     scb_order=scb_order,
                     title=title,
+                    avg_da_by_inverter=avg_da_by_inv,
+                    valid_scb_count_by_inverter=valid_scb_n_by_inv,
                 )
                 st.plotly_chart(fig, width="stretch")
 
     with st.expander("Show table"):
-        show_cols = ["scb_label", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings"]
+        show_cols = ["scb_label", "scb_median", "scb_peak", "string_num", "normalized_value", "median_value", "deviation_pct", "disconnected_strings", "DA%"]
         present = [c for c in show_cols if c in dev_plot.columns]
         display_df = dev_plot[present].drop(columns=["scb_median"], errors="ignore").copy()
         if "scb_label" in display_df.columns:
@@ -1833,10 +2486,16 @@ def render_scb_ot(db_path: str) -> None:
             st.metric("Total SCBs below threshold", f"{len(below_set)}")
         with k2:
             st.metric("Total SCBs with comments", f"{len(below_set.intersection(comment_set))}")
-        st.session_state["scb_ot_last_kpis"] = {
-            "below_threshold": len(below_set),
-            "with_comments": len(below_set.intersection(comment_set)),
-        }
+        # Merge into existing KPI dict (cards are independent from this bar).
+        existing = st.session_state.get("scb_ot_last_kpis") or {}
+        merged = dict(existing)
+        merged.update(
+            {
+                "below_threshold": len(below_set),
+                "with_comments": len(below_set.intersection(comment_set)),
+            }
+        )
+        st.session_state["scb_ot_last_kpis"] = merged
     except Exception:
         pass
 
