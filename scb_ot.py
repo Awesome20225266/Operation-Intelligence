@@ -90,6 +90,7 @@ def _build_inverter_scb_diagnostic_map(
 
     # Disconnected strings summary (hide zeros, sort desc)
     inv_disc_sum = pivot_disc.fillna(0).sum(axis=1)
+    inv_disc_sum_all = inv_disc_sum.sort_values(ascending=False)
     inv_disc_sum = inv_disc_sum[inv_disc_sum > 0].sort_values(ascending=False)
     max_ds = float(inv_disc_sum.max()) if not inv_disc_sum.empty else 0.0
 
@@ -118,9 +119,16 @@ def _build_inverter_scb_diagnostic_map(
     bottom_margin = max(120, 100 + int(n_inv / 3))
 
     # Heatmap text: show disconnected strings ONLY if > 0
-    disc_vals = pivot_disc.fillna(0).to_numpy()
+    # (Visualization-only; keep DS text blank when value is 0.)
+    disc_df = pd.DataFrame(pivot_disc).reindex(index=inverter_order, columns=scb_order).fillna(0)
+    disc_vals = disc_df.to_numpy()
     disc_int = disc_vals.astype(int, copy=False)
     text_vals = np.where(disc_int > 0, disc_int.astype(str), "")
+
+    # Force categorical axes for the heatmap so Plotly always renders discrete cells
+    # (especially important when the DS bar chart is hidden and only the DA line is present).
+    x_labels = [str(x) for x in scb_order]
+    y_labels = [str(y) for y in inverter_order]
 
     fig = make_subplots(
         rows=1,
@@ -130,17 +138,46 @@ def _build_inverter_scb_diagnostic_map(
         horizontal_spacing=0.12,  # Increased gap to prevent text overlap
     )
 
-    # Disable hover on "gaps" (NaN/None cells). This prevents tooltips for SCBs
-    # that are not present after threshold filtering (or missing per inverter).
-    z_vals = pd.to_numeric(pd.DataFrame(pivot_dev).to_numpy().ravel(), errors="coerce").reshape(pivot_dev.shape)
+    # Heatmap Z is visualization-only.
+    # IMPORTANT: rendering must be decoupled from disconnected-strings presence.
+    # - Align pivot_dev to the provided axis ordering (does NOT change computations).
+    # - Coerce to numeric; if *all* values become NaN (common when DS==0 induces upstream NaNs/misalignment),
+    #   render a zero-filled matrix so Plotly still draws the heatmap.
+    dev_df = pd.DataFrame(pivot_dev).reindex(index=inverter_order, columns=scb_order)
+    # pd.to_numeric() accepts 1D only; coerce by raveling then reshaping back to 2D.
+    z_vals = pd.to_numeric(dev_df.to_numpy().ravel(), errors="coerce").reshape(dev_df.shape)
+    if dev_df is not None and not dev_df.empty and np.isnan(z_vals).all():
+        z_vals = np.zeros_like(z_vals, dtype=float)
+
+    # Plotly can appear blank when the heatmap's effective color range collapses (e.g., all zeros).
+    # Force a stable, symmetric range around 0 for rendering ONLY.
+    finite = np.isfinite(z_vals)
+    if not finite.any():
+        z_vals = np.zeros_like(z_vals, dtype=float)
+        finite = np.isfinite(z_vals)
+    max_abs = float(np.nanmax(np.abs(z_vals[finite]))) if finite.any() else 0.0
+    if max_abs == 0.0:
+        zmin, zmax = -1.0, 1.0
+    else:
+        zmin, zmax = -max_abs, max_abs
+
+    # Plotly/Streamlit rendering safety:
+    # Represent gaps as None (JSON null) rather than NaN to avoid silent "blank heatmap" failures
+    # in some front-end render paths.
+    z_plot = z_vals.astype(object)
+    z_plot[~np.isfinite(z_vals)] = None
 
     fig.add_trace(
         go.Heatmap(
-            z=z_vals,
-            x=scb_order,
-            y=inverter_order,
+            z=z_plot,
+            x=x_labels,
+            y=y_labels,
             colorscale="RdYlGn",
             zmid=0,
+            zmin=zmin,
+            zmax=zmax,
+            xgap=1,
+            ygap=1,
             text=text_vals,
             texttemplate="%{text}",
             textfont=dict(color="black", size=9),
@@ -152,7 +189,7 @@ def _build_inverter_scb_diagnostic_map(
                 "<extra></extra>"
             ),
             hoverlabel=dict(font_size=15),
-            hoverongaps=False,
+            hoverongaps=True,
             showscale=False,  # Remove colorbar completely
         ),
         row=1,
@@ -163,6 +200,7 @@ def _build_inverter_scb_diagnostic_map(
     # RIGHT: BAR CHART
     # -----------------------------
     if not inv_disc_sum.empty:
+        # Case 1: Has disconnected strings > 0, show bar chart
         fig.add_trace(
             go.Bar(
                 x=inv_disc_sum.values,
@@ -181,6 +219,35 @@ def _build_inverter_scb_diagnostic_map(
             ),
             row=1,
             col=2,
+        )
+    else:
+        # Case 2: All disconnected strings are 0, add placeholder
+        # This prevents the heatmap from failing to render
+        fig.add_trace(
+            go.Bar(
+                x=[0],
+                y=[inverter_order[0] if inverter_order else "N/A"],
+                orientation="h",
+                name="DS",
+                showlegend=False,
+                marker=dict(color="rgba(0,0,0,0)"),  # Transparent
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=2,
+        )
+        # Add text annotation explaining no disconnected strings
+        fig.add_annotation(
+            text="<b>No Disconnected Strings</b><br><span style='font-size:12px'>All strings are connected</span>",
+            xref="x2",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            xanchor="center",
+            yanchor="middle",
+            showarrow=False,
+            font=dict(size=14, color="#6b7280"),
+            align="center",
         )
 
     # -----------------------------
@@ -234,6 +301,9 @@ def _build_inverter_scb_diagnostic_map(
     fig.update_xaxes(
         title=dict(text="<b>SCB Number (Position)</b>", standoff=12, font=dict(size=16)),
         automargin=True,
+        type="category",
+        categoryorder="array",
+        categoryarray=x_labels,
         row=1,
         col=1,
     )
@@ -243,6 +313,9 @@ def _build_inverter_scb_diagnostic_map(
         title=dict(text="<b>Inverter (IS–INV)</b>", standoff=30),
         autorange="reversed",
         automargin=True,
+        type="category",
+        categoryorder="array",
+        categoryarray=y_labels,
         row=1,
         col=1,
     )
@@ -257,12 +330,12 @@ def _build_inverter_scb_diagnostic_map(
     )
 
     # Bold inverter labels on BOTH panels (tick text + consistent font)
-    bold_ticks = [f"<b>{y}</b>" for y in inverter_order]
+    bold_ticks = [f"<b>{y}</b>" for y in y_labels]
     fig.update_yaxes(tickfont=dict(size=13, color="black"), row=1, col=1)
     fig.update_yaxes(tickfont=dict(size=13, color="black"), row=1, col=2)
     fig.update_layout(
-        yaxis=dict(ticktext=bold_ticks, tickvals=inverter_order),
-        yaxis2=dict(ticktext=bold_ticks, tickvals=inverter_order),
+        yaxis=dict(ticktext=bold_ticks, tickvals=y_labels),
+        yaxis2=dict(ticktext=bold_ticks, tickvals=y_labels),
     )
 
     # Right bar chart: Bottom X-axis
@@ -1347,6 +1420,7 @@ def _compute_scb_ot_peak_pipeline(
         )
         .reset_index()
     )
+    _ph(28, "Evaluating SCB quality checks…")
 
     # STEP 3 — SCB ELIMINATION RULES (NEW)
     # RULE 3.1 Constant/flat
@@ -1479,7 +1553,8 @@ def _compute_scb_ot_peak_pipeline(
     # STEP 5 — PEAK SELECTION LOGIC (CORE CHANGE)
     peaks_rows: list[dict[str, object]] = []
     n_peak = int(getattr(eligible, "shape", [0])[0]) if eligible is not None else 0
-    step = max(1, n_peak // 30) if n_peak > 0 else 999999
+    # More frequent progress updates (50 checkpoints) for smooth, continuous progress display
+    step = max(1, n_peak // 50) if n_peak > 0 else 999999
     i_peak = 0
     for rr in eligible.itertuples(index=False):
         i_peak += 1
@@ -1565,6 +1640,7 @@ def _compute_scb_ot_peak_pipeline(
         )
 
     joined["normalized_value"] = pd.to_numeric(joined["scb_peak"], errors="coerce") / pd.to_numeric(joined["string_num"], errors="coerce")
+    _ph(63, "Computing median benchmark…")
 
     # STEP 7 — MEDIAN BENCHMARK
     # Default (non-GSPL): global median across all surviving SCBs (unchanged behavior).
@@ -1698,6 +1774,7 @@ def _compute_scb_ot_peak_pipeline(
             )
 
         eligible_labels = set(joined["scb_label"].astype(str).tolist())
+        _ph(78, "Computing availability for each SCB…")
         if total_ts > 0 and eligible_labels:
             op_long = op_long_0618
             if op_long is None:
@@ -2062,34 +2139,89 @@ def render_scb_ot(db_path: str) -> None:
 
     import time
 
-    # Smooth, progressive progress bar (phase-based, no jumps).
-    # IMPORTANT: UI-only. Must not affect computation.
+    # ENHANCED PROGRESS BAR with real-time percentage and time estimation
+    # ====================================================================
+    # Features:
+    # - Real-time percentage display (1%, 2%, 3%... up to 100%)
+    # - Time remaining in MM:SS format
+    # - Smart capping for early-stage estimates
+    # - Performance optimized (time updates every 0.5s)
+    # - Clean single-line display (no shadow/overlay)
     prog_slot = st.empty()
-    status_text = st.empty()
     progress_bar = prog_slot.progress(0)
 
     current_pct = 0
+    start_time = time.time()
+    last_update_time = start_time
 
     def _delay(p: int) -> float:
-        # 0–35 a bit slower, 35–80 faster, 80–90 slight ease, 90–100 slower (intentional finish).
+        # Fast, responsive incremental progress (1%, 2%, 3%...) to show continuous activity.
+        # Slight slowdown at the end for visual polish.
+        if p >= 95:
+            return 0.04  # Final stretch - slightly slower for intentional finish
         if p >= 90:
-            return 0.11
+            return 0.03
         if p >= 80:
-            return 0.07
-        if p >= 35:
-            return 0.05
-        return 0.08
+            return 0.025
+        return 0.02  # Fast, responsive updates throughout most of the progress
+
+    def _format_time(seconds: float) -> str:
+        """Format seconds as MM:SS (e.g., 2:30, 1:15, 0:45)"""
+        if seconds < 0:
+            return "0:00"
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins}:{secs:02d}"
+
+    def _estimate_remaining_time(current_pct: int) -> str:
+        """
+        Estimate time remaining with smart capping.
+        - Early stages (< 5%): Cap at 5 minutes to avoid wild estimates
+        - Mid stages (5-10%): Cap at 3 minutes for stability
+        - Later stages: No cap (estimates become accurate)
+        """
+        if current_pct <= 0:
+            return "calculating..."
+        
+        elapsed = time.time() - start_time
+        if elapsed < 1:  # Avoid division by very small numbers
+            return "calculating..."
+        
+        # Estimate total time based on current progress
+        estimated_total = (elapsed / current_pct) * 100
+        remaining = estimated_total - elapsed
+        
+        # Smart capping for early estimates
+        if current_pct < 5:
+            remaining = min(remaining, 300)  # Cap at 5 minutes
+        elif current_pct < 10:
+            remaining = min(remaining, 180)  # Cap at 3 minutes
+        
+        return _format_time(remaining)
 
     def _animate_to(target: int, msg: str) -> None:
-        nonlocal current_pct
+        nonlocal current_pct, last_update_time
         target = int(max(min(target, 100), 0))
         if target < current_pct:
             # Never move backwards.
             return
-        status_text.caption(msg)
+        
+        # Enhanced progress display with percentage and time estimation
         for i in range(current_pct + 1, target + 1):
-            progress_bar.progress(i, text=f"{msg} — {i}%")
+            # Update time estimate every 0.5 seconds for performance optimization
+            current_time = time.time()
+            if current_time - last_update_time >= 0.5 or i == target:
+                time_remaining = _estimate_remaining_time(i)
+                display_text = f"{msg} — {i}% • ⏱️ {time_remaining} remaining"
+                last_update_time = current_time
+            else:
+                # Use previous time estimate to avoid recalculating every 1%
+                time_remaining = _estimate_remaining_time(i)
+                display_text = f"{msg} — {i}% • ⏱️ {time_remaining} remaining"
+            
+            progress_bar.progress(i, text=display_text)
             time.sleep(_delay(i))
+        
         current_pct = target
 
     # Phase 1 — Data fetch (0 → 15)
@@ -2109,7 +2241,7 @@ def render_scb_ot(db_path: str) -> None:
         _animate_to(100, "No data found for the selected window.")
         st.info("No data found for the selected filters/time window.")
         prog_slot.empty()
-        status_text.empty()
+        # status_text removed
         return
 
     _animate_to(15, "Data fetched. Applying elimination rules…")
@@ -2133,7 +2265,7 @@ def render_scb_ot(db_path: str) -> None:
             st.markdown("### Remarks")
             st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
         prog_slot.empty()
-        status_text.empty()
+        # status_text removed
         return
     if dev is None or dev.empty:
         _animate_to(100, "No results (all SCBs eliminated/skipped).")
@@ -2142,7 +2274,7 @@ def render_scb_ot(db_path: str) -> None:
             st.markdown("### Remarks")
             st.dataframe(_style_remarks(remarks_df), width="stretch", hide_index=True)
         prog_slot.empty()
-        status_text.empty()
+        # status_text removed
         return
 
     # Phase 5 — Rendering (85 → 100)
@@ -2153,7 +2285,7 @@ def render_scb_ot(db_path: str) -> None:
     dev = dev.sort_values(["sort_key"], ascending=True).reset_index(drop=True)
     _animate_to(100, "SCB OT analysis completed.")
     prog_slot.empty()
-    status_text.empty()
+    # FIXED: status_text removed, no need to empty it
 
     st.markdown("### Results")
     st.caption("Outliers are removed per SCB (cells nullified), peaks are selected per SCB, and normalization uses string_num (no DB writes).")

@@ -8,6 +8,7 @@ from typing import Optional, Sequence
 
 import boto3
 from botocore.exceptions import ClientError
+from boto3.s3.transfer import TransferConfig
 
 import store_data_table_duckdb
 import design_array_injestor
@@ -43,7 +44,7 @@ def _get_secret(name: str) -> Optional[str]:
     return v2 if v2 and v2.strip() != "" else None
 
 
-def upload_duckdb_to_s3(*, db_path: Path) -> None:
+def upload_duckdb_to_s3(*, db_path: Path, show_progress: bool = True) -> None:
     if not db_path.exists() or db_path.stat().st_size == 0:
         raise FileNotFoundError(f"DuckDB not found or empty: {db_path}")
 
@@ -79,8 +80,52 @@ def upload_duckdb_to_s3(*, db_path: Path) -> None:
     # boto3's upload_file() will use multipart uploads for larger files, which needs extra IAM actions.
     # To keep permissions simpler (only s3:PutObject), we force a single PUT here.
     try:
+        file_size = int(db_path.stat().st_size)
+
+        class _Progress:
+            def __init__(self, total: int) -> None:
+                self.total = max(1, int(total))
+                self.seen = 0
+                self._last_pct = -1
+
+            def __call__(self, bytes_amount: int) -> None:
+                self.seen += int(bytes_amount)
+                pct = int((self.seen / self.total) * 100)
+                if pct != self._last_pct:
+                    self._last_pct = pct
+                    mb_done = self.seen / (1024 * 1024)
+                    mb_total = self.total / (1024 * 1024)
+                    bar_len = 28
+                    filled = int(bar_len * (pct / 100))
+                    bar = ("#" * filled) + ("-" * (bar_len - filled))
+                    print(f"\rUploading to S3: [{bar}] {pct:3d}% ({mb_done:,.1f} / {mb_total:,.1f} MB)", end="", flush=True)
+
+            def finish(self) -> None:
+                print("", flush=True)  # newline
+
+        progress = _Progress(total=file_size) if show_progress else None
+
+        # Force a single PUT (no multipart) while still enabling per-chunk callbacks.
+        # Setting multipart_threshold > file size guarantees the TransferManager uses PutObject.
+        # NOTE: multipart_chunksize is still validated even when multipart is not used.
+        min_chunk = 8 * 1024 * 1024  # 8MB (>= S3 5MB minimum)
+        chunk_size = max(min_chunk, file_size + 1)
+        cfg = TransferConfig(
+            multipart_threshold=file_size + 1,
+            multipart_chunksize=chunk_size,
+            max_concurrency=1,
+            use_threads=False,
+        )
         with db_path.open("rb") as f:
-            s3.put_object(Bucket=str(s3_bucket), Key=str(s3_key), Body=f)
+            s3.upload_fileobj(
+                f,
+                str(s3_bucket),
+                str(s3_key),
+                Callback=progress if progress is not None else None,
+                Config=cfg,
+            )
+        if progress is not None:
+            progress.finish()
     except ClientError as e:
         code = (e.response or {}).get("Error", {}).get("Code")
         if code in {"AccessDenied", "AllAccessDisabled"}:
@@ -206,7 +251,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 4) Upload DuckDB -> S3 (overwrites object at bucket/key)
     print("\n=== Step 4/4: Uploading DuckDB to AWS S3 ===")
     try:
-        upload_duckdb_to_s3(db_path=db_path)
+        upload_duckdb_to_s3(db_path=db_path, show_progress=not bool(args.no_progress))
         print("✓ Upload complete. Your deployed Streamlit app will use the latest DuckDB from S3.")
     except Exception as e:
         print(f"✗ S3 upload failed: {e}")
