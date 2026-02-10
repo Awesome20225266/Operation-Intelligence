@@ -49,27 +49,38 @@ TABLE_WORK_ORDERS = "work_orders"
 TABLE_PTW_REQUESTS = "ptw_requests"
 TABLE_PTW_TEMPLATES = "ptw_templates"
 
-UI_STATUSES = ["OPEN", "APPROVED", "WIP", "REJECTED"]
+# Internal (derived) statuses — do not change derive_ptw_status outputs
+INTERNAL_STATUSES = ["OPEN", "WIP", "APPROVED", "REJECTED"]
+
+# Canonical UI labels (display only)
+UI_STATUSES = ["Approved", "Awaiting Approval", "Open", "Rejected"]
 
 # DB <-> UI mapping (keeps DB schema intact while matching requested UI labels)
-# Note: "CLOSED" and "APPROVED" both map to "APPROVED" for UI display
+# Note: "CLOSED" and "APPROVED" both map to "Approved" for UI display
 DB_STATUS_TO_UI = {
-    "OPEN": "OPEN",
-    "PENDING": "WIP",
-    "APPROVED": "APPROVED",
-    "REJECTED": "REJECTED",
-    "CLOSED": "APPROVED",
-    "WIP": "WIP",
+    "OPEN": "Open",
+    "PENDING": "Awaiting Approval",
+    "WIP": "Awaiting Approval",
+    "APPROVED": "Approved",
+    "CLOSED": "Approved",
+    "REJECTED": "Rejected",
 }
 UI_STATUS_TO_DB = {
-    "OPEN": ["OPEN"],
-    "WIP": ["PENDING", "WIP"],
-    "APPROVED": ["APPROVED", "CLOSED"],
-    "REJECTED": ["REJECTED"],
+    "Open": ["OPEN"],
+    "Awaiting Approval": ["PENDING", "WIP"],
+    "Approved": ["APPROVED", "CLOSED"],
+    "Rejected": ["REJECTED"],
 }
 
-# Display order: REJECTED, OPEN, WIP, APPROVED
-STATUS_ORDER = {"REJECTED": 0, "OPEN": 1, "WIP": 2, "APPROVED": 3, "CLOSED": 3}
+# Default status sort order (derived status; single source of truth)
+# Required order: Approved, Awaiting Approval (WIP), Open, Rejected
+STATUS_ORDER = {
+    "APPROVED": 0,
+    "CLOSED": 0,
+    "WIP": 1,
+    "OPEN": 2,
+    "REJECTED": 3,
+}
 
 # Placeholder regex for template processing
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
@@ -357,7 +368,7 @@ def _list_statuses_from_work_orders(
     Status is derived from date columns (single source of truth).
     """
     sb = get_supabase_client(prefer_service_role=True)
-    statuses_ui: set[str] = set()
+    statuses_internal: set[str] = set()
     page_size = 1000
     offset = 0
 
@@ -391,21 +402,22 @@ def _list_statuses_from_work_orders(
         for r in rows:
             # Derive status from date columns
             derived = derive_ptw_status(r)
-            # Keep derived status as APPROVED for UI display
+            # Map CLOSED -> APPROVED (internal normalization for UI)
             if derived == "CLOSED":
                 derived = "APPROVED"
-            if derived in UI_STATUSES:
-                statuses_ui.add(derived)
+            if derived in INTERNAL_STATUSES:
+                statuses_internal.add(derived)
         
         if len(rows) < page_size:
             break
         offset += page_size
 
-    # Required order: REJECTED, OPEN, WIP, CLOSED
-    ordered = sorted(statuses_ui, key=lambda s: STATUS_ORDER.get(s, 99))
-    return ordered
+    ordered_internal = sorted(statuses_internal, key=lambda s: STATUS_ORDER.get(s, 99))
+    # Return UI labels (display only)
+    return [DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s)) for s in ordered_internal]
 
 
+@st.cache_data(show_spinner=False, ttl=60)
 def _fetch_work_orders(
     *,
     site_name: str,
@@ -463,19 +475,18 @@ def _fetch_work_orders(
     
     # Filter by derived status if requested
     if status_ui:
-        # Map UI status to derived status
-        status_map = {
-            "OPEN": "OPEN",
-            "WIP": "WIP",
-            "APPROVED": "APPROVED",  # UI shows APPROVED, derived is APPROVED or CLOSED
-            "REJECTED": "REJECTED",
-        }
-        target_status = status_map.get(status_ui, status_ui)
-        # Filter for APPROVED includes both APPROVED and CLOSED derived statuses
-        if target_status == "APPROVED":
+        sel = str(status_ui).strip()
+        internal_targets = UI_STATUS_TO_DB.get(sel, [sel.strip().upper()])
+
+        # Filter for Approved includes both APPROVED and CLOSED derived statuses
+        if "APPROVED" in internal_targets or "CLOSED" in internal_targets:
             df = df[df["status"].isin(["APPROVED", "CLOSED"])]
+        # Awaiting Approval maps to internal WIP
+        elif "WIP" in internal_targets or "PENDING" in internal_targets:
+            df = df[df["status"] == "WIP"]
         else:
-            df = df[df["status"] == target_status]
+            target = internal_targets[0] if internal_targets else sel.strip().upper()
+            df = df[df["status"] == target]
     
     # Map CLOSED -> APPROVED for UI display
     df["status"] = df["status"].replace({"CLOSED": "APPROVED"})
@@ -497,16 +508,10 @@ def _fetch_work_orders(
 
     if not df.empty:
         df["date_planned"] = pd.to_datetime(df["date_planned"], errors="coerce").dt.date.astype("string")
-        df["status"] = (
-            df["status"]
-            .astype("string")
-            .fillna("")
-            .map(lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s).strip().upper()))
+        df["_status_rank"] = df["status"].astype("string").fillna("").map(
+            lambda s: STATUS_ORDER.get(str(s).strip().upper(), 99)
         )
-        df["_status_rank"] = df["status"].map(lambda s: STATUS_ORDER.get(str(s), 99))
-        df = df.sort_values(by=["_status_rank", "date_planned"], ascending=[True, True]).drop(
-            columns=["_status_rank"]
-        )
+        df = df.sort_values(by=["_status_rank", "date_planned"], ascending=[True, True]).drop(columns=["_status_rank"])
 
     return df
 
@@ -525,7 +530,7 @@ def _highlight_status(val: Any) -> str:
     
     if status == "OPEN":
         return "background-color: #2563eb; color: white; font-weight: 700;"
-    elif status == "WIP":
+    elif status in ("WIP", "AWAITING APPROVAL"):
         return "background-color: #f97316; color: white; font-weight: 700;"
     elif status in ("CLOSED", "APPROVED"):
         return "background-color: #10b981; color: white; font-weight: 700;"
@@ -751,6 +756,7 @@ def insert_ptw_request(
     return resp_data[0]["ptw_id"]
 
 
+@st.cache_data(show_spinner=False, ttl=60)
 def fetch_ptw_requests(
     *,
     start_date: date | None = None,
@@ -763,17 +769,9 @@ def fetch_ptw_requests(
     """
     sb = get_supabase_client(prefer_service_role=True)
 
-    q = sb.table(TABLE_PTW_REQUESTS).select(
-        "ptw_id,permit_no,site_name,status,created_at,created_by,form_data"
-    )
-
-    if start_date:
-        start_dt = datetime.combine(start_date, datetime.min.time())
-        q = q.gte("created_at", start_dt.isoformat())
-    if end_date:
-        end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
-        q = q.lt("created_at", end_dt.isoformat())
-
+    # IMPORTANT: Date filtering for lifecycle visibility is based on work_orders.date_s1_created,
+    # NOT ptw_requests.created_at (ptw_requests.created_at is not the lifecycle clock).
+    q = sb.table(TABLE_PTW_REQUESTS).select("ptw_id,permit_no,site_name,status,created_at,created_by,form_data")
     q = q.order("created_at", desc=True)
     resp = q.execute()
 
@@ -787,15 +785,17 @@ def fetch_ptw_requests(
     if df.empty:
         return df
     
-    # Derive status from work_orders date columns
+    # Derive status + lifecycle dates from work_orders date columns
     # permit_no in ptw_requests = work_order_id in work_orders
     work_order_ids = df["permit_no"].unique().tolist()
     
     if work_order_ids:
-        # Fetch date columns from work_orders for status derivation
+        # Fetch date columns from work_orders for status derivation + lifecycle filtering
         wo_resp = (
             sb.table(TABLE_WORK_ORDERS)
-            .select("work_order_id,date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected")
+            .select(
+                "work_order_id,date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
+            )
             .in_("work_order_id", work_order_ids)
             .execute()
         )
@@ -803,17 +803,28 @@ def fetch_ptw_requests(
         
         if wo_data:
             wo_df = pd.DataFrame(wo_data)
-            # Create lookup dict: work_order_id -> derived status
-            status_lookup = {}
+            # Create lookup dicts: work_order_id -> derived status / s1_created
+            status_lookup: dict[str, str] = {}
+            s1_created_lookup: dict[str, Any] = {}
             for _, row in wo_df.iterrows():
                 derived = derive_ptw_status(row.to_dict())
                 # Map CLOSED -> APPROVED for UI display
                 if derived == "CLOSED":
                     derived = "APPROVED"
                 status_lookup[row["work_order_id"]] = derived
+                s1_created_lookup[row["work_order_id"]] = row.get("date_s1_created")
             
             # Apply derived status to PTW requests
             df["status"] = df["permit_no"].map(status_lookup).fillna("WIP")
+            df["date_s1_created"] = df["permit_no"].map(s1_created_lookup)
+
+    # Apply lifecycle date range filter using work_orders.date_s1_created
+    if start_date or end_date:
+        start_dt = datetime.combine(start_date or date.min, datetime.min.time())
+        end_dt_excl = datetime.combine((end_date or date.max) + timedelta(days=1), datetime.min.time())
+        ts = pd.to_datetime(df.get("date_s1_created"), errors="coerce")
+        df = df[(ts >= start_dt) & (ts < end_dt_excl)]
+        df = df.sort_values(by=["date_s1_created"], ascending=[False], na_position="last")
     
     return df
 
@@ -1109,197 +1120,317 @@ def _convert_docx_to_pdf_cloudconvert(docx_bytes: bytes, *, timeout_s: int = 180
 # PDF TEMPLATE + REPORTLAB OVERLAY (NO DOCX/LIBREOFFICE/CLOUDCONVERT)
 # =============================================================================
 
-# Page-wise coordinate mapping for PDF overlay (A4: 595 x 842, bottom-left origin)
-# This is a CONTRACT — do not change without re-mapping the template
-
-_PDF_COORDS_PAGE1 = {
-    # HEADER
-    "permit_no": (150, 740),
-    "permit_validity_date": (420, 740),
-    "start_time": (150, 710),
-    "end_time": (420, 710),
-    "site_name": (150, 680),
-    "work_location": (420, 680),
-    "work_description_line1": (150, 650),
-    "work_description_line2": (150, 635),
-    "contractor_name": (150, 605),
-    # HAZARDS (checkmarks)
-    "hz_live_dc_cables": (65, 560),
-    "hz_loose_connectors": (205, 560),
-    "hz_tracker_parts": (350, 560),
-    "hz_dust": (500, 560),
-    "hz_high_dc": (65, 530),
-    "hz_poor_grounding": (205, 530),
-    "hz_heavy_panels": (350, 530),
-    "hz_wildlife": (500, 530),
-    "hz_arc_flash": (65, 500),
-    "hz_working_height": (205, 500),
-    "hz_sharp_edges": (350, 500),
-    "hz_lightning": (500, 500),
-    "hz_improper_grounding": (65, 470),
-    "hz_wet_surfaces": (205, 470),
-    "hz_heat": (350, 470),
-    "hz_overload": (500, 470),
-    "hz_manual_handling": (205, 440),
-    "hz_overhead_line": (350, 440),
-    "hz_others_text": (440, 440),
-    # RISK IDENTIFICATION (checkmarks)
-    "rk_electrocution": (65, 385),
-    "rk_burns": (205, 385),
-    "rk_unexpected_energization": (350, 385),
-    "rk_heat_stress": (500, 385),
-    "rk_electric_shock": (65, 355),
-    "rk_fire": (205, 355),
-    "rk_crushing": (350, 355),
-    "rk_others_text": (500, 355),
-    "rk_electric_burn": (65, 325),
-    "rk_fall": (205, 325),
-    "rk_back_injury": (350, 325),
-    "rk_bites": (65, 295),
-    "rk_falling_particles": (205, 295),
-    "rk_tripping": (350, 295),
-    # PPE (checkmarks)
-    "ppe_helmet": (65, 245),
-    "ppe_hrc_suit": (205, 245),
-    "ppe_respirators": (350, 245),
-    "ppe_harness": (500, 245),
-    "ppe_shoes": (65, 215),
-    "ppe_electrical_mat": (205, 215),
-    "ppe_dust_mask": (350, 215),
-    "ppe_lifeline": (500, 215),
-    "ppe_reflective_vest": (65, 185),
-    "ppe_face_shield": (205, 185),
-    "ppe_ear_plugs": (350, 185),
-    "ppe_cut_gloves": (500, 185),
-    "ppe_goggles": (65, 155),
-    "ppe_insulated_tools": (205, 155),
-    "ppe_electrical_gloves": (350, 155),
-    "ppe_others_text": (500, 155),
-    # SAFETY PRECAUTIONS (checkmarks)
-    "sp_electrical_isolation": (65, 105),
-    "sp_fire_extinguisher": (205, 105),
-    "sp_proper_isolation": (350, 105),
-    "sp_authorized_personnel": (500, 105),
-    "sp_loto": (65, 75),
-    "sp_signage": (205, 75),
-    "sp_rescue_equipment": (350, 75),
-    "sp_others_text": (500, 75),
-    "sp_zero_voltage": (65, 45),
-    "sp_earthing": (205, 45),
-    "sp_pre_job_meeting": (350, 45),
-    "sp_insulated_tools": (65, 15),
-    "sp_illumination": (205, 15),
-    "sp_escape_route": (350, 15),
+# Authoritative PDF overlay coordinate mapping (A4: 595 x 842, bottom-left origin).
+# Structure: dotted_tag -> {page, x, y, width, height, type}
+# Types: "text" | "multiline" | "checkbox" | "tri_state"
+PTW_PDF_COORDINATES: dict[str, dict[str, Any]] = {
+    # ---------------------------
+    # Page 1 — Header (text)
+    # ---------------------------
+    "meta.permit_no": {"page": 1, "x": 166, "y": 666, "width": 181, "height": 19, "type": "text"},
+    "meta.permit_validity_date": {"page": 1, "x": 461, "y": 665, "width": 118, "height": 20, "type": "text"},
+    "meta.start_time": {"page": 1, "x": 166, "y": 644, "width": 184, "height": 16, "type": "text"},
+    "meta.end_time": {"page": 1, "x": 458, "y": 646, "width": 123, "height": 17, "type": "text"},
+    "meta.project_site_name": {"page": 1, "x": 163, "y": 626, "width": 188, "height": 15, "type": "text"},
+    "meta.work_location": {"page": 1, "x": 456, "y": 624, "width": 121, "height": 19, "type": "text"},
+    "meta.description_of_work": {"page": 1, "x": 158, "y": 605, "width": 422, "height": 16, "type": "text"},
+    "meta.contractor_name": {"page": 1, "x": 161, "y": 582, "width": 419, "height": 17, "type": "text"},
+    # ---------------------------
+    # Page 1 — Hazards (checkboxes + text)
+    # ---------------------------
+    "hazards.live_dc_cables": {"page": 1, "x": 34, "y": 529, "width": 9, "height": 11, "type": "checkbox"},
+    "hazards.loose_or_damaged_connectors": {"page": 1, "x": 135, "y": 528, "width": 14, "height": 15, "type": "checkbox"},
+    "hazards.moving_solar_tracker_parts": {"page": 1, "x": 288, "y": 531, "width": 11, "height": 10, "type": "checkbox"},
+    "hazards.dust_accumulation_on_equipment": {"page": 1, "x": 417, "y": 529, "width": 15, "height": 13, "type": "checkbox"},
+    "hazards.high_dc_voltage_from_pv_panels": {"page": 1, "x": 33, "y": 512, "width": 15, "height": 14, "type": "checkbox"},
+    "hazards.poor_grounding_earthing": {"page": 1, "x": 135, "y": 507, "width": 14, "height": 14, "type": "checkbox"},
+    "hazards.heavy_solar_panels": {"page": 1, "x": 288, "y": 507, "width": 11, "height": 12, "type": "checkbox"},
+    "hazards.wildlife_snakes_insects_birds": {"page": 1, "x": 419, "y": 506, "width": 13, "height": 14, "type": "checkbox"},
+    "hazards.arc_flash_short_circuit": {"page": 1, "x": 34, "y": 489, "width": 15, "height": 13, "type": "checkbox"},
+    "hazards.working_at_height_rooftop_structure": {"page": 1, "x": 135, "y": 487, "width": 16, "height": 14, "type": "checkbox"},
+    "hazards.sharp_panel_edges_metal_structures": {"page": 1, "x": 287, "y": 487, "width": 14, "height": 12, "type": "checkbox"},
+    "hazards.lightning_or_stormy_weather": {"page": 1, "x": 417, "y": 479, "width": 15, "height": 17, "type": "checkbox"},
+    "hazards.improper_grounding": {"page": 1, "x": 34, "y": 462, "width": 15, "height": 13, "type": "checkbox"},
+    "hazards.wet_surfaces": {"page": 1, "x": 135, "y": 453, "width": 17, "height": 20, "type": "checkbox"},
+    "hazards.high_ambient_temperature_sun_exposure": {"page": 1, "x": 285, "y": 463, "width": 15, "height": 12, "type": "checkbox"},
+    "hazards.overloaded_circuits": {"page": 1, "x": 417, "y": 464, "width": 14, "height": 15, "type": "checkbox"},
+    "hazards.manual_handling": {"page": 1, "x": 136, "y": 436, "width": 13, "height": 12, "type": "checkbox"},
+    "hazards.overhead_line": {"page": 1, "x": 286, "y": 436, "width": 14, "height": 10, "type": "checkbox"},
+    "hazards.if_others_text": {"page": 1, "x": 537, "y": 434, "width": 45, "height": 15, "type": "text"},
+    # ---------------------------
+    # Page 1 — Risks (checkboxes + multiline text)
+    # ---------------------------
+    "risks.electrocution": {"page": 1, "x": 31, "y": 388, "width": 15, "height": 15, "type": "checkbox"},
+    "risks.burns_equipment_damage": {"page": 1, "x": 135, "y": 387, "width": 14, "height": 15, "type": "checkbox"},
+    "risks.unexpected_energization": {"page": 1, "x": 286, "y": 387, "width": 14, "height": 15, "type": "checkbox"},
+    "risks.heat_stress_dehydration": {"page": 1, "x": 286, "y": 387, "width": 14, "height": 15, "type": "checkbox"},
+    "risks.electric_shock": {"page": 1, "x": 35, "y": 367, "width": 11, "height": 14, "type": "checkbox"},
+    "risks.fire_or_overheating": {"page": 1, "x": 135, "y": 367, "width": 15, "height": 12, "type": "checkbox"},
+    "risks.crushing_or_pinching_injuries": {"page": 1, "x": 285, "y": 370, "width": 18, "height": 17, "type": "checkbox"},
+    "risks.if_others_text": {"page": 1, "x": 430, "y": 330, "width": 149, "height": 43, "type": "multiline"},
+    "risks.electric_burn": {"page": 1, "x": 31, "y": 345, "width": 18, "height": 17, "type": "checkbox"},
+    "risks.fall_causing_serious_injury": {"page": 1, "x": 135, "y": 346, "width": 14, "height": 13, "type": "checkbox"},
+    "risks.back_or_muscle_injury": {"page": 1, "x": 288, "y": 348, "width": 12, "height": 11, "type": "checkbox"},
+    "risks.bites_stings": {"page": 1, "x": 29, "y": 327, "width": 17, "height": 15, "type": "checkbox"},
+    "risks.falling_particles": {"page": 1, "x": 136, "y": 327, "width": 14, "height": 15, "type": "checkbox"},
+    "risks.tripping_slipping": {"page": 1, "x": 289, "y": 329, "width": 10, "height": 11, "type": "checkbox"},
+    # ---------------------------
+    # Page 1 — PPE (checkboxes + text)
+    # ---------------------------
+    "ppe.safety_helmet": {"page": 1, "x": 31, "y": 271, "width": 15, "height": 15, "type": "checkbox"},
+    "ppe.hrc_suit": {"page": 1, "x": 135, "y": 272, "width": 15, "height": 14, "type": "checkbox"},
+    "ppe.respirators": {"page": 1, "x": 286, "y": 272, "width": 14, "height": 11, "type": "checkbox"},
+    "ppe.full_body_safety_harness": {"page": 1, "x": 417, "y": 272, "width": 14, "height": 15, "type": "checkbox"},
+    "ppe.safety_shoes": {"page": 1, "x": 32, "y": 254, "width": 13, "height": 13, "type": "checkbox"},
+    "ppe.electrical_mat": {"page": 1, "x": 138, "y": 255, "width": 14, "height": 14, "type": "checkbox"},
+    "ppe.dust_masks": {"page": 1, "x": 287, "y": 253, "width": 15, "height": 16, "type": "checkbox"},
+    "ppe.lifeline_anchor_point": {"page": 1, "x": 417, "y": 253, "width": 15, "height": 15, "type": "checkbox"},
+    "ppe.reflective_vest": {"page": 1, "x": 30, "y": 236, "width": 17, "height": 14, "type": "checkbox"},
+    "ppe.face_shield_with_arc_protection": {"page": 1, "x": 135, "y": 237, "width": 14, "height": 15, "type": "checkbox"},
+    "ppe.ear_plugs_muffs": {"page": 1, "x": 287, "y": 237, "width": 15, "height": 15, "type": "checkbox"},
+    "ppe.cut_resistant_gloves": {"page": 1, "x": 417, "y": 237, "width": 13, "height": 14, "type": "checkbox"},
+    "ppe.safety_goggles": {"page": 1, "x": 31, "y": 218, "width": 16, "height": 14, "type": "checkbox"},
+    "ppe.insulated_hand_tools": {"page": 1, "x": 135, "y": 219, "width": 14, "height": 17, "type": "checkbox"},
+    "ppe.electrical_hand_gloves": {"page": 1, "x": 286, "y": 216, "width": 14, "height": 17, "type": "checkbox"},
+    "ppe.if_others_text": {"page": 1, "x": 418, "y": 221, "width": 13, "height": 15, "type": "text"},
+    # ---------------------------
+    # Page 1 — Safety precautions (checkboxes + multiline)
+    # ---------------------------
+    "precautions.electrical_isolation": {"page": 1, "x": 32, "y": 160, "width": 15, "height": 19, "type": "checkbox"},
+    "precautions.fire_extinguisher_first_aid": {"page": 1, "x": 134, "y": 158, "width": 18, "height": 16, "type": "checkbox"},
+    "precautions.proper_isolation": {"page": 1, "x": 285, "y": 159, "width": 17, "height": 21, "type": "checkbox"},
+    "precautions.authorized_competent_personnel": {"page": 1, "x": 415, "y": 165, "width": 15, "height": 16, "type": "checkbox"},
+    "precautions.lockout_tagout": {"page": 1, "x": 33, "y": 133, "width": 13, "height": 19, "type": "checkbox"},
+    "precautions.warning_signage_barricading": {"page": 1, "x": 136, "y": 144, "width": 11, "height": 10, "type": "checkbox"},
+    "precautions.rescue_equipment_at_site": {"page": 1, "x": 288, "y": 135, "width": 12, "height": 17, "type": "checkbox"},
+    "precautions.if_others_text": {"page": 1, "x": 420, "y": 103, "width": 162, "height": 36, "type": "multiline"},
+    "precautions.zero_voltage_ensure": {"page": 1, "x": 35, "y": 115, "width": 11, "height": 15, "type": "checkbox"},
+    "precautions.proper_earthing_grounding": {"page": 1, "x": 135, "y": 114, "width": 16, "height": 16, "type": "checkbox"},
+    "precautions.pre_job_meeting": {"page": 1, "x": 286, "y": 114, "width": 16, "height": 17, "type": "checkbox"},
+    "precautions.insulated_tools": {"page": 1, "x": 33, "y": 102, "width": 13, "height": 12, "type": "checkbox"},
+    "precautions.proper_illumination": {"page": 1, "x": 135, "y": 102, "width": 15, "height": 14, "type": "checkbox"},
+    "precautions.escape_route_clear": {"page": 1, "x": 283, "y": 100, "width": 19, "height": 14, "type": "checkbox"},
+    # ---------------------------
+    # Page 2 — Associated permits / documents (checkboxes + text)
+    # ---------------------------
+    "permits.hot_work_permit_no": {"page": 2, "x": 31, "y": 640, "width": 15, "height": 14, "type": "checkbox"},
+    "permits.work_at_night_permit_no": {"page": 2, "x": 151, "y": 639, "width": 17, "height": 18, "type": "checkbox"},
+    "permits.work_at_height_permit_no": {"page": 2, "x": 328, "y": 638, "width": 17, "height": 16, "type": "checkbox"},
+    "permits.general_work_permit_no": {"page": 2, "x": 29, "y": 621, "width": 22, "height": 16, "type": "checkbox"},
+    "permits.excavation_work_permit_no": {"page": 2, "x": 152, "y": 615, "width": 13, "height": 16, "type": "checkbox"},
+    "permits.lifting_plan_permit_no": {"page": 2, "x": 328, "y": 614, "width": 17, "height": 18, "type": "checkbox"},
+    "permits.loto_permit_no": {"page": 2, "x": 33, "y": 592, "width": 12, "height": 18, "type": "checkbox"},
+    "permits.confined_space_permit_no": {"page": 2, "x": 150, "y": 591, "width": 17, "height": 18, "type": "checkbox"},
+    "permits.if_others_text": {"page": 2, "x": 327, "y": 589, "width": 19, "height": 22, "type": "text"},
+    # Page 2 — Tool / Equipment (multiline)
+    "tools_equipment.list_text": {"page": 2, "x": 32, "y": 492, "width": 549, "height": 62, "type": "multiline"},
+    # Page 2 — Permit issuer checklist (tri-state: Y/N/NA)
+    "issuer_checks.jsa_carried_out": {"page": 2, "x": 290, "y": 385, "width": 30, "height": 26, "type": "tri_state"},
+    "issuer_checks.equipment_deenergized_loto": {"page": 2, "x": 292, "y": 360, "width": 29, "height": 19, "type": "tri_state"},
+    "issuer_checks.energized_work_ppe_procedure": {"page": 2, "x": 285, "y": 333, "width": 38, "height": 20, "type": "tri_state"},
+    "issuer_checks.workers_fit_trained_qualified": {"page": 2, "x": 292, "y": 307, "width": 33, "height": 22, "type": "tri_state"},
+    "issuer_checks.tools_fit_for_voltage": {"page": 2, "x": 292, "y": 307, "width": 33, "height": 22, "type": "tri_state"},
+    "issuer_checks.rescue_plan_available": {"page": 2, "x": 287, "y": 252, "width": 38, "height": 24, "type": "tri_state"},
+    "issuer_checks.testing_equipment_compatible": {"page": 2, "x": 286, "y": 224, "width": 40, "height": 25, "type": "tri_state"},
+    "issuer_checks.line_clearance_taken": {"page": 2, "x": 287, "y": 189, "width": 36, "height": 29, "type": "tri_state"},
+    "issuer_checks.environment_condition_suitable": {"page": 2, "x": 546, "y": 386, "width": 36, "height": 21, "type": "tri_state"},
+    "issuer_checks.firefighting_equipment_available": {"page": 2, "x": 544, "y": 359, "width": 38, "height": 21, "type": "tri_state"},
+    "issuer_checks.rescue_equipment_available": {"page": 2, "x": 547, "y": 333, "width": 33, "height": 20, "type": "tri_state"},
+    "issuer_checks.equipment_grounded": {"page": 2, "x": 545, "y": 306, "width": 36, "height": 23, "type": "tri_state"},
+    "issuer_checks.adequate_lighting": {"page": 2, "x": 542, "y": 278, "width": 40, "height": 22, "type": "tri_state"},
+    "issuer_checks.warning_signage_available": {"page": 2, "x": 542, "y": 253, "width": 40, "height": 20, "type": "tri_state"},
+    "issuer_checks.conductive_items_removed": {"page": 2, "x": 544, "y": 224, "width": 37, "height": 24, "type": "tri_state"},
+    "issuer_checks.safety_requirements_explained": {"page": 2, "x": 543, "y": 188, "width": 38, "height": 31, "type": "tri_state"},
+    # ---------------------------
+    # Page 3 — People & signatures (text)
+    # ---------------------------
+    "people.permit_receiver.name": {"page": 3, "x": 194, "y": 626, "width": 147, "height": 20, "type": "text"},
+    "people.permit_receiver.signature": {"page": 3, "x": 350, "y": 626, "width": 110, "height": 18, "type": "text"},
+    "people.permit_receiver.datetime": {"page": 3, "x": 468, "y": 626, "width": 109, "height": 17, "type": "text"},
+    "people.permit_holder.name": {"page": 3, "x": 191, "y": 602, "width": 150, "height": 20, "type": "text"},
+    "people.permit_holder.signature": {"page": 3, "x": 347, "y": 601, "width": 117, "height": 21, "type": "text"},
+    "people.permit_holder.datetime": {"page": 3, "x": 468, "y": 600, "width": 110, "height": 23, "type": "text"},
+    "people.co_workers.1": {"page": 3, "x": 205, "y": 578, "width": 137, "height": 17, "type": "text"},
+    "people.co_workers.2": {"page": 3, "x": 359, "y": 577, "width": 103, "height": 17, "type": "text"},
+    "people.co_workers.3": {"page": 3, "x": 479, "y": 578, "width": 101, "height": 16, "type": "text"},
+    "people.co_workers.4": {"page": 3, "x": 202, "y": 554, "width": 142, "height": 20, "type": "text"},
+    "people.co_workers.5": {"page": 3, "x": 358, "y": 554, "width": 103, "height": 19, "type": "text"},
+    "people.co_workers.6": {"page": 3, "x": 475, "y": 554, "width": 105, "height": 19, "type": "text"},
+    "people.permit_issuer.name": {"page": 3, "x": 193, "y": 509, "width": 148, "height": 17, "type": "text"},
+    "people.permit_issuer.signature": {"page": 3, "x": 349, "y": 508, "width": 112, "height": 18, "type": "text"},
+    "people.permit_issuer.datetime": {"page": 3, "x": 466, "y": 508, "width": 113, "height": 17, "type": "text"},
+    # Page 3 — Extension (text + multiline)
+    "extension.date": {"page": 3, "x": 28, "y": 415, "width": 76, "height": 19, "type": "text"},
+    "extension.time_from": {"page": 3, "x": 107, "y": 416, "width": 31, "height": 15, "type": "text"},
+    "extension.time_to": {"page": 3, "x": 143, "y": 416, "width": 38, "height": 15, "type": "text"},
+    "extension.permit_holder.name": {"page": 3, "x": 187, "y": 414, "width": 77, "height": 17, "type": "text"},
+    "extension.permit_holder.signature": {"page": 3, "x": 271, "y": 415, "width": 45, "height": 16, "type": "text"},
+    "extension.permit_receiver.name": {"page": 3, "x": 320, "y": 414, "width": 75, "height": 15, "type": "text"},
+    "extension.permit_receiver.signature": {"page": 3, "x": 396, "y": 416, "width": 48, "height": 14, "type": "text"},
+    "extension.permit_issuer.name": {"page": 3, "x": 447, "y": 413, "width": 84, "height": 18, "type": "text"},
+    "extension.permit_issuer.signature": {"page": 3, "x": 533, "y": 415, "width": 45, "height": 15, "type": "text"},
+    "extension.remarks": {"page": 3, "x": 96, "y": 372, "width": 479, "height": 36, "type": "multiline"},
+    # Page 3 — Closure (text)
+    "closure.permit_receiver.name": {"page": 3, "x": 191, "y": 267, "width": 149, "height": 20, "type": "text"},
+    "closure.permit_receiver.signature": {"page": 3, "x": 348, "y": 266, "width": 116, "height": 21, "type": "text"},
+    "closure.permit_receiver.datetime": {"page": 3, "x": 468, "y": 266, "width": 111, "height": 20, "type": "text"},
+    "closure.permit_holder.name": {"page": 3, "x": 194, "y": 244, "width": 148, "height": 17, "type": "text"},
+    "closure.permit_holder.signature": {"page": 3, "x": 349, "y": 244, "width": 113, "height": 15, "type": "text"},
+    "closure.permit_holder.datetime": {"page": 3, "x": 466, "y": 244, "width": 113, "height": 17, "type": "text"},
+    "closure.permit_issuer.name": {"page": 3, "x": 191, "y": 220, "width": 153, "height": 18, "type": "text"},
+    "closure.permit_issuer.signature": {"page": 3, "x": 348, "y": 221, "width": 112, "height": 18, "type": "text"},
+    "closure.permit_issuer.datetime": {"page": 3, "x": 466, "y": 220, "width": 114, "height": 19, "type": "text"},
 }
 
-_PDF_COORDS_PAGE2 = {
-    # ASSOCIATED PERMITS (checkmarks)
-    "ap_hot_work": (65, 700),
-    "ap_night_work": (205, 700),
-    "ap_height_work": (350, 700),
-    "ap_general_work": (65, 670),
-    "ap_excavation": (205, 670),
-    "ap_lifting": (350, 670),
-    "ap_loto": (65, 640),
-    "ap_confined_space": (205, 640),
-    "ap_others_text": (350, 640),
-    # TOOLS / EQUIPMENT (text, multiline)
-    "tools_equipment_line1": (65, 600),
-    "tools_equipment_line2": (65, 585),
-    "tools_equipment_line3": (65, 570),
-    # CHECK POINTS (Y/N/NA checkmarks) - left column
-    "chk_jsa": (300, 525),
-    "chk_loto": (300, 495),
-    "chk_energized_ppe": (300, 465),
-    "chk_workers_fit": (300, 435),
-    "chk_tools": (300, 405),
-    "chk_rescue_plan": (300, 375),
-    "chk_testing_equipment": (300, 345),
-    "chk_line_clearance": (300, 315),
-    # CHECK POINTS - right column
-    "chk_environment": (545, 525),
-    "chk_fire_fighting": (545, 495),
-    "chk_rescue": (545, 465),
-    "chk_grounded": (545, 435),
-    "chk_lighting": (545, 405),
-    "chk_signage": (545, 375),
-    "chk_conductive_removed": (545, 345),
-    "chk_briefing": (545, 315),
-    # UNDERTAKING
-    "undertaking_accept": (65, 255),
-}
-
-_PDF_COORDS_PAGE3 = {
-    # SIGNATURES
-    "receiver_name": (220, 705),
-    "receiver_datetime": (450, 705),
-    "holder_name": (220, 675),
-    "holder_datetime": (450, 675),
-    "issuer_name": (220, 620),
-    "issuer_datetime": (450, 620),
-    # CO-WORKERS
-    "coworker_1": (260, 645),
-    "coworker_2": (340, 645),
-    "coworker_3": (420, 645),
-    "coworker_4": (260, 615),
-    "coworker_5": (340, 615),
-    "coworker_6": (420, 615),
-    # EXTENSION
-    "ext_date": (95, 565),
-    "ext_from_time": (160, 565),
-    "ext_to_time": (215, 565),
-    "ext_holder_name": (295, 565),
-    "ext_receiver_name": (395, 565),
-    "ext_issuer_name": (500, 565),
-    "ext_remarks": (120, 535),
-    # PERMIT CLOSURE
-    "closure_receiver": (220, 480),
-    "closure_receiver_datetime": (450, 480),
-    "closure_holder": (220, 450),
-    "closure_holder_datetime": (450, 450),
-    "closure_issuer": (220, 420),
-    "closure_issuer_datetime": (450, 420),
-}
-
-# All checkmark/boolean fields (value should be rendered as ✔ if truthy)
-_CHECKBOX_FIELDS = {
+# Read-only mapping from overlay tags to existing form_data keys (keeps DB/UI schema unchanged).
+_PTW_TAG_SOURCES: dict[str, list[str]] = {
+    # Meta
+    "meta.permit_no": ["permit_no", "work_order_id"],
+    "meta.permit_validity_date": ["permit_validity_date"],
+    "meta.start_time": ["start_time"],
+    "meta.end_time": ["end_time"],
+    "meta.project_site_name": ["project_site_name", "site_name"],
+    "meta.work_location": ["work_location"],
+    "meta.description_of_work": ["description_of_work", "work_description", "work_description_line1"],
+    "meta.contractor_name": ["contractor_name"],
     # Hazards
-    "hz_live_dc_cables", "hz_loose_connectors", "hz_tracker_parts", "hz_dust",
-    "hz_high_dc", "hz_poor_grounding", "hz_heavy_panels", "hz_wildlife",
-    "hz_arc_flash", "hz_working_height", "hz_sharp_edges", "hz_lightning",
-    "hz_improper_grounding", "hz_wet_surfaces", "hz_heat", "hz_overload",
-    "hz_manual_handling", "hz_overhead_line",
+    "hazards.live_dc_cables": ["hz_live_dc_cables"],
+    "hazards.loose_or_damaged_connectors": ["hz_loose_connectors"],
+    "hazards.moving_solar_tracker_parts": ["hz_tracker_parts"],
+    "hazards.dust_accumulation_on_equipment": ["hz_dust"],
+    "hazards.high_dc_voltage_from_pv_panels": ["hz_high_dc"],
+    "hazards.poor_grounding_earthing": ["hz_poor_grounding"],
+    "hazards.heavy_solar_panels": ["hz_heavy_panels"],
+    "hazards.wildlife_snakes_insects_birds": ["hz_wildlife"],
+    "hazards.arc_flash_short_circuit": ["hz_arc_flash"],
+    "hazards.working_at_height_rooftop_structure": ["hz_working_height"],
+    "hazards.sharp_panel_edges_metal_structures": ["hz_sharp_edges"],
+    "hazards.lightning_or_stormy_weather": ["hz_lightning"],
+    "hazards.improper_grounding": ["hz_improper_grounding"],
+    "hazards.wet_surfaces": ["hz_wet_surfaces"],
+    "hazards.high_ambient_temperature_sun_exposure": ["hz_heat"],
+    "hazards.overloaded_circuits": ["hz_overload"],
+    "hazards.manual_handling": ["hz_manual_handling"],
+    "hazards.overhead_line": ["hz_overhead_line"],
+    "hazards.if_others_text": ["hz_others_text"],
     # Risks
-    "rk_electrocution", "rk_burns", "rk_unexpected_energization", "rk_heat_stress",
-    "rk_electric_shock", "rk_fire", "rk_crushing", "rk_electric_burn",
-    "rk_fall", "rk_back_injury", "rk_bites", "rk_falling_particles", "rk_tripping",
+    "risks.electrocution": ["rk_electrocution"],
+    "risks.burns_equipment_damage": ["rk_burns"],
+    "risks.unexpected_energization": ["rk_unexpected_energization"],
+    "risks.heat_stress_dehydration": ["rk_heat_stress"],
+    "risks.electric_shock": ["rk_electric_shock"],
+    "risks.fire_or_overheating": ["rk_fire"],
+    "risks.crushing_or_pinching_injuries": ["rk_crushing"],
+    "risks.electric_burn": ["rk_electric_burn"],
+    "risks.fall_causing_serious_injury": ["rk_fall"],
+    "risks.back_or_muscle_injury": ["rk_back_injury"],
+    "risks.bites_stings": ["rk_bites"],
+    "risks.falling_particles": ["rk_falling_particles"],
+    "risks.tripping_slipping": ["rk_tripping"],
+    "risks.if_others_text": ["rk_others_text"],
     # PPE
-    "ppe_helmet", "ppe_hrc_suit", "ppe_respirators", "ppe_harness",
-    "ppe_shoes", "ppe_electrical_mat", "ppe_dust_mask", "ppe_lifeline",
-    "ppe_reflective_vest", "ppe_face_shield", "ppe_ear_plugs", "ppe_cut_gloves",
-    "ppe_goggles", "ppe_insulated_tools", "ppe_electrical_gloves",
-    # Safety Precautions
-    "sp_electrical_isolation", "sp_fire_extinguisher", "sp_proper_isolation",
-    "sp_authorized_personnel", "sp_loto", "sp_signage", "sp_rescue_equipment",
-    "sp_zero_voltage", "sp_earthing", "sp_pre_job_meeting",
-    "sp_insulated_tools", "sp_illumination", "sp_escape_route",
-    # Associated Permits
-    "ap_hot_work", "ap_night_work", "ap_height_work",
-    "ap_general_work", "ap_excavation", "ap_lifting",
-    "ap_loto", "ap_confined_space",
-    # Undertaking
-    "undertaking_accept",
-    # Checkpoints
-    "chk_jsa", "chk_loto", "chk_energized_ppe", "chk_workers_fit",
-    "chk_tools", "chk_rescue_plan", "chk_testing_equipment", "chk_line_clearance",
-    "chk_environment", "chk_fire_fighting", "chk_rescue", "chk_grounded",
-    "chk_lighting", "chk_signage", "chk_conductive_removed", "chk_briefing",
+    "ppe.safety_helmet": ["ppe_helmet"],
+    "ppe.hrc_suit": ["ppe_hrc_suit"],
+    "ppe.respirators": ["ppe_respirators", "ppe_respirator"],
+    "ppe.full_body_safety_harness": ["ppe_harness"],
+    "ppe.safety_shoes": ["ppe_shoes"],
+    "ppe.electrical_mat": ["ppe_electrical_mat"],
+    "ppe.dust_masks": ["ppe_dust_mask"],
+    "ppe.lifeline_anchor_point": ["ppe_lifeline"],
+    "ppe.reflective_vest": ["ppe_reflective_vest"],
+    "ppe.face_shield_with_arc_protection": ["ppe_face_shield"],
+    "ppe.ear_plugs_muffs": ["ppe_ear_plugs"],
+    "ppe.cut_resistant_gloves": ["ppe_cut_gloves"],
+    "ppe.safety_goggles": ["ppe_goggles"],
+    "ppe.insulated_hand_tools": ["ppe_insulated_tools"],
+    "ppe.electrical_hand_gloves": ["ppe_electrical_gloves"],
+    "ppe.if_others_text": ["ppe_others_text"],
+    # Precautions
+    "precautions.electrical_isolation": ["sp_electrical_isolation"],
+    "precautions.fire_extinguisher_first_aid": ["sp_fire_extinguisher"],
+    "precautions.proper_isolation": ["sp_proper_isolation"],
+    "precautions.authorized_competent_personnel": ["sp_authorized_personnel"],
+    "precautions.lockout_tagout": ["sp_loto"],
+    "precautions.warning_signage_barricading": ["sp_signage"],
+    "precautions.rescue_equipment_at_site": ["sp_rescue_equipment"],
+    "precautions.zero_voltage_ensure": ["sp_zero_voltage"],
+    "precautions.proper_earthing_grounding": ["sp_earthing"],
+    "precautions.pre_job_meeting": ["sp_pre_job_meeting"],
+    "precautions.insulated_tools": ["sp_insulated_tools"],
+    "precautions.proper_illumination": ["sp_illumination"],
+    "precautions.escape_route_clear": ["sp_escape_route"],
+    "precautions.if_others_text": ["sp_others_text"],
+    # Associated permits / documents (S1 stores booleans only)
+    "permits.hot_work_permit_no": ["ap_hot_work"],
+    "permits.work_at_night_permit_no": ["ap_night_work"],
+    "permits.work_at_height_permit_no": ["ap_height_work"],
+    "permits.general_work_permit_no": ["ap_general_work"],
+    "permits.excavation_work_permit_no": ["ap_excavation"],
+    "permits.lifting_plan_permit_no": ["ap_lifting"],
+    "permits.loto_permit_no": ["ap_loto"],
+    "permits.confined_space_permit_no": ["ap_confined_space"],
+    "permits.if_others_text": ["ap_others_text"],
+    # Tools / equipment
+    "tools_equipment.list_text": ["tools_equipment"],
+    # Issuer checks (tri-state values: "Y"/"N"/"NA")
+    "issuer_checks.jsa_carried_out": ["chk_jsa"],
+    "issuer_checks.environment_condition_suitable": ["chk_environment"],
+    "issuer_checks.equipment_deenergized_loto": ["chk_loto"],
+    "issuer_checks.firefighting_equipment_available": ["chk_fire_fighting"],
+    "issuer_checks.energized_work_ppe_procedure": ["chk_energized_ppe"],
+    "issuer_checks.rescue_equipment_available": ["chk_rescue"],
+    "issuer_checks.workers_fit_trained_qualified": ["chk_workers_fit"],
+    "issuer_checks.equipment_grounded": ["chk_grounded"],
+    "issuer_checks.tools_fit_for_voltage": ["chk_tools"],
+    "issuer_checks.adequate_lighting": ["chk_lighting"],
+    "issuer_checks.rescue_plan_available": ["chk_rescue_plan"],
+    "issuer_checks.warning_signage_available": ["chk_signage"],
+    "issuer_checks.testing_equipment_compatible": ["chk_testing_equipment"],
+    "issuer_checks.conductive_items_removed": ["chk_conductive_removed"],
+    "issuer_checks.line_clearance_taken": ["chk_line_clearance"],
+    "issuer_checks.safety_requirements_explained": ["chk_briefing"],
+    # People (names/dates are stored across S1/S2/S3)
+    "people.permit_receiver.name": ["receiver_name"],
+    "people.permit_receiver.signature": ["receiver_signature"],
+    "people.permit_receiver.datetime": ["receiver_datetime"],
+    "people.permit_holder.name": ["permit_holder_name", "holder_name"],
+    "people.permit_holder.signature": ["holder_signature"],
+    "people.permit_holder.datetime": ["permit_holder_datetime", "holder_datetime"],
+    "people.permit_issuer.name": ["permit_issuer_name", "issuer_name"],
+    "people.permit_issuer.signature": ["issuer_signature"],
+    "people.permit_issuer.datetime": ["permit_issuer_datetime", "issuer_datetime"],
+    "people.co_workers.1": ["coworker_1"],
+    "people.co_workers.2": ["coworker_2"],
+    "people.co_workers.3": ["coworker_3"],
+    "people.co_workers.4": ["coworker_4"],
+    "people.co_workers.5": ["coworker_5"],
+    "people.co_workers.6": ["coworker_6"],
+    # Extension / Closure (legacy flat keys from earlier overlay)
+    "extension.date": ["ext_date"],
+    "extension.time_from": ["ext_from_time"],
+    "extension.time_to": ["ext_to_time"],
+    "extension.permit_holder.name": ["ext_holder_name"],
+    "extension.permit_holder.signature": ["ext_holder_signature"],
+    "extension.permit_receiver.name": ["ext_receiver_name"],
+    "extension.permit_receiver.signature": ["ext_receiver_signature"],
+    "extension.permit_issuer.name": ["ext_issuer_name"],
+    "extension.permit_issuer.signature": ["ext_issuer_signature"],
+    "extension.remarks": ["ext_remarks"],
+    "closure.permit_receiver.name": ["closure_receiver"],
+    "closure.permit_receiver.signature": ["closure_receiver_signature"],
+    "closure.permit_receiver.datetime": ["closure_receiver_datetime"],
+    "closure.permit_holder.name": ["closure_holder"],
+    "closure.permit_holder.signature": ["closure_holder_signature"],
+    "closure.permit_holder.datetime": ["closure_holder_datetime"],
+    "closure.permit_issuer.name": ["closure_issuer"],
+    "closure.permit_issuer.signature": ["closure_issuer_signature"],
+    "closure.permit_issuer.datetime": ["closure_issuer_datetime"],
 }
 
-# Global coordinate offset to correct template margin/scale mismatch.
-# Apply this to every drawString/textLine/tick (do not change individual coords).
-X_OFFSET = -6
-Y_OFFSET = 20
+# Approved stamp position (kept identical to previous behavior; offsets were baked in)
+_APPROVED_STAMP_X = 374
+_APPROVED_STAMP_Y = 790
+_APPROVED_STAMP_DATE_Y = 772
 
 
 def _draw_approved_stamp(canvas_obj: Any, approved_datetime: Any) -> None:
@@ -1309,8 +1440,8 @@ def _draw_approved_stamp(canvas_obj: Any, approved_datetime: Any) -> None:
     Condition is handled by caller.
     Data source: form_data["date_s3_approved"]
     """
-    stamp_x = 380 + X_OFFSET
-    stamp_y = 770 + Y_OFFSET
+    stamp_x = _APPROVED_STAMP_X
+    stamp_y = _APPROVED_STAMP_Y
 
     # "APPROVED" in green
     canvas_obj.setFont("Helvetica-Bold", 16)
@@ -1322,7 +1453,7 @@ def _draw_approved_stamp(canvas_obj: Any, approved_datetime: Any) -> None:
     canvas_obj.setFillColorRGB(0, 0, 0)
     canvas_obj.drawString(
         stamp_x,
-        752 + Y_OFFSET,
+        _APPROVED_STAMP_DATE_Y,
         f"Date: {'' if approved_datetime is None else str(approved_datetime)}",
     )
 
@@ -1364,74 +1495,178 @@ def _is_truthy(val: Any) -> bool:
 
 def _prepare_overlay_data(form_data: dict) -> dict:
     """
-    Prepare form_data for PDF overlay rendering.
-    - Split work_description into lines
-    - Split tools_equipment into lines
-    - Normalize checkbox values
+    Prepare a read-only overlay data dict keyed by PTW_PDF_COORDINATES dotted tags.
+
+    IMPORTANT:
+    - Does NOT mutate or change the DB/UI schema.
+    - Uses _PTW_TAG_SOURCES to map existing flat form_data into dotted overlay tags.
     """
-    data = dict(form_data)
-    
-    # Split work_description into two lines (max ~60 chars per line)
-    work_desc = str(data.get("work_description", "") or "")
-    if len(work_desc) > 60:
-        # Try to split at a space near the middle
-        split_idx = work_desc.rfind(" ", 0, 60)
-        if split_idx == -1:
-            split_idx = 60
-        data["work_description_line1"] = work_desc[:split_idx].strip()
-        data["work_description_line2"] = work_desc[split_idx:].strip()
-    else:
-        data["work_description_line1"] = work_desc
-        data["work_description_line2"] = ""
-    
-    # Split tools_equipment into three lines
-    tools = str(data.get("tools_equipment", "") or "")
-    lines = []
-    while tools and len(lines) < 3:
-        if len(tools) <= 70:
-            lines.append(tools)
-            break
-        split_idx = tools.rfind(" ", 0, 70)
-        if split_idx == -1:
-            split_idx = 70
-        lines.append(tools[:split_idx].strip())
-        tools = tools[split_idx:].strip()
-    while len(lines) < 3:
-        lines.append("")
-    data["tools_equipment_line1"] = lines[0]
-    data["tools_equipment_line2"] = lines[1]
-    data["tools_equipment_line3"] = lines[2]
-    
-    # Handle PPE field name variations (ppe_respirator vs ppe_respirators)
-    if "ppe_respirator" in data and "ppe_respirators" not in data:
-        data["ppe_respirators"] = data["ppe_respirator"]
-    
-    return data
+    fd = form_data if isinstance(form_data, dict) else {}
+    out: dict[str, Any] = {}
+
+    for tag in PTW_PDF_COORDINATES.keys():
+        sources = _PTW_TAG_SOURCES.get(tag, [])
+        val = None
+        for k in sources:
+            if k in fd:
+                val = fd.get(k)
+                # Keep explicit False/0 for checkbox-ish fields; empties get filtered at render-time
+                break
+        out[tag] = val
+
+    return out
 
 
-def _create_overlay_page(canvas_obj: Any, page_coords: dict, data: dict, font_size: int = 10) -> None:
-    """
-    Draw text/checkmarks on a ReportLab canvas for one page.
-    """
-    for key, (x, y) in page_coords.items():
-        val = data.get(key)
-        if val is None:
-            continue
-        
-        # Checkbox fields: render ✔ if truthy
-        if key in _CHECKBOX_FIELDS:
-            if _is_truthy(val):
-                canvas_obj.setFont("Helvetica-Bold", font_size + 2)
-                canvas_obj.drawString(x + X_OFFSET, y + Y_OFFSET, "✔")
+def _ptw_wrap_text_to_width(text: str, *, font_name: str, font_size: int, max_width: float) -> list[str]:
+    """Wrap text into lines that fit max_width using ReportLab string metrics."""
+    try:
+        from reportlab.pdfbase import pdfmetrics  # type: ignore
+    except Exception:
+        # Fallback: crude wrap by characters
+        import textwrap
+        return textwrap.wrap(text, width=max(1, int(max_width // 5))) or [text]
+
+    words = (text or "").replace("\r", " ").split()
+    if not words:
+        return []
+
+    lines: list[str] = []
+    cur = words[0]
+    for w in words[1:]:
+        candidate = f"{cur} {w}"
+        if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+            cur = candidate
         else:
-            # Text fields
-            text = str(val).strip()
-            if text:
-                canvas_obj.setFont("Helvetica", font_size)
-                # Truncate very long text to prevent overflow
-                if len(text) > 80:
-                    text = text[:77] + "..."
-                canvas_obj.drawString(x + X_OFFSET, y + Y_OFFSET, text)
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    return lines
+
+
+def _ptw_draw_centered_text(
+    canvas_obj: Any,
+    *,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    text: str,
+    font_name: str = "Helvetica-Bold",
+    font_size: int = 10,
+) -> None:
+    """Draw a short text centered in the given rectangle."""
+    try:
+        from reportlab.pdfbase import pdfmetrics  # type: ignore
+        tw = float(pdfmetrics.stringWidth(text, font_name, font_size))
+    except Exception:
+        tw = float(len(text) * (font_size * 0.6))
+    tx = float(x) + max(0.0, (float(w) - tw) / 2.0)
+    ty = float(y) + max(0.0, (float(h) - float(font_size)) / 2.0)
+    canvas_obj.setFont(font_name, font_size)
+    canvas_obj.drawString(tx, ty, text)
+
+
+def _ptw_draw_text_in_box(
+    canvas_obj: Any,
+    *,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    text: str,
+    multiline: bool,
+    font_name: str = "Helvetica",
+    font_size: int = 9,
+) -> None:
+    """Draw text inside a rectangular box; clips/wraps to fit."""
+    s = ("" if text is None else str(text)).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return
+
+    canvas_obj.setFont(font_name, font_size)
+
+    if multiline:
+        lines = []
+        for para in s.split("\n"):
+            para = para.strip()
+            if not para:
+                lines.append("")
+                continue
+            lines.extend(_ptw_wrap_text_to_width(para, font_name=font_name, font_size=font_size, max_width=float(w)))
+
+        line_h = float(font_size) + 1.0
+        max_lines = max(1, int(float(h) // line_h))
+        lines = lines[:max_lines]
+
+        # Draw from top down within the box
+        y_top = float(y) + float(h) - float(font_size)
+        for i, line in enumerate(lines):
+            yy = y_top - (i * line_h)
+            if yy < float(y):
+                break
+            canvas_obj.drawString(float(x), yy, line)
+        return
+
+    # Single-line: clip with ellipsis if needed
+    try:
+        from reportlab.pdfbase import pdfmetrics  # type: ignore
+
+        if pdfmetrics.stringWidth(s, font_name, font_size) > float(w):
+            ell = "…"
+            # Ensure ellipsis fits
+            while s and pdfmetrics.stringWidth(s + ell, font_name, font_size) > float(w):
+                s = s[:-1]
+            s = (s + ell) if s else ""
+    except Exception:
+        # Crude truncation fallback
+        max_chars = max(1, int(float(w) // (font_size * 0.6)))
+        if len(s) > max_chars:
+            s = s[: max(1, max_chars - 1)] + "…"
+
+    yy = float(y) + max(1.0, (float(h) - float(font_size)) / 2.0)
+    canvas_obj.drawString(float(x), yy, s)
+
+
+def _render_ptw_overlay_page(canvas_obj: Any, *, page_num: int, data: dict) -> None:
+    """
+    Render overlay content for a single page using PTW_PDF_COORDINATES.
+    """
+    for tag, cfg in PTW_PDF_COORDINATES.items():
+        if int(cfg.get("page", 0)) != int(page_num):
+            continue
+
+        v = (data or {}).get(tag)
+        if v is None:
+            continue
+
+        x = float(cfg.get("x", 0))
+        y = float(cfg.get("y", 0))
+        w = float(cfg.get("width", 0))
+        h = float(cfg.get("height", 0))
+        typ = str(cfg.get("type") or "text").strip().lower()
+
+        if typ == "checkbox":
+            if _is_truthy(v):
+                # Center a checkmark in the provided rectangle
+                fs = max(8, min(14, int(h) + 2))
+                _ptw_draw_centered_text(canvas_obj, x=x, y=y, w=w, h=h, text="✓", font_name="Helvetica-Bold", font_size=fs)
+            continue
+
+        if typ == "tri_state":
+            s = str(v).strip().upper()
+            if s in {"Y", "N", "NA"}:
+                _ptw_draw_centered_text(canvas_obj, x=x, y=y, w=w, h=h, text=s, font_name="Helvetica-Bold", font_size=9)
+            continue
+
+        if typ == "multiline":
+            _ptw_draw_text_in_box(canvas_obj, x=x, y=y, w=w, h=h, text=str(v), multiline=True, font_name="Helvetica", font_size=8)
+            continue
+
+        # default: text
+        _ptw_draw_text_in_box(canvas_obj, x=x, y=y, w=w, h=h, text=str(v), multiline=False, font_name="Helvetica", font_size=9)
+
+
+    return
 
 
 def generate_ptw_pdf_from_template(form_data: dict, *, progress_callback=None) -> bytes:
@@ -1494,23 +1729,17 @@ def generate_ptw_pdf_from_template(form_data: dict, *, progress_callback=None) -
     # Create overlay PDF with ReportLab (one page per template page)
     overlay_buffer = BytesIO()
     c = rl_canvas.Canvas(overlay_buffer, pagesize=A4)
-    
-    # Page coordinate mappings
-    page_coords_list = [
-        _PDF_COORDS_PAGE1,
-        _PDF_COORDS_PAGE2,
-        _PDF_COORDS_PAGE3,
-    ]
-    
+
     for page_idx in range(num_pages):
-        if page_idx < len(page_coords_list):
-            _create_overlay_page(c, page_coords_list[page_idx], data)
-            # APPROVED stamp (page 1 only), in the new PDF pipeline
-            if (
-                page_idx == 0
-                and str(form_data.get("status", "")).strip().upper() == "APPROVED"
-            ):
-                _draw_approved_stamp(c, form_data.get("date_s3_approved"))
+        _render_ptw_overlay_page(c, page_num=page_idx + 1, data=data)
+
+        # APPROVED stamp (page 1 only), in the PDF overlay pipeline
+        if (
+            page_idx == 0
+            and str(form_data.get("status", "")).strip().upper() == "APPROVED"
+        ):
+            _draw_approved_stamp(c, form_data.get("date_s3_approved"))
+
         c.showPage()
     
     c.save()
@@ -2475,20 +2704,21 @@ def _render_view_work_order() -> None:
         # Flag allows next rerun to mount progress UI immediately before any heavy work.
         st.session_state["s1_wo_run_fetch"] = True
 
-    with st.form("s1_view_work_orders_filters", clear_on_submit=False):
-        c1, c2, c3, c4, c5 = st.columns([2.0, 1.3, 1.3, 1.4, 1.4], vertical_alignment="bottom")
-        with c1:
-            site_name = st.selectbox("Site Name", options=site_options, index=0, key="s1_wo_site")
-        with c2:
-            start_date = st.date_input("Start Date", value=None, key="s1_wo_start")
-        with c3:
-            end_date = st.date_input("End Date", value=None, key="s1_wo_end")
-        with c4:
-            location = st.selectbox("Location", options=loc_options, index=0, key="s1_wo_location")
-        with c5:
-            status_ui = st.selectbox("Status", options=status_options, index=0, key="s1_wo_status")
+    # Filters OUTSIDE form to prevent Enter key triggering submit
+    c1, c2, c3, c4, c5 = st.columns([2.0, 1.3, 1.3, 1.4, 1.4], vertical_alignment="bottom")
+    with c1:
+        site_name = st.selectbox("Site Name", options=site_options, index=0, key="s1_wo_site")
+    with c2:
+        start_date = st.date_input("Start Date", value=None, key="s1_wo_start")
+    with c3:
+        end_date = st.date_input("End Date", value=None, key="s1_wo_end")
+    with c4:
+        location = st.selectbox("Location", options=loc_options, index=0, key="s1_wo_location")
+    with c5:
+        status_ui = st.selectbox("Status", options=status_options, index=0, key="s1_wo_status")
 
-        submitted = st.form_submit_button("Submit", on_click=_on_s1_wo_submit_click)
+    # Submit button (no form wrapper)
+    submitted = st.button("Submit", type="primary", on_click=_on_s1_wo_submit_click)
 
     # If Submit was clicked, do the fetch with progress mounted at the top.
     if submitted or st.session_state.get("s1_wo_run_fetch"):
@@ -2595,9 +2825,9 @@ def _render_view_work_order() -> None:
             f"""
             <div class="kpi-row">
               <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:#2563eb;">{total}</div></div>
-              <div class="kpi-card"><div class="kpi-title">REJECTED</div><div class="kpi-value" style="color:#dc2626;">{c_rej}</div></div>
-              <div class="kpi-card"><div class="kpi-title">OPEN</div><div class="kpi-value" style="color:#16a34a;">{c_open}</div></div>
-              <div class="kpi-card"><div class="kpi-title">WIP</div><div class="kpi-value" style="color:#f97316;">{c_wip}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:#dc2626;">{c_rej}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:#16a34a;">{c_open}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:#f97316;">{c_wip}</div></div>
               <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{c_approved}</div></div>
             </div>
             """,
@@ -2605,8 +2835,12 @@ def _render_view_work_order() -> None:
         )
 
         # Table with styling
+        df_display = df.copy()
+        df_display["status"] = df_display["status"].astype("string").fillna("").map(
+            lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s))
+        )
         styled = (
-            df.style.map(_highlight_open_status, subset=["status"])
+            df_display.style.map(_highlight_open_status, subset=["status"])
             .set_table_styles(
                 [
                     {"selector": "th", "props": [("font-weight", "800"), ("color", "#0f172a")]},
@@ -2852,11 +3086,18 @@ def _render_request_ptw() -> None:
         wo_details = st.session_state.get("ptw_wo_details") or None
         site_name_display = ""
         work_location_display = ""
+        permit_validity_display = ""
+        
         if isinstance(wo_details, dict) and wo_details:
-            site_name_display = wo_details.get("site_name", "") or ""
-            location = wo_details.get("location", "") or ""
-            equipment = wo_details.get("equipment", "") or ""
+            site_name_display = str(wo_details.get("site_name", "") or "")
+            location = str(wo_details.get("location", "") or "")
+            equipment = str(wo_details.get("equipment", "") or "")
             work_location_display = f"{location}-{equipment}" if location and equipment else location or equipment
+            
+            # Extract date_planned for Permit Validity Date
+            date_planned = wo_details.get("date_planned")
+            if date_planned:
+                permit_validity_display = pd.to_datetime(date_planned).strftime("%d-%m-%Y")
 
         # Persist auto-filled values for submit handler (UI-only ordering; same values)
         if selected_wo_id:
@@ -2868,9 +3109,9 @@ def _render_request_ptw() -> None:
             st.session_state["ptw_site_name"] = ""
             st.session_state["ptw_work_location"] = ""
 
-        # Display auto-filled fields (read-only)
+        # Display auto-filled fields (read-only) - OUTSIDE form for reactive updates
         st.markdown("---")
-        st.caption("The following fields are auto-filled from the selected Work Order:")
+        st.markdown("##### The following fields are auto-filled from the selected Work Order:")
 
         col_site, col_loc, col_validity = st.columns(3)
         with col_site:
@@ -2878,23 +3119,18 @@ def _render_request_ptw() -> None:
                 "Project / Site Name",
                 value=site_name_display,
                 disabled=True,
-                key="ptw_site_display",
-                help="Auto-filled from Work Order",
             )
         with col_loc:
             st.text_input(
                 "Work Location",
                 value=work_location_display,
                 disabled=True,
-                key="ptw_location_display",
-                help="Derived as: location-equipment from Work Order",
             )
         with col_validity:
-            st.date_input(
+            st.text_input(
                 "Permit Validity Date",
-                value=date.today(),
-                key="ptw_validity_date",
-                help="Default: Today's date",
+                value=permit_validity_display,
+                disabled=True,
             )
 
         st.caption("Start Time and End Time are automatically recorded when you submit the PTW (End = Start + 8 hours).")
@@ -2906,7 +3142,14 @@ def _render_request_ptw() -> None:
 
         # Read from session after selector block (fragment-safe)
         selected_wo_id = st.session_state.get("ptw_selected_wo_id")
-        permit_validity_date = st.session_state.get("ptw_validity_date", date.today())
+        
+        # Extract permit_validity_date from work order details (backend-derived, NOT user input)
+        permit_validity_date = date.today()  # fallback
+        wo_details = st.session_state.get("ptw_wo_details")
+        if isinstance(wo_details, dict) and wo_details:
+            date_planned = wo_details.get("date_planned")
+            if date_planned:
+                permit_validity_date = pd.to_datetime(date_planned).date()
 
         # Check if we can proceed with the form
         if not selected_wo_id:
@@ -2957,10 +3200,18 @@ def _render_request_ptw() -> None:
             work_order_id = _ss("ptw_selected_wo_id", "")
             site_name = _ss("ptw_site_name", "")
             work_location = _ss("ptw_work_location", "")
+            
+            # Extract permit_validity_date from work order details (backend-derived)
+            permit_validity_date = date.today()  # fallback
+            wo_details = _ss("ptw_wo_details", None)
+            if isinstance(wo_details, dict) and wo_details:
+                date_planned = wo_details.get("date_planned")
+                if date_planned:
+                    permit_validity_date = pd.to_datetime(date_planned).date()
 
             _handle_ptw_submit(
                 work_order_id=work_order_id,
-                permit_validity_date=_ss("ptw_validity_date", date.today()),
+                permit_validity_date=permit_validity_date,  # Backend-derived from date_planned
                 site_name=site_name,
                 work_location=work_location,
                 work_description=_ss("ptw_work_desc", ""),
@@ -3086,8 +3337,8 @@ def _render_request_ptw() -> None:
         st.markdown('<div class="section-title">📋 Work Details</div>', unsafe_allow_html=True)
         work_description = st.text_area("Description of Work *", height=100, key="ptw_work_desc", 
                                          placeholder="Describe the work to be performed...")
-        contractor_name = st.text_input("Contractor Name", key="ptw_contractor",
-                                        placeholder="Enter contractor/company name")
+        contractor_name = st.text_area("Contractor Name", key="ptw_contractor",
+                                        placeholder="Enter contractor/company name", height=38)
 
         st.divider()
 
@@ -3119,7 +3370,7 @@ def _render_request_ptw() -> None:
             hz_wildlife = st.checkbox("Wildlife", key="hz_wildlife")
             hz_lightning = st.checkbox("Lightning", key="hz_lightning")
 
-        hz_others_text = st.text_input("Other Hazards (if any)", key="hz_others_text")
+        hz_others_text = st.text_area("Other Hazards (if any)", key="hz_others_text", height=38)
 
         st.divider()
 
@@ -3146,7 +3397,7 @@ def _render_request_ptw() -> None:
         with rk_cols[3]:
             rk_back_injury = st.checkbox("Back injury", key="rk_back_injury")
 
-        rk_others_text = st.text_input("Other Risks (if any)", key="rk_others_text")
+        rk_others_text = st.text_area("Other Risks (if any)", key="rk_others_text", height=38)
 
         st.divider()
 
@@ -3175,7 +3426,7 @@ def _render_request_ptw() -> None:
             ppe_dust_mask = st.checkbox("Dust Mask", key="ppe_dust_mask")
             ppe_ear_plugs = st.checkbox("Ear Plugs", key="ppe_ear_plugs")
 
-        ppe_others_text = st.text_input("Other PPE (if any)", key="ppe_others_text")
+        ppe_others_text = st.text_area("Other PPE (if any)", key="ppe_others_text", height=38)
 
         st.divider()
 
@@ -3202,7 +3453,7 @@ def _render_request_ptw() -> None:
         with sp_cols[3]:
             sp_illumination = st.checkbox("Adequate illumination", key="sp_illumination")
 
-        sp_others_text = st.text_input("Other Precautions (if any)", key="sp_others_text")
+        sp_others_text = st.text_area("Other Precautions (if any)", key="sp_others_text", height=38)
 
         st.divider()
 
@@ -3223,7 +3474,7 @@ def _render_request_ptw() -> None:
             ap_excavation = st.checkbox("Excavation Permit", key="ap_excavation")
             ap_confined_space = st.checkbox("Confined Space Permit", key="ap_confined_space")
 
-        ap_others_text = st.text_input("Other Permits (if any)", key="ap_others_text")
+        ap_others_text = st.text_area("Other Permits (if any)", key="ap_others_text", height=38)
 
         st.divider()
 
@@ -3285,16 +3536,16 @@ def _render_request_ptw() -> None:
 
         ppl_col1, ppl_col2, ppl_col3 = st.columns(3)
         with ppl_col1:
-            receiver_name = st.text_input("Permit Receiver Name *", key="ptw_receiver")
-            coworker_1 = st.text_input("Co-worker 1", key="ptw_coworker1")
+            receiver_name = st.text_area("Permit Receiver Name *", key="ptw_receiver", height=38)
+            coworker_1 = st.text_area("Co-worker 1", key="ptw_coworker1", height=38)
         with ppl_col2:
-            coworker_2 = st.text_input("Co-worker 2", key="ptw_coworker2")
-            coworker_3 = st.text_input("Co-worker 3", key="ptw_coworker3")
+            coworker_2 = st.text_area("Co-worker 2", key="ptw_coworker2", height=38)
+            coworker_3 = st.text_area("Co-worker 3", key="ptw_coworker3", height=38)
         with ppl_col3:
-            coworker_4 = st.text_input("Co-worker 4", key="ptw_coworker4")
-            coworker_5 = st.text_input("Co-worker 5", key="ptw_coworker5")
+            coworker_4 = st.text_area("Co-worker 4", key="ptw_coworker4", height=38)
+            coworker_5 = st.text_area("Co-worker 5", key="ptw_coworker5", height=38)
 
-        coworker_6 = st.text_input("Co-worker 6", key="ptw_coworker6")
+        coworker_6 = st.text_area("Co-worker 6", key="ptw_coworker6", height=38)
 
         st.divider()
 
@@ -3551,6 +3802,11 @@ def _handle_ptw_submit(**kwargs) -> None:
         # Full visual reset (widgets) after SUCCESS only
         _reset_ptw_form_state()
         
+        # Clear cache to ensure View Work Order shows updated status immediately
+        st.cache_data.clear()
+        st.session_state["s1_wo_last_df"] = None
+        st.session_state["s1_wo_last_kpis"] = None
+        
         # Rerun to show success screen
         st.rerun()
 
@@ -3628,10 +3884,17 @@ def _render_view_applied_ptw() -> None:
         # Display summary
         st.metric("Total PTW Requests", len(df))
 
-        # Format for display
-        display_df = df[["permit_no", "site_name", "status", "created_at", "created_by"]].copy()
-        display_df["created_at"] = pd.to_datetime(display_df["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
-        display_df.columns = ["Permit No", "Site Name", "Status", "Created At", "Created By"]
+        # Format for display (lifecycle clock = work_orders.date_s1_created)
+        cols = ["permit_no", "site_name", "status", "date_s1_created", "created_by"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = pd.NA
+        display_df = df[cols].copy()
+        display_df["date_s1_created"] = pd.to_datetime(display_df["date_s1_created"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+        display_df["status"] = display_df["status"].astype("string").fillna("").map(
+            lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s))
+        )
+        display_df.columns = ["Permit No", "Site Name", "Status", "Submitted At", "Created By"]
 
         # Apply color-coded status styling
         styled = (

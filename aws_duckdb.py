@@ -16,21 +16,107 @@ except Exception:
     _HAS_STREAMLIT = False
 
 
+_SECRETS_DEBUG = str(os.getenv("ZELES_SECRETS_DEBUG", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+_CLI_SECRETS_CACHE: Optional[dict] = None
+_CLI_SECRETS_SOURCE: Optional[str] = None
+
+
+def _secrets_debug(msg: str) -> None:
+    # Non-sensitive debug logging (presence + source only)
+    if _SECRETS_DEBUG:
+        print(f"[secrets] {msg}", flush=True)
+
+
+def _load_cli_secrets() -> dict:
+    """
+    Best-effort loader for `.streamlit/secrets.toml` when running outside Streamlit.
+    Never logs secret values.
+    """
+    global _CLI_SECRETS_CACHE, _CLI_SECRETS_SOURCE
+    if _CLI_SECRETS_CACHE is not None:
+        return _CLI_SECRETS_CACHE
+
+    candidates = [
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+        Path.cwd() / ".streamlit" / "secrets.toml",
+        Path.home() / ".streamlit" / "secrets.toml",
+    ]
+
+    secrets: dict = {}
+    source: Optional[str] = None
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                try:
+                    import tomllib as _toml  # py3.11+
+                except Exception:  # pragma: no cover
+                    import tomli as _toml  # type: ignore[import-not-found]
+
+                txt = p.read_text(encoding="utf-8")
+                secrets = dict(_toml.loads(txt) or {})
+                source = str(p)
+                break
+        except Exception as e:
+            _secrets_debug(f"secrets.toml read failed at {p}: {type(e).__name__}")
+            continue
+
+    _CLI_SECRETS_CACHE = secrets
+    _CLI_SECRETS_SOURCE = source
+    if source:
+        _secrets_debug(f"loaded secrets.toml from {source}")
+    else:
+        _secrets_debug("no secrets.toml found in expected locations")
+    return _CLI_SECRETS_CACHE
+
+
+def _lookup_key(mapping: object, key: str) -> Optional[object]:
+    if not isinstance(mapping, dict):
+        return None
+    if key in mapping:
+        return mapping.get(key)
+    for v in mapping.values():
+        if isinstance(v, dict):
+            found = _lookup_key(v, key)
+            if found is not None:
+                return found
+    return None
+
+
 def _get_secret(name: str) -> Optional[str]:
     """
     Read secrets from Streamlit if available; fallback to env vars.
     Never logs secret values.
     """
+    # 1) Streamlit secrets (preferred)
     try:
         import streamlit as st  # type: ignore
 
         v = st.secrets.get(name)  # type: ignore[attr-defined]
-        if v is not None and str(v).strip() != "":
+        ok = v is not None and str(v).strip() != ""
+        _secrets_debug(f"streamlit secrets: {name} => {'FOUND' if ok else 'NOT FOUND'}")
+        if ok:
             return str(v)
-    except Exception:
-        pass
+    except Exception as e:
+        _secrets_debug(f"streamlit secrets unavailable for {name}: {type(e).__name__}")
+
+    # 1b) CLI compatibility: load `.streamlit/secrets.toml` directly if Streamlit isn't active
+    try:
+        cli_secrets = _load_cli_secrets()
+        v_file = _lookup_key(cli_secrets, name)
+        ok_file = v_file is not None and str(v_file).strip() != ""
+        _secrets_debug(
+            f"secrets.toml ({_CLI_SECRETS_SOURCE or 'none'}): {name} => {'FOUND' if ok_file else 'NOT FOUND'}"
+        )
+        if ok_file:
+            return str(v_file)
+    except Exception as e:
+        _secrets_debug(f"secrets.toml lookup failed for {name}: {type(e).__name__}")
+
+    # 2) Environment variables
     v2 = os.getenv(name)
-    return v2 if v2 and v2.strip() != "" else None
+    ok_env = bool(v2 and v2.strip() != "")
+    _secrets_debug(f"env var: {name} => {'FOUND' if ok_env else 'NOT FOUND'}")
+    return v2 if ok_env else None
 
 
 def _get_s3_etag(

@@ -40,6 +40,7 @@ from S1 import (
     TABLE_PTW_REQUESTS,
     TABLE_PTW_TEMPLATES,
     UI_STATUSES,
+    DB_STATUS_TO_UI,
     STATUS_ORDER,
     derive_ptw_status,
     _list_sites_from_work_orders,
@@ -577,13 +578,11 @@ def _fetch_ptw_for_s2(
     start_dt = datetime.combine(start_date, datetime.min.time())
     end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
     
-    # Fetch PTW requests
+    # Fetch PTW requests (date filtering is based on work_orders.date_s1_created, not ptw_requests.created_at)
     q = sb.table(TABLE_PTW_REQUESTS).select(
         "ptw_id,permit_no,site_name,status,created_at,created_by,form_data"
     )
     
-    q = q.gte("created_at", start_dt.isoformat())
-    q = q.lt("created_at", end_dt.isoformat())
     q = q.order("created_at", desc=True)
     
     resp = q.execute()
@@ -620,10 +619,14 @@ def _fetch_ptw_for_s2(
             
             # Filter to only those with date_s1_created (PTW actually submitted)
             wo_df = wo_df[wo_df["date_s1_created"].notna()]
+            # Apply date range filter using work_orders.date_s1_created (lifecycle clock)
+            s1_ts = pd.to_datetime(wo_df["date_s1_created"], errors="coerce")
+            wo_df = wo_df[(s1_ts >= start_dt) & (s1_ts < end_dt)]
             
             # Create lookup dicts
             status_lookup = {}
             s2_forwarded_lookup = {}
+            s3_approved_lookup = {}
             isolation_lookup = {}
             location_lookup = {}
             
@@ -635,6 +638,7 @@ def _fetch_ptw_for_s2(
                     derived = "APPROVED"
                 status_lookup[woid] = derived
                 s2_forwarded_lookup[woid] = row.get("date_s2_forwarded")
+                s3_approved_lookup[woid] = row.get("date_s3_approved")
                 isolation_lookup[woid] = row.get("isolation_requirement")
                 location_lookup[woid] = f"{row.get('location', '')}-{row.get('equipment', '')}"
             
@@ -642,12 +646,18 @@ def _fetch_ptw_for_s2(
             valid_wo_ids = set(wo_df["work_order_id"].tolist())
             df = df[df["permit_no"].isin(valid_wo_ids)]
             
-            # Apply derived status
+            # Apply derived status and date fields onto PTW dataframe
             df["status"] = df["permit_no"].map(status_lookup).fillna("OPEN")
             df["date_s2_forwarded"] = df["permit_no"].map(s2_forwarded_lookup)
+            df["date_s3_approved"] = df["permit_no"].map(s3_approved_lookup)
             df["isolation_requirement"] = df["permit_no"].map(isolation_lookup)
             df["work_location"] = df["permit_no"].map(location_lookup)
     
+    # Ensure expected columns exist to avoid KeyError downstream
+    if "date_s2_forwarded" not in df.columns:
+        df["date_s2_forwarded"] = pd.NA
+    if "date_s3_approved" not in df.columns:
+        df["date_s3_approved"] = pd.NA
     return df
 
 
@@ -665,6 +675,23 @@ def _update_ptw_form_data(ptw_id: str, form_data: dict) -> None:
     err = getattr(resp, "error", None)
     if err:
         raise RuntimeError(f"Failed to update PTW form data: {err}")
+
+
+def _persist_form_data_silently(*, ptw_id: str, form_data: dict) -> None:
+    """
+    Silent autosave for field changes.
+    No progress bar.
+    No UI messaging.
+    Autosave failures should NOT interrupt user input.
+    """
+    try:
+        sb = get_supabase_client(prefer_service_role=True)
+        sb.table(TABLE_PTW_REQUESTS).update(
+            {"form_data": form_data}
+        ).eq("ptw_id", ptw_id).execute()
+    except Exception:
+        # Autosave failures should NOT interrupt user input
+        pass
 
 
 def _update_work_order_s2_forwarded(
@@ -895,9 +922,9 @@ def _render_view_work_order_s2() -> None:
             f"""
             <div class="kpi-row">
               <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:#2563eb;">{total}</div></div>
-              <div class="kpi-card"><div class="kpi-title">REJECTED</div><div class="kpi-value" style="color:#dc2626;">{c_rej}</div></div>
-              <div class="kpi-card"><div class="kpi-title">OPEN</div><div class="kpi-value" style="color:#16a34a;">{c_open}</div></div>
-              <div class="kpi-card"><div class="kpi-title">WIP</div><div class="kpi-value" style="color:#f97316;">{c_wip}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:#dc2626;">{c_rej}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:#16a34a;">{c_open}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:#f97316;">{c_wip}</div></div>
               <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{c_approved}</div></div>
             </div>
             """,
@@ -910,8 +937,12 @@ def _render_view_work_order_s2() -> None:
         if "date_planned" in df.columns:
             df["date_planned"] = pd.to_datetime(df["date_planned"]).dt.strftime("%Y-%m-%d")
         
-        # Table with styling
-        styled = df.style.map(_highlight_status, subset=["status"]).set_table_styles(
+        # Table with styling (display labels only)
+        df_display = df.copy()
+        df_display["status"] = df_display["status"].astype("string").fillna("").map(
+            lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s))
+        )
+        styled = df_display.style.map(_highlight_status, subset=["status"]).set_table_styles(
             [{"selector": "th", "props": [("font-weight", "800"), ("color", "#0f172a")]}]
         )
         st.dataframe(styled, width="stretch", hide_index=True)
@@ -1020,19 +1051,46 @@ def _render_view_submitted_ptw_body() -> None:
         st.info("No submitted PTWs found for the selected date range.")
         return
     
-    # Summary metrics (modern KPI cards)
+    # Summary metrics (modern KPI cards, S2-aware)
     total = int(len(df))
-    wip_count = int((df["status"].astype("string").str.upper() == "WIP").sum())
-    approved_count = int(df["status"].astype("string").str.upper().isin(["CLOSED", "APPROVED"]).sum())
-    rejected_count = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
+
+    # PTWs awaiting S2 action (not forwarded yet and not rejected)
+    pending_s2_count = int(
+        (
+            df["date_s2_forwarded"].isna()
+            & ~df["status"].astype("string").str.upper().isin(["REJECTED"])
+        ).sum()
+    )
+
+    # Approved = PTWs that have been approved from S3
+    approved_count = int(df["date_s3_approved"].notna().sum())
+
+    rejected_count = int(
+        (df["status"].astype("string").str.upper() == "REJECTED").sum()
+    )
 
     st.markdown(
         f"""
         <div class="kpi-row">
-          <div class="kpi-card"><div class="kpi-title">Total PTWs</div><div class="kpi-value" style="color:#2563eb;">{total}</div></div>
-          <div class="kpi-card"><div class="kpi-title">WIP</div><div class="kpi-value" style="color:#f97316;">{wip_count}</div></div>
-          <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{approved_count}</div></div>
-          <div class="kpi-card"><div class="kpi-title">REJECTED</div><div class="kpi-value" style="color:#dc2626;">{rejected_count}</div></div>
+          <div class="kpi-card">
+            <div class="kpi-title">Total PTWs</div>
+            <div class="kpi-value" style="color:#2563eb;">{total}</div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="kpi-title">Pending at S2</div>
+            <div class="kpi-value" style="color:#f97316;">{pending_s2_count}</div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="kpi-title">Approved</div>
+            <div class="kpi-value" style="color:#10b981;">{approved_count}</div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="kpi-title">Rejected</div>
+            <div class="kpi-value" style="color:#dc2626;">{rejected_count}</div>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1040,71 +1098,188 @@ def _render_view_submitted_ptw_body() -> None:
     
     st.divider()
     
-    # Render each PTW as an expander (keep active one open to prevent "reload collapse")
-    for idx, row in df.iterrows():
+    # BUILD DROPDOWN OPTIONS FROM df
+    def _build_ptw_option(row):
+        """
+        Build dropdown label for PTW selection.
+        States (priority order):
+        - 🟢 APPROVED FROM S3 (date_s3_approved set)
+        - 🟢 FORWARDED TO S3 (date_s2_forwarded set, date_s3_approved null)
+        - PENDING AT S2 (no forwarding timestamp)
+        """
+        wo = str(row.get("permit_no", "") or "")
+        site = row.get("site_name", "")
+        created = row.get("created_at", "")
+        forwarded_ts = row.get("date_s2_forwarded")
+        approved_ts = row.get("date_s3_approved")
+
+        try:
+            created = pd.to_datetime(created).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+
+        # PRIORITY 1: Approved from S3
+        if approved_ts is not None and str(approved_ts).strip() != "":
+            return f"🟢 {wo} | {site} | APPROVED FROM S3 | {created}"
+
+        # PRIORITY 2: Forwarded to S3 (but not yet approved)
+        if forwarded_ts is not None and str(forwarded_ts).strip() != "":
+            return f"🟢 {wo} | {site} | FORWARDED TO S3 | {created}"
+
+        # PRIORITY 3: Pending at S2
+        return f"{wo} | {site} | PENDING AT S2 | {created}"
+    
+    ptw_options = {
+        _build_ptw_option(row): row
+        for _, row in df.iterrows()
+    }
+    
+    # SINGLE-PTW SELECTOR
+    st.markdown("### Select PTW to Review")
+    selected_label = st.selectbox(
+        "Choose a PTW from the list",
+        options=["(select PTW)"] + list(ptw_options.keys()),
+        index=0,
+        key="s2_selected_ptw_label",
+        label_visibility="collapsed",
+    )
+    
+    # RENDER ONLY SELECTED PTW
+    if selected_label and selected_label != "(select PTW)":
+        row = ptw_options[selected_label]
+        
         # Normalize IDs to string so UI state keys are stable across pandas/numpy dtypes.
         ptw_id = str(row.get("ptw_id", ""))
         work_order_id = str(row.get("permit_no", "") or "")
         site_name = row.get("site_name", "")
+        work_location = row.get("work_location", "")
         status = row.get("status", "OPEN")
-        created_at = row.get("created_at", "")
         form_data = row.get("form_data", {}) or {}
         date_s2_forwarded = row.get("date_s2_forwarded")
-        work_location = row.get("work_location", "")
-        
-        # Format created_at
-        if created_at:
-            try:
-                created_at = pd.to_datetime(created_at).strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                pass
         
         # Check if already forwarded (disable editing)
         is_forwarded = date_s2_forwarded is not None and str(date_s2_forwarded).strip() != ""
         
         # Check if just submitted (show success state)
-        # IMPORTANT: use work_order_id for the key (stable) to avoid dtype mismatches on reruns.
-        # NOTE: We rely solely on the session flag, not on is_forwarded from the dataframe,
-        # because the cached dataframe may be stale (not refreshed after submission).
         just_submitted_key = f"s2_wo_{work_order_id}_just_submitted"
         just_submitted = bool(st.session_state.get(just_submitted_key, False))
         
-        # Status badge color
-        status_color = {
-            "OPEN": "green",
-            "WIP": "orange",
-            "APPROVED": "green",
-            "CLOSED": "green",
-            "REJECTED": "red",
-        }.get(status, "gray")
+        st.divider()
         
-        # Different label for submitted vs pending
         if just_submitted:
-            expander_label = f"✅ **{work_order_id}** | {site_name} | SUBMITTED | {created_at}"
+            # Show success message and download option
+            _render_post_submit_view(
+                ptw_id=ptw_id,
+                work_order_id=work_order_id,
+                site_name=site_name,
+                form_data=form_data,
+                just_submitted_key=just_submitted_key,
+            )
+        elif is_forwarded:
+            # Show read-only summary card for forwarded PTW
+            _render_forwarded_ptw_card(
+                ptw_id=ptw_id,
+                work_order_id=work_order_id,
+                site_name=site_name,
+                work_location=work_location,
+                form_data=form_data,
+            )
         else:
-            expander_label = f"**{work_order_id}** | {site_name} | :{status_color}[{status}] | {created_at}"
+            # Show editable PTW detail form
+            _render_ptw_detail(
+                ptw_id=ptw_id,
+                work_order_id=work_order_id,
+                site_name=site_name,
+                work_location=work_location,
+                form_data=form_data,
+                is_forwarded=is_forwarded,
+                status=status,
+            )
+
+
+def _render_forwarded_ptw_card(
+    *,
+    ptw_id: str,
+    work_order_id: str,
+    site_name: str,
+    work_location: str,
+    form_data: dict,
+) -> None:
+    """
+    Render read-only summary card for PTWs that have been forwarded to S3.
+    
+    This prevents editing and provides clear visual confirmation of PTW state.
+    Only non-destructive actions (Download PDF) are allowed.
+    """
+    st.info("🔒 This PTW has been forwarded to S3. Editing is disabled.")
+    
+    # Styled container for the summary card
+    st.markdown(
+        """
+        <style>
+        .forwarded-card {
+            background-color: #f1f7ff;
+            border: 1px solid #cfe3ff;
+            padding: 16px;
+            border-radius: 10px;
+            margin-bottom: 16px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    with st.container():
+        st.markdown('<div class="forwarded-card">', unsafe_allow_html=True)
+        st.markdown("### 🧾 PTW Summary")
         
-        active = st.session_state.get("s2_active_ptw_id") == work_order_id
-        with st.expander(expander_label, expanded=bool(just_submitted or active)):
-            if just_submitted:
-                # Show success message and download option
-                _render_post_submit_view(
-                    ptw_id=ptw_id,
-                    work_order_id=work_order_id,
-                    site_name=site_name,
+        # Key metadata in two columns
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**Work Order ID:** {work_order_id}")
+            st.markdown(f"**Site Name:** {site_name}")
+        
+        with c2:
+            st.markdown(f"**Work Location:** {work_location}")
+            permit_holder = form_data.get("holder_name", "N/A")
+            st.markdown(f"**Permit Holder:** {permit_holder}")
+        
+        st.markdown("---")
+        
+        # Additional details
+        isolation_req = form_data.get("isolation_required", "N/A")
+        toolbox_conducted = form_data.get("toolbox_conducted", False)
+        st.markdown(f"**Isolation Required:** {isolation_req}")
+        st.markdown(f"**Toolbox Talk Conducted:** {'✓ Yes' if toolbox_conducted else '✗ No'}")
+        
+        remarks = form_data.get("s2_remarks", "")
+        if remarks:
+            st.markdown(f"**Supervisor Remarks:** {remarks}")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Non-destructive action: Download PDF
+    st.markdown("### 📥 Available Actions")
+    
+    if st.button("⬇️ Download PTW PDF", key=f"download_pdf_{ptw_id}", use_container_width=True):
+        with st.spinner("Generating PDF..."):
+            try:
+                pdf_bytes = generate_ptw_pdf_with_attachments(
                     form_data=form_data,
-                    just_submitted_key=just_submitted_key,
-                )
-            else:
-                _render_ptw_detail(
-                    ptw_id=ptw_id,
                     work_order_id=work_order_id,
-                    site_name=site_name,
-                    work_location=work_location,
-                    form_data=form_data,
-                    is_forwarded=is_forwarded,
-                    status=status,
                 )
+                
+                st.download_button(
+                    label="📄 Download PTW PDF",
+                    data=pdf_bytes,
+                    file_name=f"{work_order_id}_PTW.pdf",
+                    mime="application/pdf",
+                    key=f"download_btn_{ptw_id}",
+                    use_container_width=True,
+                )
+                st.success("✅ PDF generated successfully!")
+            except Exception as e:
+                st.error(f"❌ Failed to generate PDF: {e}")
 
 
 def _render_post_submit_view(
@@ -1198,7 +1373,9 @@ def _render_post_submit_view(
     def _on_review_another() -> None:
         # Clear the just_submitted flag so this PTW shows as editable again (if user re-opens it)
         st.session_state[just_submitted_key] = False
-        # Clear active PTW so all expanders collapse
+        # Reset dropdown to "(select PTW)"
+        st.session_state["s2_selected_ptw_label"] = "(select PTW)"
+        # Clear active PTW
         st.session_state["s2_active_ptw_id"] = None
         # Clear cached PDF bytes for this PTW to free memory
         st.session_state.pop(cache_key, None)
@@ -1248,12 +1425,18 @@ def _render_ptw_detail_body(
     key_prefix = f"s2_ptw_{ptw_id}_"
 
     def _set_active() -> None:
-        # Track active expander by work_order_id (stable across reruns)
+        # Track active PTW by work_order_id (stable across reruns)
         st.session_state["s2_active_ptw_id"] = work_order_id
 
-    def _queue_autosave() -> None:
+    def _queue_autosave(section_id: str) -> None:
+        """
+        Queue a section-scoped autosave.
+        - Remembers which section triggered the save
+        - Uses global s2_autosave_* keys so sections can render local indicators
+        """
         _set_active()
-        st.session_state[f"{key_prefix}autosave_pending"] = True
+        st.session_state["s2_autosave_pending"] = True
+        st.session_state["s2_autosave_section"] = section_id
 
     # PRE-RUN ACTION HANDLING (progress must appear BEFORE the form is rebuilt)
     # If an action was requested by an on_change or button click, handle it first,
@@ -1266,13 +1449,14 @@ def _render_ptw_detail_body(
     if submit_req not in st.session_state:
         st.session_state[submit_req] = False
 
-    # If autosave pending, show progress + update DB with latest widget values
-    if st.session_state.get(f"{key_prefix}autosave_pending"):
-        st.session_state[f"{key_prefix}autosave_pending"] = False
-        prog_slot = st.empty()
-        prog = prog_slot.progress(0, text="Saving changes...")
+    # =========================================================================
+    # IMPROVED AUTOSAVE: Silent, section-scoped, no global progress bar
+    # =========================================================================
+    autosave_section: str | None = None
+    if st.session_state.get("s2_autosave_pending"):
+        # Capture which section triggered autosave for this render
+        autosave_section = st.session_state.get("s2_autosave_section")
         try:
-            _smooth_progress(prog, 0, 50, text="Updating PTW record...")
             updated = dict(form_data or {})
             updated["holder_name"] = st.session_state.get(f"{key_prefix}holder_name", updated.get("holder_name", ""))
             updated["isolation_required"] = st.session_state.get(
@@ -1282,13 +1466,12 @@ def _render_ptw_detail_body(
                 st.session_state.get(f"{key_prefix}toolbox_conducted", updated.get("toolbox_conducted", False))
             )
             updated["s2_remarks"] = st.session_state.get(f"{key_prefix}s2_remarks", updated.get("s2_remarks", ""))
-            _update_ptw_form_data(ptw_id, updated)
-            _smooth_progress(prog, 50, 100, text="Saved")
-        except Exception as e:
-            st.error(f"Failed to save changes: {e}")
+            _persist_form_data_silently(ptw_id=ptw_id, form_data=updated)
         finally:
-            prog_slot.empty()
-        # Continue rendering the form in the same run (prevents blank expander after autosave)
+            # Clear autosave pending; section indicator will render below
+            st.session_state["s2_autosave_pending"] = False
+            st.session_state["s2_autosave_progress"] = 100
+        # autosave_section is preserved for section-level indicators (cleared after render)
 
     # Handle preview request FIRST (avoid rebuilding the whole form before progress appears)
     if st.session_state.get(prev_req):
@@ -1475,13 +1658,24 @@ def _render_ptw_detail_body(
     # Section B: Permit Holder (MANDATORY for S2)
     st.markdown("### B. Permit Holder (Required)")
     
-    holder_name = st.text_input(
+    holder_name = st.text_area(
         "Permit Holder Name *",
         value=form_data.get("holder_name", ""),
         key=f"{key_prefix}holder_name",
         placeholder="Enter the name of the permit holder",
-        on_change=_queue_autosave,
+        on_change=lambda: _queue_autosave("section_b"),
+        height=38,
     )
+    # Section-level progress indicator (incremental, scoped)
+    if autosave_section == "section_b":
+        progress_slot = st.empty()
+        bar = progress_slot.progress(0, text="Saving Section B…")
+        for i in range(0, 101, 20):
+            bar.progress(i)
+            _time.sleep(0.05)
+        progress_slot.empty()
+        st.session_state["s2_autosave_section"] = None
+        st.session_state["s2_autosave_progress"] = 0
     
     st.divider()
     
@@ -1492,7 +1686,7 @@ def _render_ptw_detail_body(
     isolation_idx = 0 if current_isolation.upper() != "NO" else 1
     
     def _on_iso_change() -> None:
-        _queue_autosave()
+        _queue_autosave("section_c")
     isolation_required = st.radio(
         "Is Isolation Required? *",
         options=["YES", "NO"],
@@ -1529,6 +1723,17 @@ def _render_ptw_detail_body(
     else:
         st.session_state[isolation_files_key] = []
     
+    # Section-level progress indicator (incremental, scoped)
+    if autosave_section == "section_c":
+        progress_slot = st.empty()
+        bar = progress_slot.progress(0, text="Saving Section C…")
+        for i in range(0, 101, 20):
+            bar.progress(i)
+            _time.sleep(0.05)
+        progress_slot.empty()
+        st.session_state["s2_autosave_section"] = None
+        st.session_state["s2_autosave_progress"] = 0
+    
     st.divider()
     
     # Section D: Tool Box Talk (MANDATORY)
@@ -1538,7 +1743,7 @@ def _render_ptw_detail_body(
         "Tool Box Talk Conducted *",
         value=form_data.get("toolbox_conducted", False),
         key=f"{key_prefix}toolbox_conducted",
-        on_change=_queue_autosave,
+        on_change=lambda: _queue_autosave("section_d"),
     )
     
     # File upload for toolbox evidence (mandatory if checked)
@@ -1568,6 +1773,17 @@ def _render_ptw_detail_body(
     else:
         st.session_state[toolbox_files_key] = []
     
+    # Section-level progress indicator (incremental, scoped)
+    if autosave_section == "section_d":
+        progress_slot = st.empty()
+        bar = progress_slot.progress(0, text="Saving Section D…")
+        for i in range(0, 101, 20):
+            bar.progress(i)
+            _time.sleep(0.05)
+        progress_slot.empty()
+        st.session_state["s2_autosave_section"] = None
+        st.session_state["s2_autosave_progress"] = 0
+    
     st.divider()
     
     # Section E: Additional Remarks (Optional)
@@ -1578,8 +1794,18 @@ def _render_ptw_detail_body(
         value=form_data.get("s2_remarks", ""),
         key=f"{key_prefix}s2_remarks",
         placeholder="Add any additional remarks or notes...",
-        on_change=_queue_autosave,
+        on_change=lambda: _queue_autosave("section_e"),
     )
+    # Section-level progress indicator (incremental, scoped)
+    if autosave_section == "section_e":
+        progress_slot = st.empty()
+        bar = progress_slot.progress(0, text="Saving Section E…")
+        for i in range(0, 101, 20):
+            bar.progress(i)
+            _time.sleep(0.05)
+        progress_slot.empty()
+        st.session_state["s2_autosave_section"] = None
+        st.session_state["s2_autosave_progress"] = 0
     
     st.divider()
     
@@ -1704,6 +1930,18 @@ def _handle_s2_submit(
                 st.write(f"  ❌ {err}")
             return
         
+        # --- SUCCESS FEEDBACK FOR EVIDENCE UPLOADS ---
+        success_msgs = []
+        
+        if isolation_files:
+            success_msgs.append(f"✅ Isolation evidence uploaded successfully ({len(isolation_files)} file(s))")
+        
+        if toolbox_files:
+            success_msgs.append(f"✅ Toolbox Talk evidence uploaded successfully ({len(toolbox_files)} file(s))")
+        
+        for msg in success_msgs:
+            st.success(msg)
+        
         # Step 2: Update form_data in ptw_requests
         progress.progress(50, text="Updating PTW record...")
         status_msg.info("Saving changes to database...")
@@ -1764,6 +2002,13 @@ def render(db_path: str) -> None:
     # Initialize session state
     if "s2_ptw_view_df" not in st.session_state:
         st.session_state["s2_ptw_view_df"] = None
+    # Section-scoped autosave state (shared across PTW detail renders)
+    if "s2_autosave_section" not in st.session_state:
+        st.session_state["s2_autosave_section"] = None
+    if "s2_autosave_pending" not in st.session_state:
+        st.session_state["s2_autosave_pending"] = False
+    if "s2_autosave_progress" not in st.session_state:
+        st.session_state["s2_autosave_progress"] = 0
     
     # Top horizontal tabs
     tab1, tab2 = st.tabs(["View Work Order", "View Submitted PTW"])

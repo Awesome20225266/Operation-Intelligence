@@ -45,6 +45,7 @@ from S1 import (
     TABLE_WORK_ORDERS,
     TABLE_PTW_REQUESTS,
     UI_STATUSES,
+    DB_STATUS_TO_UI,
     derive_ptw_status,
     _list_sites_from_work_orders,
     _list_locations_from_work_orders,
@@ -433,7 +434,8 @@ def _render_view_work_order_s3() -> None:
                     c_rej = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
                     c_open = int((df["status"].astype("string").str.upper() == "OPEN").sum())
                     c_wip = int((df["status"].astype("string").str.upper() == "WIP").sum())
-                    c_approved = int(df["status"].astype("string").str.upper().isin(["CLOSED", "APPROVED"]).sum())
+                    # Approved KPI must use derived status (single source of truth)
+                    c_approved = int((df["status"].astype("string").str.upper() == "APPROVED").sum())
                 else:
                     total = c_rej = c_open = c_wip = c_approved = 0
 
@@ -463,7 +465,7 @@ def _render_view_work_order_s3() -> None:
               <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:#2563eb;">{kpis.get("total", 0)}</div></div>
               <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:#dc2626;">{kpis.get("rejected", 0)}</div></div>
               <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:#10b981;">{kpis.get("open", 0)}</div></div>
-              <div class="kpi-card"><div class="kpi-title">WIP</div><div class="kpi-value" style="color:#f97316;">{kpis.get("wip", 0)}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:#f97316;">{kpis.get("wip", 0)}</div></div>
               <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{kpis.get("approved", 0)}</div></div>
             </div>
             """,
@@ -474,8 +476,12 @@ def _render_view_work_order_s3() -> None:
         if "date_planned" in df.columns:
             df["date_planned"] = pd.to_datetime(df["date_planned"]).dt.strftime("%Y-%m-%d")
 
+        df_display = df.copy()
+        df_display["status"] = df_display["status"].astype("string").fillna("").map(
+            lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s))
+        )
         styled = (
-            df.style.map(_highlight_status, subset=["status"])
+            df_display.style.map(_highlight_status, subset=["status"])
             .set_table_styles([{"selector": "th", "props": [("font-weight", "800"), ("color", "#0f172a")]}])
         )
         st.dataframe(styled, width="stretch", hide_index=True)
@@ -785,12 +791,11 @@ def _render_view_approvals() -> None:
         st.info("No PTWs found for the selected date range.")
         return
 
-    # KPI Cards (matching S2)
+    # KPI Cards - S3 decision metrics only (no WIP, no redundant "Approved Total")
+    # Single source of truth: Approved = date_s3_approved IS NOT NULL
     total = int(len(df))
     pending_count = int((~df["is_approved"]).sum())
     approved_count = int(df["is_approved"].sum())
-    wip_count = int((df["derived_status"].astype("string").str.upper() == "WIP").sum())
-    closed_count = int(df["derived_status"].astype("string").str.upper().isin(["CLOSED", "APPROVED"]).sum())
 
     st.markdown(
         f"""
@@ -798,8 +803,6 @@ def _render_view_approvals() -> None:
           <div class="kpi-card"><div class="kpi-title">Total PTWs</div><div class="kpi-value" style="color:#2563eb;">{total}</div></div>
           <div class="kpi-card"><div class="kpi-title">Pending Approval</div><div class="kpi-value" style="color:#f97316;">{pending_count}</div></div>
           <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{approved_count}</div></div>
-          <div class="kpi-card"><div class="kpi-title">WIP</div><div class="kpi-value" style="color:#f59e0b;">{wip_count}</div></div>
-          <div class="kpi-card"><div class="kpi-title">Approved (Total)</div><div class="kpi-value" style="color:#10b981;">{closed_count}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -807,54 +810,112 @@ def _render_view_approvals() -> None:
     
     st.divider()
 
-    # Render each PTW as an expander
-    for _, r in df.iterrows():
-        work_order_id = str(r.get("work_order_id") or "")
-        site_name = str(r.get("site_name") or "")
-        status = str(r.get("derived_status") or "")
-        is_db_approved = bool(r.get("is_approved", False))
-        
-        fwd = r.get("date_s2_forwarded")
+    # ---------------------------------------------------------------------
+    # Selection-first UX: build PTW dropdown (no mass rendering)
+    # ---------------------------------------------------------------------
+
+    def _build_s3_ptw_label(row: pd.Series) -> str:
+        """Build label for S3 PTW selectbox."""
+        work_order_id = str(row.get("work_order_id") or "")
+        site_name = str(row.get("site_name") or "")
+
+        # Prefer explicit approval flag; fall back to derived status
+        status = "APPROVED" if bool(row.get("is_approved", False)) else str(row.get("derived_status") or "")
+
+        fwd = row.get("date_s2_forwarded")
         fwd_str = ""
         try:
             if fwd is not None and str(fwd).strip():
                 fwd_str = pd.to_datetime(fwd).strftime("%Y-%m-%d %H:%M")
         except Exception:
             fwd_str = str(fwd)
-        
-        appr = r.get("date_s3_approved")
-        appr_str = ""
-        try:
-            if appr is not None and str(appr).strip():
-                appr_str = pd.to_datetime(appr).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            appr_str = str(appr)
 
-        # Check if just approved in this session (show success state)
-        just_approved_key = f"s3_wo_{work_order_id}_just_approved"
-        just_approved = bool(st.session_state.get(just_approved_key, False))
+        return f"{work_order_id} | {site_name} | {status} | Forwarded: {fwd_str}"
 
-        # Status badge color
-        status_color = {
-            "OPEN": "green",
-            "WIP": "orange",
-            "APPROVED": "green",
-            "CLOSED": "green",
-            "REJECTED": "red",
-        }.get(status, "gray")
+    options = ["(select PTW)"] + [
+        _build_s3_ptw_label(r) for _, r in df.iterrows()
+    ]
 
-        # Label format
-        if just_approved or is_db_approved:
-            label = f"✅ **{work_order_id}** | {site_name} | :{status_color}[{status}] | Approved: {appr_str}"
-        else:
-            label = f"**{work_order_id}** | {site_name} | :{status_color}[{status}] | Forwarded: {fwd_str}"
+    selected_label = st.selectbox(
+        "Select PTW for Approval",
+        options=options,
+        key="s3_selected_ptw_label",
+    )
 
-        active = st.session_state.get("s3_active_approval_id") == work_order_id
-        with st.expander(label, expanded=bool(just_approved or active)):
-            if just_approved or is_db_approved:
-                _render_post_approval_view(work_order_id=work_order_id, site_name=site_name, ptw_map=ptw_map, just_approved_key=just_approved_key, is_db_approved=is_db_approved)
-            else:
-                _render_approval_form(work_order_id=work_order_id, site_name=site_name, fwd_str=fwd_str, ptw_map=ptw_map, just_approved_key=just_approved_key)
+    # Map selection back to active work_order_id
+    if selected_label and selected_label != "(select PTW)":
+        selected_wo = selected_label.split("|")[0].strip()
+        st.session_state["s3_active_approval_id"] = selected_wo
+    else:
+        st.session_state["s3_active_approval_id"] = None
+
+    active_wo = st.session_state.get("s3_active_approval_id")
+    if not active_wo:
+        return
+
+    # Locate the active row in the current dataset
+    active_row = df[df["work_order_id"].astype(str) == str(active_wo)]
+    if active_row.empty:
+        st.warning("Selected PTW is no longer available in the current filter set.")
+        return
+
+    r = active_row.iloc[0]
+    work_order_id = str(r.get("work_order_id") or "")
+    site_name = str(r.get("site_name") or "")
+    status = str(r.get("derived_status") or "")
+    is_db_approved = bool(r.get("is_approved", False))
+
+    fwd = r.get("date_s2_forwarded")
+    fwd_str = ""
+    try:
+        if fwd is not None and str(fwd).strip():
+            fwd_str = pd.to_datetime(fwd).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        fwd_str = str(fwd)
+
+    appr = r.get("date_s3_approved")
+    appr_str = ""
+    try:
+        if appr is not None and str(appr).strip():
+            appr_str = pd.to_datetime(appr).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        appr_str = str(appr)
+
+    # Check if just approved in this session (show success state)
+    just_approved_key = f"s3_wo_{work_order_id}_just_approved"
+    just_approved = bool(st.session_state.get(just_approved_key, False))
+
+    # Progress-first loading for PTW details
+    prog_slot = st.empty()
+    prog = prog_slot.progress(0, text="Loading PTW details...")
+    try:
+        _smooth_progress(prog, 0, 40, text="Fetching PTW form data...")
+        ptw_data = ptw_map.get(work_order_id)
+
+        _smooth_progress(prog, 40, 70, text="Preparing approval view...")
+        # (ptw_data is passed via ptw_map into the render helpers)
+
+        _smooth_progress(prog, 70, 100, text="Ready")
+    finally:
+        prog_slot.empty()
+
+    # Render read-only or approval form based on state
+    if just_approved or is_db_approved:
+        _render_post_approval_view(
+            work_order_id=work_order_id,
+            site_name=site_name,
+            ptw_map=ptw_map,
+            just_approved_key=just_approved_key,
+            is_db_approved=is_db_approved,
+        )
+    else:
+        _render_approval_form(
+            work_order_id=work_order_id,
+            site_name=site_name,
+            fwd_str=fwd_str,
+            ptw_map=ptw_map,
+            just_approved_key=just_approved_key,
+        )
 
 
 def _render_post_approval_view(*, work_order_id: str, site_name: str, ptw_map: dict, just_approved_key: str, is_db_approved: bool = False) -> None:
@@ -974,9 +1035,13 @@ def _render_post_approval_view(*, work_order_id: str, site_name: str, ptw_map: d
     
     with col2:
         def _on_review_another() -> None:
+            # Clear approval state
             st.session_state[just_approved_key] = False
             st.session_state["s3_active_approval_id"] = None
             st.session_state.pop(cache_key, None)
+            
+            # Reset dropdown to "(select PTW)" - soft reset, no page reload
+            st.session_state["s3_selected_ptw_label"] = "(select PTW)"
         st.button("📋 Review Another PTW", key=f"s3_another_{work_order_id}", on_click=_on_review_another)
     
     # Handle revoke request
@@ -1015,38 +1080,16 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
 
     key_prefix = f"s3_appr_{work_order_id}_"
     issuer_key = f"{key_prefix}issuer"
-    autosave_key = f"{key_prefix}autosave_pending"
     preview_req_key = f"{key_prefix}preview_requested"
     preview_cache_key = f"{key_prefix}preview_bytes"
     approve_req_key = f"{key_prefix}approve_requested"
 
-    if autosave_key not in st.session_state:
-        st.session_state[autosave_key] = False
     if preview_req_key not in st.session_state:
         st.session_state[preview_req_key] = False
     if preview_cache_key not in st.session_state:
         st.session_state[preview_cache_key] = None
     if approve_req_key not in st.session_state:
         st.session_state[approve_req_key] = False
-
-    # Handle autosave FIRST (progress-first UX)
-    if st.session_state.get(autosave_key):
-        st.session_state[autosave_key] = False
-        issuer_value = st.session_state.get(issuer_key, "")
-        
-        prog_slot = st.empty()
-        prog = prog_slot.progress(0, text="Saving...")
-        try:
-            _smooth_progress(prog, 0, 100, text="Saving issuer name...")
-            ok, msg = _update_ptw_issuer_name(work_order_id=work_order_id, issuer_name=issuer_value)
-            if ok:
-                # Update cached form_data
-                ptw_map[work_order_id]["form_data"]["issuer_name"] = issuer_value
-                st.session_state["s3_ptw_map"] = ptw_map
-        except Exception as e:
-            pass  # Silent fail for autosave
-        finally:
-            prog_slot.empty()
 
     # Handle preview request FIRST (progress-first UX)
     if st.session_state.get(preview_req_key):
@@ -1098,20 +1141,43 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
                 _smooth_progress(prog, 0, 40, text="Saving issuer name...")
                 ok, approval_ts = _approve_work_order(work_order_id=work_order_id, issuer_name=issuer_value.strip())
                 if ok:
-                    _smooth_progress(prog, 40, 100, text="Approved")
-                    prog_slot.empty()
+                    _smooth_progress(prog, 40, 70, text="Approved")
                     
                     # Update form_data with approval timestamp
                     ptw_map[work_order_id]["form_data"]["issuer_name"] = issuer_value.strip()
                     ptw_map[work_order_id]["form_data"]["issuer_datetime"] = approval_ts
                     st.session_state["s3_ptw_map"] = ptw_map
                     
+                    # Refresh the PTW list so dropdown and KPIs reflect latest status
+                    _smooth_progress(prog, 70, 90, text="Refreshing PTW list...")
+                    try:
+                        start_date = st.session_state.get("s3_appr_start_val")
+                        end_date = st.session_state.get("s3_appr_end_val")
+                        if start_date and end_date:
+                            df_refreshed = _fetch_all_s3_ptws(start_date=start_date, end_date=end_date)
+                            st.session_state["s3_pending_df"] = df_refreshed
+                            ptw_map_refreshed = _fetch_ptw_requests_for_work_orders(
+                                df_refreshed["work_order_id"].astype(str).tolist() if not df_refreshed.empty else []
+                            )
+                            st.session_state["s3_ptw_map"] = ptw_map_refreshed
+                    except Exception as refresh_err:
+                        # Do not fail approval if refresh fails
+                        print(f"Failed to refresh PTW list after approval: {refresh_err}")
+                    
+                    _smooth_progress(prog, 90, 100, text="Complete")
+                    prog_slot.empty()
+                    
                     # Mark as just approved
                     st.session_state[just_approved_key] = True
                     st.session_state["s3_active_approval_id"] = work_order_id
                     
-                    # Render success view immediately
-                    _render_post_approval_view(work_order_id=work_order_id, site_name=site_name, ptw_map=ptw_map, just_approved_key=just_approved_key)
+                    # Render success view immediately, using refreshed map
+                    _render_post_approval_view(
+                        work_order_id=work_order_id,
+                        site_name=site_name,
+                        ptw_map=st.session_state.get("s3_ptw_map", ptw_map),
+                        just_approved_key=just_approved_key,
+                    )
                     return
                 else:
                     prog_slot.empty()
@@ -1120,17 +1186,14 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
                 prog_slot.empty()
                 st.error(f"Approval failed: {e}")
 
-    # Render form
-    def _on_issuer_change() -> None:
-        st.session_state["s3_active_approval_id"] = work_order_id
-        st.session_state[autosave_key] = True
-
-    issuer_name = st.text_input(
+    # Render form - NO autosave, purely local state until "Approve" is clicked
+    issuer_name = st.text_area(
         "Permit Issuer Name *",
         value=str(form_data.get("issuer_name") or ""),
         key=issuer_key,
-        placeholder="Enter Permit Issuer name",
-        on_change=_on_issuer_change,
+        height=38,
+        placeholder="Enter Permit Issuer name (will save on approval only)",
+        # NO on_change callback - no backend write until approval
     )
 
     btn1, btn2 = st.columns([1, 1], vertical_alignment="bottom")

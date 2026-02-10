@@ -1,0 +1,1711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zelestra Dashboard - Complete Architecture Documentation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #ffb300;
+            --primary-dark: #f59e0b;
+            --secondary: #2563eb;
+            --dark: #0b1020;
+            --dark-light: #1e293b;
+            --text: #334155;
+            --text-light: #64748b;
+            --bg: #f8fafc;
+            --bg-card: #ffffff;
+            --border: #e2e8f0;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 2rem;
+        }
+
+        /* Header */
+        header {
+            background: linear-gradient(135deg, var(--dark) 0%, var(--dark-light) 100%);
+            color: white;
+            padding: 3rem 0;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+        }
+
+        .header-content {
+            text-align: center;
+        }
+
+        .logo {
+            font-size: 3rem;
+            font-weight: 900;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--primary), #fcd34d);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            font-size: 1.25rem;
+            color: rgba(255, 255, 255, 0.8);
+            font-weight: 500;
+        }
+
+        /* Navigation */
+        nav {
+            background: white;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+            border-bottom: 2px solid var(--border);
+        }
+
+        .nav-container {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem 2rem;
+            overflow-x: auto;
+            scrollbar-width: thin;
+        }
+
+        .nav-btn {
+            padding: 0.75rem 1.5rem;
+            background: var(--bg);
+            border: 2px solid var(--border);
+            border-radius: 10px;
+            cursor: pointer;
+            white-space: nowrap;
+            font-weight: 600;
+            color: var(--text);
+            transition: all 0.2s;
+        }
+
+        .nav-btn:hover {
+            background: var(--primary);
+            color: var(--dark);
+            border-color: var(--primary);
+            transform: translateY(-2px);
+        }
+
+        .nav-btn.active {
+            background: var(--primary);
+            color: var(--dark);
+            border-color: var(--primary);
+        }
+
+        /* Main Content */
+        main {
+            padding: 3rem 0;
+        }
+
+        .section {
+            display: none;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        .section.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Cards */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
+        }
+
+        .card-title {
+            font-size: 1.75rem;
+            font-weight: 800;
+            color: var(--dark);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .card-title .icon {
+            font-size: 2rem;
+        }
+
+        .card-subtitle {
+            font-size: 1.1rem;
+            color: var(--text-light);
+            margin-bottom: 1.5rem;
+        }
+
+        /* Grid Layouts */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .grid-item {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+        }
+
+        .grid-item h4 {
+            font-size: 1.1rem;
+            color: var(--dark);
+            margin-bottom: 0.75rem;
+            font-weight: 700;
+        }
+
+        .grid-item p {
+            color: var(--text-light);
+            font-size: 0.95rem;
+        }
+
+        /* Code Blocks */
+        .code-block {
+            background: var(--dark);
+            color: #e2e8f0;
+            padding: 1.5rem;
+            border-radius: 12px;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            line-height: 1.6;
+            margin: 1rem 0;
+        }
+
+        .code-block .keyword { color: #fcd34d; }
+        .code-block .function { color: #60a5fa; }
+        .code-block .string { color: #86efac; }
+        .code-block .comment { color: #94a3b8; font-style: italic; }
+        .code-block .number { color: #f472b6; }
+
+        /* Formula Blocks */
+        .formula {
+            background: linear-gradient(135deg, #dbeafe 0%, #e0e7ff 100%);
+            border-left: 4px solid var(--secondary);
+            padding: 1.5rem;
+            border-radius: 8px;
+            margin: 1.5rem 0;
+        }
+
+        .formula-title {
+            font-weight: 700;
+            color: var(--secondary);
+            margin-bottom: 0.75rem;
+            font-size: 1.1rem;
+        }
+
+        .formula-content {
+            font-family: 'Courier New', monospace;
+            font-size: 1.1rem;
+            color: var(--dark);
+            padding: 0.75rem;
+            background: white;
+            border-radius: 6px;
+            margin-top: 0.5rem;
+        }
+
+        /* Data Flow Diagram */
+        .flow-diagram {
+            background: white;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            margin: 2rem 0;
+        }
+
+        .flow-step {
+            position: relative;
+            padding: 1.5rem;
+            background: var(--bg);
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 1rem;
+        }
+
+        .flow-step:not(:last-child)::after {
+            content: '↓';
+            position: absolute;
+            bottom: -2rem;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 2rem;
+            color: var(--primary);
+            font-weight: bold;
+        }
+
+        .flow-step-number {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            background: var(--primary);
+            color: var(--dark);
+            border-radius: 50%;
+            text-align: center;
+            line-height: 40px;
+            font-weight: 800;
+            margin-right: 1rem;
+        }
+
+        .flow-step-title {
+            font-weight: 700;
+            font-size: 1.2rem;
+            color: var(--dark);
+            margin-bottom: 0.5rem;
+        }
+
+        /* Tables */
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+        }
+
+        .data-table thead {
+            background: var(--dark);
+            color: white;
+        }
+
+        .data-table th {
+            padding: 1rem;
+            text-align: left;
+            font-weight: 700;
+        }
+
+        .data-table td {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .data-table tbody tr:hover {
+            background: var(--bg);
+        }
+
+        /* Tags */
+        .tag {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin: 0.25rem;
+        }
+
+        .tag-primary { background: #dbeafe; color: var(--secondary); }
+        .tag-success { background: #d1fae5; color: #065f46; }
+        .tag-warning { background: #fef3c7; color: #92400e; }
+        .tag-danger { background: #fee2e2; color: #991b1b; }
+
+        /* Alerts */
+        .alert {
+            padding: 1.25rem;
+            border-radius: 12px;
+            margin: 1.5rem 0;
+            border-left: 4px solid;
+        }
+
+        .alert-info {
+            background: #dbeafe;
+            border-color: var(--secondary);
+            color: #1e40af;
+        }
+
+        .alert-success {
+            background: #d1fae5;
+            border-color: var(--success);
+            color: #065f46;
+        }
+
+        .alert-warning {
+            background: #fef3c7;
+            border-color: var(--warning);
+            color: #92400e;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container { padding: 0 1rem; }
+            .nav-container { padding: 1rem; }
+            .grid { grid-template-columns: 1fr; }
+            .logo { font-size: 2rem; }
+        }
+
+        /* Print styles */
+        @media print {
+            nav { display: none; }
+            .section { display: block !important; }
+            .card { page-break-inside: avoid; }
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--text-light);
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <div class="header-content">
+                <div class="logo">⚡ Zelestra Dashboard</div>
+                <div class="subtitle">Complete Architecture & Technical Documentation</div>
+                <div class="subtitle" style="margin-top: 0.5rem; font-size: 1rem;">Solar Performance Monitoring & Analytics Platform</div>
+            </div>
+        </div>
+    </header>
+
+    <nav>
+        <div class="nav-container">
+            <button class="nav-btn active" onclick="showSection('overview')">📋 Overview</button>
+            <button class="nav-btn" onclick="showSection('architecture')">🏗️ Architecture</button>
+            <button class="nav-btn" onclick="showSection('dataflow')">🔄 Data Flow</button>
+            <button class="nav-btn" onclick="showSection('pipeline')">⚙️ Data Pipeline</button>
+            <button class="nav-btn" onclick="showSection('calculations')">📊 Calculations</button>
+            <button class="nav-btn" onclick="showSection('database')">💾 Database</button>
+            <button class="nav-btn" onclick="showSection('frontend')">🎨 Frontend</button>
+            <button class="nav-btn" onclick="showSection('mapping')">🗺️ Data Mapping</button>
+            <button class="nav-btn" onclick="showSection('rules')">📜 Business Rules</button>
+        </div>
+    </nav>
+
+    <main class="container">
+        <!-- OVERVIEW SECTION -->
+        <section id="overview" class="section active">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">🎯</span> System Overview</h2>
+                <p class="card-subtitle">Zelestra Dashboard is a comprehensive solar plant monitoring and analytics platform</p>
+                
+                <div class="alert alert-info">
+                    <strong>Mission:</strong> Real-time monitoring, performance analysis, and fault detection for solar power plants across multiple sites.
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🔑 Key Features</h3>
+                <div class="grid">
+                    <div class="grid-item">
+                        <h4>📊 Portfolio Analytics</h4>
+                        <p>Multi-site performance tracking with KPI visualization, generation vs target comparison, and revenue analysis.</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>🏥 Operation Theatre</h4>
+                        <p>Real-time operational monitoring of inverters, SCBs, and string performance with automated fault detection.</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>🔌 RE-Connect Integration</h4>
+                        <p>Automated web scraping for real-time data from RE-Connect portal with DSM (Daily Status Monitoring).</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>📝 SCB Management</h4>
+                        <p>String Combiner Box monitoring with deviation detection, comment tracking, and historical analysis.</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>🧪 Raw Data Analysis</h4>
+                        <p>Deep dive analysis of time-series data with normalization, heatmaps, and comparative visualizations.</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>☁️ Cloud-Sync Pipeline</h4>
+                        <p>Automated Excel → DuckDB → S3 pipeline for seamless data updates and cloud deployment.</p>
+                    </div>
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🛠️ Technology Stack</h3>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Component</th>
+                            <th>Technology</th>
+                            <th>Purpose</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Frontend Framework</strong></td>
+                            <td>Streamlit 1.37+</td>
+                            <td>Interactive web dashboard with authentication</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Database</strong></td>
+                            <td>DuckDB (embedded OLAP)</td>
+                            <td>High-performance analytics on local/cloud data</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Cloud Storage</strong></td>
+                            <td>AWS S3 + boto3</td>
+                            <td>Centralized database distribution</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Data Processing</strong></td>
+                            <td>Pandas 2.0+, NumPy</td>
+                            <td>ETL, transformations, aggregations</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Visualization</strong></td>
+                            <td>Plotly 5.22+</td>
+                            <td>Interactive charts and time-series plots</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Excel Ingestion</strong></td>
+                            <td>openpyxl, calamine</td>
+                            <td>Fast Excel file parsing</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Web Scraping</strong></td>
+                            <td>Selenium + webdriver-manager</td>
+                            <td>Automated RE-Connect data collection</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Authentication</strong></td>
+                            <td>Supabase (PostgreSQL + Auth)</td>
+                            <td>User management and role-based access</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title"><span class="icon">📁</span> Project Structure</h2>
+                <div class="code-block">
+<span class="comment"># Root Directory</span>
+Zelestra-Dashboard/
+├── <span class="keyword">master_run.py</span>          <span class="comment"># Main orchestration pipeline</span>
+├── <span class="keyword">dashboard.py</span>           <span class="comment"># Streamlit frontend entry point</span>
+├── <span class="keyword">auth.py</span>                <span class="comment"># Authentication & session management</span>
+├── <span class="keyword">access_control.py</span>      <span class="comment"># Role-based access control (RBAC)</span>
+│
+├── <span class="comment"># Data Ingestion Modules</span>
+├── <span class="keyword">store_data_table_duckdb.py</span>  <span class="comment"># DGR Excel → DuckDB loader</span>
+├── <span class="keyword">design_array_injestor.py</span>    <span class="comment"># Design data ingestion</span>
+├── <span class="keyword">apollo_injestor.py</span>          <span class="comment"># Apollo time-series data parser</span>
+│
+├── <span class="comment"># Feature Modules</span>
+├── <span class="keyword">portfolio_analytics.py</span>      <span class="comment"># Multi-site KPI analysis</span>
+├── <span class="keyword">operation_theatre.py</span>        <span class="comment"># Operational monitoring</span>
+├── <span class="keyword">reconnect_dsm.py</span>            <span class="comment"># RE-Connect DSM integration</span>
+├── <span class="keyword">scb_ot.py</span>                   <span class="comment"># SCB Operation Theatre</span>
+├── <span class="keyword">scb_comment.py</span>              <span class="comment"># SCB comment management</span>
+├── <span class="keyword">raw_analyser.py</span>             <span class="comment"># Raw time-series analysis</span>
+├── <span class="keyword">meta_viewer.py</span>              <span class="comment"># Metadata explorer</span>
+├── <span class="keyword">add_comments.py</span>             <span class="comment"># Comment tracking system</span>
+│
+├── <span class="comment"># Infrastructure</span>
+├── <span class="keyword">aws_duckdb.py</span>               <span class="comment"># DuckDB S3 connector</span>
+├── <span class="keyword">supabase_link.py</span>            <span class="comment"># Supabase client wrapper</span>
+│
+├── <span class="comment"># Data Folders</span>
+├── DGR/                      <span class="comment"># Daily Generation Reports (Excel)</span>
+├── design_data/              <span class="comment"># Plant & array design specs</span>
+├── Apollo Raw Data/          <span class="comment"># Time-series measurements</span>
+├── reconnect_downloads/      <span class="comment"># RE-Connect scraped data</span>
+└── Web Scraping_RE_Connect/  <span class="comment"># Selenium automation scripts</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- ARCHITECTURE SECTION -->
+        <section id="architecture" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">🏗️</span> System Architecture</h2>
+                <p class="card-subtitle">Multi-tier architecture with ETL pipeline, analytical database, and interactive frontend</p>
+
+                <div class="flow-diagram">
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">1</span>
+                            <div>
+                                <div class="flow-step-title">📥 Data Sources</div>
+                                <p style="color: var(--text-light);">Excel files (DGR, Design, Apollo) + Web scraping (RE-Connect)</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">2</span>
+                            <div>
+                                <div class="flow-step-title">⚙️ ETL Pipeline (master_run.py)</div>
+                                <p style="color: var(--text-light);">Orchestrates all data ingestion with validation, deduplication & error handling</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">3</span>
+                            <div>
+                                <div class="flow-step-title">💾 DuckDB (master.duckdb)</div>
+                                <p style="color: var(--text-light);">Local analytical database with star-schema tables for fast queries</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">4</span>
+                            <div>
+                                <div class="flow-step-title">☁️ AWS S3 Sync</div>
+                                <p style="color: var(--text-light);">Database uploaded to S3 for cloud deployment (Streamlit Cloud pulls from S3)</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">5</span>
+                            <div>
+                                <div class="flow-step-title">🎨 Streamlit Dashboard</div>
+                                <p style="color: var(--text-light);">Interactive web UI with authentication, role-based access & real-time analytics</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🔐 Security Architecture</h3>
+                <div class="grid">
+                    <div class="grid-item">
+                        <h4>Authentication Layer</h4>
+                        <p><strong>Supabase Auth:</strong> Email/password authentication with session management</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Access Control</h4>
+                        <p><strong>RBAC:</strong> Admin users get full access, restricted users see SCB-related modules only</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Secrets Management</h4>
+                        <p><strong>.streamlit/secrets.toml:</strong> AWS, Supabase credentials with CLI/Streamlit fallback</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- DATA FLOW SECTION -->
+        <section id="dataflow" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">🔄</span> Complete Data Flow</h2>
+                
+                <h3 style="margin-bottom: 1rem;">📊 DGR Excel Processing</h3>
+                <div class="code-block">
+<span class="comment"># Step 1: Excel Scanning</span>
+<span class="keyword">for</span> file <span class="keyword">in</span> DGR/*.xlsx:
+    site_name = extract_from_filename(file)  <span class="comment"># Strip "DGR_" prefix</span>
+    
+    <span class="comment"># Step 2: Sheet Extraction</span>
+    daily_kpi = read_sheet(<span class="string">"Daily_KPI"</span>)      <span class="comment"># Performance metrics</span>
+    budget_kpi = read_sheet(<span class="string">"Daily_KPI"</span>)     <span class="comment"># Target/budget columns</span>
+    inv_syd = read_sheet(<span class="string">"Inv_SY_D"</span>)        <span class="comment"># String yield deviation</span>
+    inv_pr = read_sheet(<span class="string">"Inv_PR"</span>)           <span class="comment"># Inverter performance ratio</span>
+    
+    <span class="comment"># Step 3: Data Cleaning</span>
+    <span class="keyword">for</span> value <span class="keyword">in</span> all_numeric_columns:
+        <span class="keyword">if</span> is_blank(value) <span class="keyword">or</span> is_error(value):
+            value = <span class="number">0.0</span>  <span class="comment"># Rule: Missing/error → 0</span>
+    
+    <span class="comment"># Step 4: Duplicate Detection (FULL-ROW equality)</span>
+    existing_rows = query_database(site_name, date)
+    <span class="keyword">if</span> exact_duplicate_detected:
+        prompt_user(<span class="string">"replace all"</span> or <span class="string">"skip"</span>)  <span class="comment"># 60s timeout</span>
+    
+    <span class="comment"># Step 5: Upsert to DuckDB</span>
+    MERGE INTO daily_kpi ...   <span class="comment"># Update if changed, insert if new</span>
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🎯 Design Data Ingestion</h3>
+                <div class="alert alert-info">
+                    <strong>Constraint:</strong> Only <code>plant_details</code> and <code>array_details</code> tables can be created/updated (security lock).
+                </div>
+                <div class="code-block">
+<span class="comment"># plant_details.xlsx → Single dataset</span>
+plant_df = read_excel(<span class="string">"plant_details.xlsx"</span>)
+
+<span class="comment"># array_details.xlsx → UNION ALL sheets (no skipping)</span>
+array_df = pd.concat([read_sheet(s) <span class="keyword">for</span> s <span class="keyword">in</span> all_sheets])
+
+<span class="comment"># Change Detection (MD5 hash per row)</span>
+excel_hashes = compute_row_hashes(excel_df)
+db_hashes = compute_row_hashes(existing_db_df)
+
+<span class="keyword">if</span> excel_hashes != db_hashes:
+    <span class="function">CREATE OR REPLACE TABLE</span> ...  <span class="comment"># Atomic replace</span>
+<span class="keyword">else</span>:
+    <span class="function">print</span>(<span class="string">"No change detected – table not updated"</span>)
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">⚡ Apollo Time-Series Parsing</h3>
+                <div class="code-block">
+<span class="comment"># Column Header Format: "SITE | ICR1-INV1-SCB01 - CB Current (A)"</span>
+<span class="keyword">for</span> column <span class="keyword">in</span> excel_columns:
+    <span class="comment"># Extract components</span>
+    site_name = regex_extract(<span class="string">r"^([^|]+)\|"</span>)
+    
+    <span class="comment"># Inverter Station Mapping</span>
+    <span class="keyword">if</span> <span class="string">"ICR1"</span> <span class="keyword">in</span> header: inv_stn = <span class="string">"IS1"</span>
+    <span class="keyword">elif</span> <span class="string">"ICR20"</span> <span class="keyword">in</span> header: inv_stn = <span class="string">"IS20"</span>
+    <span class="keyword">elif</span> <span class="string">"MCR"</span> <span class="keyword">in</span> header: inv_stn = <span class="string">"IS2"</span>
+    <span class="keyword">elif</span> <span class="string">"INV 2.3"</span> <span class="keyword">in</span> header: inv_stn = <span class="string">"IS2"</span>  <span class="comment"># Special rule</span>
+    
+    <span class="comment"># Inverter Extraction</span>
+    <span class="keyword">if</span> <span class="string">"INV 1.2"</span>: inv_name = <span class="string">"INV2"</span>  <span class="comment"># Take number after dot</span>
+    <span class="keyword">else</span>: inv_name = <span class="string">"INV1"</span>
+    
+    <span class="comment"># SCB Normalization</span>
+    <span class="string">"SCB01"</span> → <span class="string">"SCB1"</span>  <span class="comment"># Strip leading zeros</span>
+    <span class="string">"SCB10"</span> → <span class="string">"SCB10"</span>
+    <span class="string">"SCBML"</span> → <span class="string">"SCBML"</span>  <span class="comment"># Preserve alpha</span>
+    
+    <span class="comment"># Wide-format output (one row per timestamp)</span>
+    output = {
+        <span class="string">"date"</span>: <span class="string">"DD-MM-YYYY"</span>,
+        <span class="string">"timestamp"</span>: <span class="string">"HH:MM"</span>,
+        <span class="string">"site_name"</span>: site_name,
+        <span class="string">"inv_stn_name"</span>: inv_stn,
+        <span class="string">"inv_name"</span>: inv_name,
+        <span class="string">"SCB1"</span>: value, <span class="string">"SCB2"</span>: value, ...
+    }
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🔌 RE-Connect Web Scraping</h3>
+                <div class="code-block">
+<span class="comment"># Selenium Automation (Chrome WebDriver)</span>
+driver = ChromeDriver(ChromeDriverManager().install())
+
+<span class="comment"># Login Flow</span>
+driver.get(<span class="string">"https://reconnect.gov.in"</span>)
+driver.find_element(<span class="string">"username"</span>).send_keys(credentials)
+driver.find_element(<span class="string">"password"</span>).send_keys(password)
+submit_and_wait()
+
+<span class="comment"># Data Download Loop (per site, per date)</span>
+<span class="keyword">for</span> site <span class="keyword">in</span> [<span class="string">"Achampet"</span>, <span class="string">"Chincholi"</span>, ...]:
+    <span class="keyword">for</span> date <span class="keyword">in</span> date_range:
+        select_site(site)
+        select_date(date)
+        click_download()
+        wait_for_csv()  <span class="comment"># Downloads to reconnect_downloads/{site}/</span>
+
+<span class="comment"># CSV Ingestion</span>
+<span class="keyword">for</span> csv <span class="keyword">in</span> downloaded_files:
+    df = pd.read_csv(csv)
+    <span class="comment"># Insert into reconnect_{site} table in DuckDB</span>
+    upsert_to_duckdb(df)
+                </div>
+            </div>
+        </section>
+
+        <!-- PIPELINE SECTION -->
+        <section id="pipeline" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">⚙️</span> master_run.py Pipeline</h2>
+                <p class="card-subtitle">One-command orchestration: Excel → DuckDB → S3</p>
+
+                <div class="code-block">
+<span class="comment"># Command-line execution</span>
+python master_run.py \
+    --dgr-dir DGR \
+    --db master.duckdb \
+    --verbose \
+    --no-progress  <span class="comment"># Optional: disable progress bars</span>
+                </div>
+
+                <div class="flow-diagram">
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">1</span>
+                            <div>
+                                <div class="flow-step-title">📂 Step 1/4: DGR Excel → DuckDB</div>
+                                <p style="color: var(--text-light);">
+                                    Calls <code>store_data_table_duckdb.py</code><br>
+                                    Loads: daily_kpi, budget_kpi, syd, pr, dc_capacity
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">1.5</span>
+                            <div>
+                                <div class="flow-step-title">🎯 Step 1.5/4: Design Data Injection</div>
+                                <p style="color: var(--text-light);">
+                                    Calls <code>design_array_injestor.py</code><br>
+                                    Loads: plant_details, array_details
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">2</span>
+                            <div>
+                                <div class="flow-step-title">🔌 Step 2/4: RE-Connect Pipeline</div>
+                                <p style="color: var(--text-light);">
+                                    2.1: <code>reconnect_downloads.py</code> (Selenium scraping)<br>
+                                    2.2: <code>reconnect_inject.py</code> (CSV → DuckDB)
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">3</span>
+                            <div>
+                                <div class="flow-step-title">⚡ Step 3/4: Apollo Time-Series Ingestion</div>
+                                <p style="color: var(--text-light);">
+                                    Calls <code>apollo_injestor.py</code><br>
+                                    Creates per-site tables (e.g., <code>aspl</code>, <code>gspl</code>)
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flow-step">
+                        <div style="display: flex; align-items: center;">
+                            <span class="flow-step-number">4</span>
+                            <div>
+                                <div class="flow-step-title">☁️ Step 4/4: Upload to S3</div>
+                                <p style="color: var(--text-light);">
+                                    Upload <code>master.duckdb</code> → <code>s3://bucket/key</code><br>
+                                    Streamlit Cloud downloads from S3 on startup
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="alert alert-warning">
+                    <strong>Error Handling:</strong> Each step validates data and aborts if critical errors occur. Non-critical warnings are logged but don't block the pipeline.
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">☁️ S3 Upload Details</h3>
+                <div class="code-block">
+<span class="comment"># Single PUT operation (no multipart) for simpler IAM permissions</span>
+<span class="keyword">def</span> <span class="function">upload_duckdb_to_s3</span>(db_path):
+    s3 = boto3.client(<span class="string">'s3'</span>,
+        aws_access_key_id=secrets[<span class="string">'AWS_ACCESS_KEY_ID'</span>],
+        aws_secret_access_key=secrets[<span class="string">'AWS_SECRET_ACCESS_KEY'</span>],
+        region_name=secrets[<span class="string">'AWS_REGION'</span>]
+    )
+    
+    <span class="comment"># Force single PUT (no multipart)</span>
+    config = TransferConfig(
+        multipart_threshold=file_size + <span class="number">1</span>,  <span class="comment"># Never trigger multipart</span>
+        use_threads=<span class="keyword">False</span>
+    )
+    
+    s3.upload_fileobj(
+        open(db_path, <span class="string">'rb'</span>),
+        bucket=secrets[<span class="string">'S3_BUCKET'</span>],
+        key=secrets[<span class="string">'S3_KEY'</span>],
+        Config=config,
+        Callback=progress_callback  <span class="comment"># Shows upload % in terminal</span>
+    )
+
+<span class="comment"># Required IAM Permissions</span>
+{
+  <span class="string">"Effect"</span>: <span class="string">"Allow"</span>,
+  <span class="string">"Action"</span>: [<span class="string">"s3:PutObject"</span>],
+  <span class="string">"Resource"</span>: <span class="string">"arn:aws:s3:::bucket/key"</span>
+}
+                </div>
+            </div>
+        </section>
+
+        <!-- CALCULATIONS SECTION -->
+        <section id="calculations" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">📊</span> Mathematical Formulae & KPIs</h2>
+                
+                <h3 style="margin-bottom: 1rem;">⚡ Core Performance Metrics</h3>
+
+                <div class="formula">
+                    <div class="formula-title">Performance Ratio (PR%)</div>
+                    <div class="formula-content">
+                        PR(%) = (Actual Energy / Expected Energy) × 100<br><br>
+                        Expected Energy = POA × Array Capacity × η_system
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Source:</strong> daily_kpi.pr_percent (directly from Excel)<br>
+                        <strong>Threshold:</strong> Typical PR > 75% is considered healthy
+                    </p>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">Capacity Utilization Factor (CUF%)</div>
+                    <div class="formula-content">
+                        CUF(%) = (Actual Energy / (Rated Capacity × 24h)) × 100<br><br>
+                        AC CUF = inv_gen_kwh / (operational_ac_mw × 1000 × 24)<br>
+                        DC CUF = (similar, using operational_dc_mwp)
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Source:</strong> daily_kpi.ac_cuf_percent, daily_kpi.dc_cuf_percent
+                    </p>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">Plant Availability (PA%)</div>
+                    <div class="formula-content">
+                        PA(%) = (Available Hours / Total Hours) × 100<br><br>
+                        Available Hours = 24h - Maintenance Time - Fault Time
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Source:</strong> daily_kpi.pa_percent
+                    </p>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">Energy Generation Availability (EGA%)</div>
+                    <div class="formula-content">
+                        EGA(%) = (Energy Available / Energy Expected) × 100
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Source:</strong> daily_kpi.ga_percent
+                    </p>
+                </div>
+
+                <h3 style="margin-top: 2.5rem; margin-bottom: 1rem;">💰 Revenue Calculation</h3>
+                <div class="formula">
+                    <div class="formula-title">Daily Revenue (INR)</div>
+                    <div class="formula-content">
+                        Revenue = inv_gen_kwh × Tariff (INR/kWh)<br><br>
+                        Example: 50,000 kWh × ₹6.00/kWh = ₹3,00,000
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Default Tariff:</strong> ₹6.00/kWh (configurable in UI)
+                    </p>
+                </div>
+
+                <h3 style="margin-top: 2.5rem; margin-bottom: 1rem;">📉 Loss Calculations</h3>
+                <div class="formula">
+                    <div class="formula-title">Energy Gap (kWh)</div>
+                    <div class="formula-content">
+                        Gap = Target Energy - Actual Energy<br>
+                        Gap = b_energy_kwh - inv_gen_kwh
+                    </div>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">Soiling Loss (kWh)</div>
+                    <div class="formula-content">
+                        Soiling Loss = (b_sl_percent / 100) × b_energy_kwh
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Source:</strong> budget_kpi.b_sl_percent (Budg Soiling Loss %)<br>
+                        <strong>Note:</strong> Unattributed gap = Total Gap - Soiling Loss
+                    </p>
+                </div>
+
+                <h3 style="margin-top: 2.5rem; margin-bottom: 1rem;">🔧 Equipment-Level Metrics</h3>
+
+                <div class="formula">
+                    <div class="formula-title">Inverter Performance Ratio (per equipment)</div>
+                    <div class="formula-content">
+                        INV_PR(%) = pr.pr_percent<br><br>
+                        Query: SELECT equipment_name, pr_percent FROM pr<br>
+                        WHERE site_name = ? AND date = ?
+                    </div>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">String Yield Deviation (SYD%)</div>
+                    <div class="formula-content">
+                        SYD(%) = syd.syd_percent<br><br>
+                        Query: SELECT equipment_name, syd_percent FROM syd<br>
+                        WHERE site_name = ? AND date = ?
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Interpretation:</strong> Lower SYD% = better performance (closer to expected yield)
+                    </p>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">SCB Current Deviation Detection</div>
+                    <div class="formula-content">
+                        For each timestamp (t), each SCB (i):<br>
+                        avg_i = mean(current_i across all timestamps in period)<br>
+                        std_i = stddev(current_i)<br><br>
+                        Deviation Score = (current_i[t] - avg_i) / std_i<br><br>
+                        Flag if: Deviation Score < threshold (e.g., -3.0 sigma)
+                    </div>
+                    <p style="margin-top: 0.75rem; color: var(--text-light); font-size: 0.9rem;">
+                        <strong>Use Case:</strong> Raw Analyser & SCB OT modules detect underperforming strings
+                    </p>
+                </div>
+
+                <h3 style="margin-top: 2.5rem; margin-bottom: 1rem;">📈 Time-Series Approximations</h3>
+                <div class="alert alert-info">
+                    Dashboard shows "last 24h" charts but DuckDB stores daily totals. We approximate hourly profiles using bell curves.
+                </div>
+
+                <div class="code-block">
+<span class="comment"># Solar Profile Generation (Gaussian bell curve)</span>
+<span class="keyword">def</span> <span class="function">_solar_profile_24h</span>(total_kwh, sunrise_hour=<span class="number">6</span>, sunset_hour=<span class="number">18</span>):
+    hours = np.arange(<span class="number">24</span>)
+    mask = (hours >= sunrise_hour) & (hours <= sunset_hour)
+    x = np.linspace(-<span class="number">2.5</span>, <span class="number">2.5</span>, mask.sum())
+    bell = np.exp(-(x**<span class="number">2</span>))  <span class="comment"># Gaussian curve</span>
+    
+    y = np.zeros(<span class="number">24</span>)
+    y[mask] = bell / bell.sum() * total_kwh  <span class="comment"># Normalize to sum = total</span>
+    <span class="keyword">return</span> y
+
+<span class="comment"># Example: 50,000 kWh distributed over 6am-6pm with peak at noon</span>
+profile = _solar_profile_24h(<span class="number">50000</span>)
+<span class="comment"># [0, 0, 0, 0, 0, 0, 1200, 3500, 5800, 7200, 8000, 7500, 5500, 3200, 1000, 0, ...]</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- DATABASE SECTION -->
+        <section id="database" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">💾</span> Database Schema (DuckDB)</h2>
+                <p class="card-subtitle">Star schema with fact tables (daily_kpi, budget_kpi) and dimension tables (pr, syd, dc_capacity)</p>
+
+                <h3 style="margin-bottom: 1rem;">📊 Core Tables</h3>
+
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Table Name</th>
+                            <th>Primary Key</th>
+                            <th>Purpose</th>
+                            <th>Row Count (typical)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>daily_kpi</strong></td>
+                            <td>(site_name, date)</td>
+                            <td>Daily performance metrics per site</td>
+                            <td>~10,000 (8 sites × 365 days × 3 years)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>budget_kpi</strong></td>
+                            <td>(site_name, date)</td>
+                            <td>Target/budget values for comparison</td>
+                            <td>~10,000</td>
+                        </tr>
+                        <tr>
+                            <td><strong>pr</strong></td>
+                            <td>(site_name, date, equipment_name)</td>
+                            <td>Inverter-level performance ratio</td>
+                            <td>~200,000 (8 sites × 20 inverters × 365 days × 3 years)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>syd</strong></td>
+                            <td>(site_name, date, equipment_name)</td>
+                            <td>String yield deviation per inverter</td>
+                            <td>~200,000</td>
+                        </tr>
+                        <tr>
+                            <td><strong>dc_capacity</strong></td>
+                            <td>(site_name, date, equipment_name)</td>
+                            <td>DC capacity (kWp) per inverter</td>
+                            <td>~200,000</td>
+                        </tr>
+                        <tr>
+                            <td><strong>plant_details</strong></td>
+                            <td>(no PK)</td>
+                            <td>Site metadata (location, capacity, etc.)</td>
+                            <td>~10 rows</td>
+                        </tr>
+                        <tr>
+                            <td><strong>array_details</strong></td>
+                            <td>(no PK)</td>
+                            <td>Array configuration (all sheets union)</td>
+                            <td>~500 rows</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">⚡ Apollo Time-Series Tables</h3>
+                <p style="color: var(--text-light); margin-bottom: 1rem;">
+                    Dynamic tables created per site (e.g., <code>aspl</code>, <code>gspl</code>, <code>nspl</code>) with wide-format schema.
+                </p>
+
+                <div class="code-block">
+<span class="comment">-- Example: aspl (ASPL site Apollo data)</span>
+<span class="keyword">CREATE TABLE</span> aspl (
+    date TEXT,              <span class="comment">-- Format: DD-MM-YYYY</span>
+    timestamp TEXT,         <span class="comment">-- Format: HH:MM</span>
+    site_name TEXT,
+    inv_stn_name TEXT,      <span class="comment">-- IS1, IS2, IS20, etc.</span>
+    inv_name TEXT,          <span class="comment">-- INV1, INV2, etc.</span>
+    
+    <span class="comment">-- Dynamic SCB columns (added as needed)</span>
+    SCB1 DOUBLE,
+    SCB2 DOUBLE,
+    SCB3 DOUBLE,
+    ...
+    SCB24 DOUBLE,
+    SCBML DOUBLE            <span class="comment">-- Main Line SCB</span>
+);
+
+<span class="comment">-- Typical row count per site:</span>
+<span class="comment">-- 365 days × 288 timestamps/day (5-min intervals) = 105,120 rows/year</span>
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">📋 daily_kpi Table Schema</h3>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Column</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                            <th>Source Excel Column</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>site_name</td><td>TEXT</td><td>Site identifier (from filename)</td><td>N/A</td></tr>
+                        <tr><td>date</td><td>DATE</td><td>Measurement date</td><td>Date</td></tr>
+                        <tr><td>days</td><td>DOUBLE</td><td>Days in period (usually 1)</td><td>Days</td></tr>
+                        <tr><td>ghi</td><td>DOUBLE</td><td>Global Horizontal Irradiance (kWh/m²)</td><td>GHI-UP (KWh/m2)</td></tr>
+                        <tr><td>poa</td><td>DOUBLE</td><td>Plane of Array irradiance (kWh/m²)</td><td>POA-UP(KWh/m2)</td></tr>
+                        <tr><td>at</td><td>DOUBLE</td><td>Ambient temperature (°C)</td><td>Amb_Temp(°C)</td></tr>
+                        <tr><td>mt</td><td>DOUBLE</td><td>Module temperature (°C)</td><td>Mod_Temp(°C)</td></tr>
+                        <tr><td>wsa</td><td>DOUBLE</td><td>Wind speed average (m/s)</td><td>WS_Avg(m/s)</td></tr>
+                        <tr><td>wsm</td><td>DOUBLE</td><td>Wind speed max (m/s)</td><td>WS_Max(m/s)</td></tr>
+                        <tr><td>pa_percent</td><td>DOUBLE</td><td>Plant Availability (%)</td><td>E_PA(%)</td></tr>
+                        <tr><td>ga_percent</td><td>DOUBLE</td><td>Energy Generation Availability (%)</td><td>E_EGA(%)</td></tr>
+                        <tr><td>pr_percent</td><td>DOUBLE</td><td>Performance Ratio (%)</td><td>PR(%)</td></tr>
+                        <tr><td>ac_cuf_percent</td><td>DOUBLE</td><td>AC Capacity Utilization Factor (%)</td><td>AC_CUF(%)</td></tr>
+                        <tr><td>dc_cuf_percent</td><td>DOUBLE</td><td>DC Capacity Utilization Factor (%)</td><td>DC_CUF(%)</td></tr>
+                        <tr><td>inv_gen_kwh</td><td>DOUBLE</td><td>Inverter generation (kWh)</td><td>Gen_Exp (kWh)</td></tr>
+                        <tr><td>abt_export_kwh</td><td>DOUBLE</td><td>Meter export (kWh)</td><td>Mtr_Export (kWh)</td></tr>
+                        <tr><td>abt_import_kwh</td><td>DOUBLE</td><td>Meter import (kWh)</td><td>Mtr_Import (kWh)</td></tr>
+                        <tr><td>abt_net_export_kwh</td><td>DOUBLE</td><td>Net export (kWh)</td><td>Mtr_Net_Exp (KWh)</td></tr>
+                        <tr><td>operational_ac_mw</td><td>DOUBLE</td><td>Operational AC capacity (MW)</td><td>Operational AC Capacity (MW)</td></tr>
+                        <tr><td>operational_dc_mwp</td><td>DOUBLE</td><td>Operational DC capacity (MWp)</td><td>Operational DC Capacity (MWp)</td></tr>
+                    </tbody>
+                </table>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🎯 budget_kpi Table Schema</h3>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Column</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                            <th>Source Excel Column</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>site_name</td><td>TEXT</td><td>Site identifier</td><td>N/A</td></tr>
+                        <tr><td>date</td><td>DATE</td><td>Budget date</td><td>Date</td></tr>
+                        <tr><td>b_poa</td><td>DOUBLE</td><td>Budget POA (kWh/m²)</td><td>Bugt_Resource</td></tr>
+                        <tr><td>b_ghi</td><td>DOUBLE</td><td>Budget GHI (placeholder, always 0)</td><td>N/A</td></tr>
+                        <tr><td>b_energy_kwh</td><td>DOUBLE</td><td>Budget energy (kWh)</td><td>Bugt_Energy</td></tr>
+                        <tr><td>b_pr_percent</td><td>DOUBLE</td><td>Budget PR (%)</td><td>Bugt PR</td></tr>
+                        <tr><td>b_cuf_percent</td><td>DOUBLE</td><td>Budget CUF (%)</td><td>Bugt CUF</td></tr>
+                        <tr><td>b_pa_percent</td><td>DOUBLE</td><td>Budget PA (%)</td><td>Bugt_PA</td></tr>
+                        <tr><td>b_ga_percent</td><td>DOUBLE</td><td>Budget EGA (%)</td><td>Bugt_EGA</td></tr>
+                        <tr><td>b_ac_mw</td><td>DOUBLE</td><td>Budget AC capacity (MW)</td><td>Bugt AC Capacity (MW)</td></tr>
+                        <tr><td>b_dc_mwp</td><td>DOUBLE</td><td>Budget DC capacity (MWp)</td><td>Bugt Capacity</td></tr>
+                        <tr><td>b_sl_percent</td><td>DOUBLE</td><td>Budget soiling loss (%)</td><td>Budg Soiling Loss (%)</td></tr>
+                    </tbody>
+                </table>
+
+                <div class="alert alert-warning" style="margin-top: 2rem;">
+                    <strong>Data Cleaning Rule:</strong> All missing/blank/non-numeric values are coerced to <code>0.0</code> during ingestion.
+                </div>
+            </div>
+        </section>
+
+        <!-- FRONTEND SECTION -->
+        <section id="frontend" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">🎨</span> Frontend Architecture</h2>
+                <p class="card-subtitle">Streamlit-based multi-page app with authentication, RBAC, and modern UI</p>
+
+                <h3 style="margin-bottom: 1rem;">🔐 Authentication Flow</h3>
+                <div class="code-block">
+<span class="comment"># auth.py - Supabase Authentication</span>
+<span class="keyword">def</span> <span class="function">check_password</span>():
+    <span class="keyword">if</span> st.session_state.get(<span class="string">"authenticated"</span>):
+        <span class="keyword">return</span> <span class="keyword">True</span>  <span class="comment"># Already logged in</span>
+    
+    <span class="comment"># Show login form</span>
+    email = st.text_input(<span class="string">"Email"</span>)
+    password = st.text_input(<span class="string">"Password"</span>, type=<span class="string">"password"</span>)
+    
+    <span class="keyword">if</span> st.button(<span class="string">"Login"</span>):
+        <span class="keyword">try</span>:
+            response = supabase.auth.sign_in_with_password({
+                <span class="string">"email"</span>: email,
+                <span class="string">"password"</span>: password
+            })
+            st.session_state.authenticated = <span class="keyword">True</span>
+            st.session_state.user_info = {
+                <span class="string">"username"</span>: email,
+                <span class="string">"user_id"</span>: response.user.id
+            }
+            st.rerun()  <span class="comment"># Refresh to show dashboard</span>
+        <span class="keyword">except</span> Exception <span class="keyword">as</span> e:
+            st.error(<span class="string">f"Login failed: {e}"</span>)
+    
+    <span class="keyword">return</span> <span class="keyword">False</span>  <span class="comment"># Block dashboard access</span>
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🛡️ Role-Based Access Control</h3>
+                <div class="code-block">
+<span class="comment"># access_control.py</span>
+ADMIN_USERS = [
+    <span class="string">"shashank@zelestra.energy"</span>,
+    <span class="string">"admin@zelestra.energy"</span>
+]
+
+<span class="keyword">def</span> <span class="function">is_admin</span>(username):
+    <span class="keyword">return</span> username <span class="keyword">in</span> ADMIN_USERS
+
+<span class="comment"># dashboard.py - Conditional UI rendering</span>
+<span class="keyword">if</span> is_admin(username):
+    allowed_pages = {
+        <span class="string">"portfolio"</span>, <span class="string">"operation"</span>, <span class="string">"reconnect"</span>, 
+        <span class="string">"add_comments"</span>, <span class="string">"meta_viewer"</span>, <span class="string">"scb_ot"</span>, 
+        <span class="string">"scb_comment"</span>, <span class="string">"raw_analyser"</span>, <span class="string">"s1"</span>, <span class="string">"s2"</span>, <span class="string">"s3"</span>
+    }
+<span class="keyword">else</span>:
+    <span class="comment"># Restricted users: SCB modules only</span>
+    allowed_pages = {<span class="string">"scb_ot"</span>, <span class="string">"scb_comment"</span>, <span class="string">"raw_analyser"</span>}
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">📱 Page Modules</h3>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Module</th>
+                            <th>File</th>
+                            <th>Key Features</th>
+                            <th>Access</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Portfolio Analytics</strong></td>
+                            <td>portfolio_analytics.py</td>
+                            <td>Multi-site KPI comparison, trend charts, revenue tracking</td>
+                            <td>Admin only</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Operation Theatre</strong></td>
+                            <td>operation_theatre.py</td>
+                            <td>Real-time monitoring, equipment health, alert dashboard</td>
+                            <td>Admin only</td>
+                        </tr>
+                        <tr>
+                            <td><strong>RE-Connect DSM</strong></td>
+                            <td>reconnect_dsm.py</td>
+                            <td>Daily status monitoring from RE-Connect data</td>
+                            <td>Admin only</td>
+                        </tr>
+                        <tr>
+                            <td><strong>SCB Operation Theatre</strong></td>
+                            <td>scb_ot.py</td>
+                            <td>SCB current analysis, deviation heatmaps, fault detection</td>
+                            <td>All users</td>
+                        </tr>
+                        <tr>
+                            <td><strong>SCB Comment</strong></td>
+                            <td>scb_comment.py</td>
+                            <td>Add/edit/view comments on SCB deviations, bulk Excel upload</td>
+                            <td>All users</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Raw Analyser</strong></td>
+                            <td>raw_analyser.py</td>
+                            <td>Time-series deep dive, normalization, heatmaps</td>
+                            <td>All users</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Meta Viewer</strong></td>
+                            <td>meta_viewer.py</td>
+                            <td>Database schema browser, table explorer</td>
+                            <td>Admin only</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Add Comments</strong></td>
+                            <td>add_comments.py</td>
+                            <td>General comment tracking system</td>
+                            <td>Admin only</td>
+                        </tr>
+                        <tr>
+                            <td><strong>S1/S2/S3 Portals</strong></td>
+                            <td>S1.py, S2.py, S3.py</td>
+                            <td>Custom workflow pages</td>
+                            <td>Admin only</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🎨 UI Components</h3>
+                <div class="grid">
+                    <div class="grid-item">
+                        <h4>KPI Cards</h4>
+                        <p>Custom HTML/CSS cards showing real-time power, PR%, CUF%, revenue with delta indicators</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Interactive Charts</h4>
+                        <p>Plotly line/area/bar charts with hover tooltips, zoom, pan, and export capabilities</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Data Tables</h4>
+                        <p>Sortable, filterable tables with cell highlighting for deviation detection</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Page Transitions</h4>
+                        <p>Smooth fade-in animations with progress bars to prevent UI ghosting</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Responsive Layout</h4>
+                        <p>Wide layout with collapsible sidebar, mobile-friendly breakpoints</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>State Management</h4>
+                        <p>Session state persistence across tabs, form data caching</p>
+                    </div>
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">⚡ Performance Optimizations</h3>
+                <div class="code-block">
+<span class="comment"># Caching strategies</span>
+@st.cache_data(show_spinner=<span class="keyword">False</span>)
+<span class="keyword">def</span> <span class="function">list_sites</span>(db_path):
+    <span class="comment"># Cache site list (rarely changes)</span>
+    <span class="keyword">return</span> query_sites(db_path)
+
+@st.cache_data(show_spinner=<span class="keyword">False</span>)
+<span class="keyword">def</span> <span class="function">get_daily_row</span>(db_path, site_name, date):
+    <span class="comment"># Cache per (site, date) - invalidates on data update</span>
+    <span class="keyword">return</span> query_daily_kpi(db_path, site_name, date)
+
+<span class="comment"># Anti-ghosting: Isolated containers per page</span>
+<span class="keyword">def</span> <span class="function">render_page</span>(page_name):
+    page_container_key = <span class="string">f"_page_container_{page_name}"</span>
+    
+    <span class="keyword">if</span> st.session_state.get(<span class="string">"_last_rendered_page"</span>) != page_name:
+        <span class="comment"># Clear stale page content</span>
+        <span class="keyword">for</span> key <span class="keyword">in</span> list(st.session_state.keys()):
+            <span class="keyword">if</span> key.startswith(<span class="string">"_page_container_"</span>) <span class="keyword">and</span> key != page_container_key:
+                st.session_state.pop(key)
+        st.session_state[<span class="string">"_last_rendered_page"</span>] = page_name
+                </div>
+            </div>
+        </section>
+
+        <!-- MAPPING SECTION -->
+        <section id="mapping" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">🗺️</span> Data Mapping & Transformations</h2>
+                
+                <h3 style="margin-bottom: 1rem;">📋 Excel → Database Column Mapping</h3>
+                
+                <h4 style="margin-top: 1.5rem; color: var(--dark);">Daily KPI Mapping</h4>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Database Column</th>
+                            <th>Excel Column Header</th>
+                            <th>Data Type</th>
+                            <th>Transformation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>date</td><td>Date</td><td>DATE</td><td>pd.to_datetime() → date</td></tr>
+                        <tr><td>days</td><td>Days</td><td>DOUBLE</td><td>_safe_number() → 0.0 if blank</td></tr>
+                        <tr><td>ghi</td><td>GHI-UP (KWh/m2)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>poa</td><td>POA-UP(KWh/m2)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>at</td><td>Amb_Temp(°C)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>mt</td><td>Mod_Temp(°C)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>wsa</td><td>WS_Avg(m/s)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>wsm</td><td>WS_Max(m/s)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>pa_percent</td><td>E_PA(%)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>ga_percent</td><td>E_EGA(%)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>pr_percent</td><td>PR(%)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>ac_cuf_percent</td><td>AC_CUF(%)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>dc_cuf_percent</td><td>DC_CUF(%)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>inv_gen_kwh</td><td>Gen_Exp (kWh)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>abt_export_kwh</td><td>Mtr_Export (kWh)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>abt_import_kwh</td><td>Mtr_Import (kWh)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>abt_net_export_kwh</td><td>Mtr_Net_Exp (KWh)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>operational_ac_mw</td><td>Operational AC Capacity (MW)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                        <tr><td>operational_dc_mwp</td><td>Operational DC Capacity (MWp)</td><td>DOUBLE</td><td>_safe_number()</td></tr>
+                    </tbody>
+                </table>
+
+                <h4 style="margin-top: 2rem; color: var(--dark);">Budget KPI Mapping</h4>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Database Column</th>
+                            <th>Excel Column Header</th>
+                            <th>Data Type</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>date</td><td>Date</td><td>DATE</td></tr>
+                        <tr><td>b_poa</td><td>Bugt_Resource</td><td>DOUBLE</td></tr>
+                        <tr><td>b_energy_kwh</td><td>Bugt_Energy</td><td>DOUBLE</td></tr>
+                        <tr><td>b_pr_percent</td><td>Bugt PR</td><td>DOUBLE</td></tr>
+                        <tr><td>b_cuf_percent</td><td>Bugt CUF</td><td>DOUBLE</td></tr>
+                        <tr><td>b_pa_percent</td><td>Bugt_PA</td><td>DOUBLE</td></tr>
+                        <tr><td>b_ga_percent</td><td>Bugt_EGA</td><td>DOUBLE</td></tr>
+                        <tr><td>b_ac_mw</td><td>Bugt AC Capacity (MW)</td><td>DOUBLE</td></tr>
+                        <tr><td>b_dc_mwp</td><td>Bugt Capacity</td><td>DOUBLE</td></tr>
+                        <tr><td>b_sl_percent</td><td>Budg Soiling Loss (%)</td><td>DOUBLE</td></tr>
+                        <tr><td>b_ghi</td><td>(none - always 0)</td><td>DOUBLE</td></tr>
+                    </tbody>
+                </table>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🔧 Equipment Name Transformations</h3>
+                <div class="alert alert-info">
+                    <strong>Apollo Data Parsing Rules</strong> - Complex regex-based extraction from column headers
+                </div>
+
+                <h4 style="color: var(--dark); margin-top: 1rem;">Inverter Station (inv_stn_name)</h4>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Input Pattern</th>
+                            <th>Output</th>
+                            <th>Rule</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>ICR1</td><td>IS1</td><td>ICR{N} → IS{N}</td></tr>
+                        <tr><td>ICR20</td><td>IS20</td><td>ICR{N} → IS{N}</td></tr>
+                        <tr><td>ICR (no number)</td><td>IS1</td><td>Default to IS1</td></tr>
+                        <tr><td>MCR</td><td>IS2</td><td>MCR → IS2 (hardcoded)</td></tr>
+                        <tr><td>INV 2.3</td><td>IS2</td><td>INV {X}.{Y} → IS{X}</td></tr>
+                    </tbody>
+                </table>
+
+                <h4 style="color: var(--dark); margin-top: 1.5rem;">Inverter Name (inv_name)</h4>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Input Pattern</th>
+                            <th>Output</th>
+                            <th>Rule</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>INV1</td><td>INV1</td><td>Direct mapping</td></tr>
+                        <tr><td>INV 1.2</td><td>INV2</td><td>Take number after dot</td></tr>
+                        <tr><td>INV 3.14</td><td>INV14</td><td>Take number after dot</td></tr>
+                    </tbody>
+                </table>
+
+                <h4 style="color: var(--dark); margin-top: 1.5rem;">SCB Name (scb_col)</h4>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Input Pattern</th>
+                            <th>Output</th>
+                            <th>Rule</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>SCB01</td><td>SCB1</td><td>Strip leading zeros</td></tr>
+                        <tr><td>SCB10</td><td>SCB10</td><td>No leading zeros</td></tr>
+                        <tr><td>SCBML</td><td>SCBML</td><td>Preserve alpha</td></tr>
+                        <tr><td>SCB 5</td><td>SCB5</td><td>Remove spaces</td></tr>
+                    </tbody>
+                </table>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🔄 Data Type Conversions</h3>
+                <div class="code-block">
+<span class="comment"># _safe_number() - Universal numeric coercion</span>
+<span class="keyword">def</span> <span class="function">_safe_number</span>(x):
+    <span class="keyword">if</span> x <span class="keyword">is</span> <span class="keyword">None</span>: <span class="keyword">return</span> <span class="number">0.0</span>
+    <span class="keyword">if</span> pd.isna(x): <span class="keyword">return</span> <span class="number">0.0</span>
+    <span class="keyword">if</span> isinstance(x, str):
+        s = x.strip()
+        <span class="keyword">if</span> s == <span class="string">""</span> <span class="keyword">or</span> s.upper() <span class="keyword">in</span> {<span class="string">"NA"</span>, <span class="string">"N/A"</span>, <span class="string">"NULL"</span>, <span class="string">"NONE"</span>, <span class="string">"-"</span>}:
+            <span class="keyword">return</span> <span class="number">0.0</span>
+        s = s.replace(<span class="string">","</span>, <span class="string">""</span>)  <span class="comment"># Remove thousand separators</span>
+        <span class="keyword">try</span>:
+            <span class="keyword">return</span> float(s)
+        <span class="keyword">except</span>:
+            <span class="keyword">return</span> <span class="number">0.0</span>
+    <span class="keyword">try</span>:
+        <span class="keyword">return</span> float(x)
+    <span class="keyword">except</span>:
+        <span class="keyword">return</span> <span class="number">0.0</span>
+
+<span class="comment"># Example transformations:</span>
+_safe_number(<span class="string">"1,234.56"</span>)   → <span class="number">1234.56</span>
+_safe_number(<span class="string">"NA"</span>)          → <span class="number">0.0</span>
+_safe_number(<span class="keyword">None</span>)         → <span class="number">0.0</span>
+_safe_number(<span class="string">""</span>)           → <span class="number">0.0</span>
+_safe_number(<span class="string">"error"</span>)      → <span class="number">0.0</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- RULES SECTION -->
+        <section id="rules" class="section">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">📜</span> Business Rules & Regulations</h2>
+                
+                <h3 style="margin-bottom: 1rem;">🔒 Data Integrity Rules</h3>
+                
+                <div class="alert alert-warning">
+                    <strong>Rule #1: Missing Data → Zero</strong><br>
+                    All missing, blank, non-numeric, or error values are coerced to <code>0.0</code> during ingestion. This prevents calculation errors and ensures consistent reporting.
+                </div>
+
+                <div class="alert alert-warning">
+                    <strong>Rule #2: Full-Row Duplicate Detection</strong><br>
+                    A row is considered a duplicate ONLY if ALL column values match an existing row exactly. Rows that share a primary key but differ in any metric are updated via MERGE (not skipped).
+                </div>
+
+                <div class="alert alert-warning">
+                    <strong>Rule #3: 60-Second Decision Window</strong><br>
+                    When exact duplicates are detected, the loader prompts: <em>"Type 'replace all' within 60 seconds to overwrite exact duplicates."</em><br>
+                    • Timeout/no input → Skip duplicates, load only new/changed rows<br>
+                    • "replace all" → Delete existing, re-insert all
+                </div>
+
+                <div class="alert alert-warning">
+                    <strong>Rule #4: Site Name Extraction</strong><br>
+                    Excel filename <code>DGR_SiteName.xlsx</code> → site_name = <code>SiteName</code><br>
+                    If filename doesn't start with "DGR_", use entire filename stem.
+                </div>
+
+                <div class="alert alert-warning">
+                    <strong>Rule #5: Design Data Table Lock</strong><br>
+                    Only <code>plant_details</code> and <code>array_details</code> tables can be created/updated by design injestor. Attempts to write other tables will raise <code>ValueError</code>.
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">⚠️ Validation Rules</h3>
+
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Check</th>
+                            <th>Condition</th>
+                            <th>Action</th>
+                            <th>Impact</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Date Validation</strong></td>
+                            <td>Date column is NULL or unparseable</td>
+                            <td>Drop row, log warning</td>
+                            <td>Row excluded from all tables</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Equipment Column Missing</strong></td>
+                            <td>Expected equipment column not found in Excel</td>
+                            <td>Create column with 0.0 values, log warning</td>
+                            <td>Metric exists in DB but all values = 0</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Apollo DATETIME Missing</strong></td>
+                            <td>DATETIME column not found in Apollo sheet</td>
+                            <td>Skip sheet, raise ValueError</td>
+                            <td>Sheet not ingested</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Unparseable Apollo Header</strong></td>
+                            <td>Column header doesn't match "SITE | IS-INV-SCB" pattern</td>
+                            <td>Skip column, log warning</td>
+                            <td>Column excluded from DB</td>
+                        </tr>
+                        <tr>
+                            <td><strong>S3 Upload Failure</strong></td>
+                            <td>AWS credentials missing or access denied</td>
+                            <td>Abort pipeline, show IAM fix instructions</td>
+                            <td>Pipeline fails, DB not uploaded</td>
+                        </tr>
+                        <tr>
+                            <td><strong>DuckDB File Missing</strong></td>
+                            <td>master.duckdb doesn't exist on S3</td>
+                            <td>Dashboard downloads from S3 on startup; shows error if missing</td>
+                            <td>Dashboard unusable</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🎯 Calculation Regulations</h3>
+
+                <div class="formula">
+                    <div class="formula-title">Regulation: PR Threshold</div>
+                    <div class="formula-content">
+                        Performance Ratio (PR%) must be ≥ 75% to be considered "healthy"<br>
+                        Lower values trigger investigation in Operation Theatre
+                    </div>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">Regulation: SCB Deviation Threshold</div>
+                    <div class="formula-content">
+                        Deviation Score = (Current - Mean) / StdDev<br>
+                        Flag SCB if: Deviation Score < -3.0 (3 sigma below mean)<br><br>
+                        This threshold is configurable in SCB OT module
+                    </div>
+                </div>
+
+                <div class="formula">
+                    <div class="formula-title">Regulation: Real-Time Power Approximation</div>
+                    <div class="formula-content">
+                        RT Power (kW) = Daily Energy (kWh) / 24h<br><br>
+                        Note: This is an approximation since DB stores daily totals, not instantaneous power
+                    </div>
+                </div>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">🔐 Security & Access Regulations</h3>
+
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Regulation</th>
+                            <th>Description</th>
+                            <th>Enforcement</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Authentication Required</strong></td>
+                            <td>All users must authenticate via Supabase before accessing dashboard</td>
+                            <td>auth.check_password() blocks at app entry</td>
+                        </tr>
+                        <tr>
+                            <td><strong>RBAC: Admin Users</strong></td>
+                            <td>Admin emails listed in ADMIN_USERS get full access to all modules</td>
+                            <td>is_admin() checked before rendering nav items</td>
+                        </tr>
+                        <tr>
+                            <td><strong>RBAC: Restricted Users</strong></td>
+                            <td>Non-admin users see SCB-related modules only (scb_ot, scb_comment, raw_analyser)</td>
+                            <td>Sidebar navigation filtered; direct URL access blocked</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Secrets Management</strong></td>
+                            <td>AWS/Supabase credentials stored in .streamlit/secrets.toml (not committed to git)</td>
+                            <td>Secrets loader with CLI/Streamlit fallback</td>
+                        </tr>
+                        <tr>
+                            <td><strong>S3 Read-Only Dashboard</strong></td>
+                            <td>Dashboard credentials (AWS_ACCESS_KEY_ID) should have read-only S3 access</td>
+                            <td>Separate upload credentials (AWS_ACCESS_KEY_ID_UPLOAD) for master_run.py</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3 style="margin-top: 2rem; margin-bottom: 1rem;">📅 Operational Regulations</h3>
+
+                <div class="grid">
+                    <div class="grid-item">
+                        <h4>Data Freshness</h4>
+                        <p><strong>Rule:</strong> Run <code>master_run.py</code> daily after DGR Excel files are updated (typically after 10 AM when generation reports are ready).</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Backup Policy</h4>
+                        <p><strong>Rule:</strong> S3 versioning enabled on bucket for master.duckdb. Retain at least 30 days of history.</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>RE-Connect Schedule</h4>
+                        <p><strong>Rule:</strong> RE-Connect scraping runs daily at 11 PM (after portal data is finalized). Timeout: 60 minutes.</p>
+                    </div>
+                    <div class="grid-item">
+                        <h4>Error Handling</h4>
+                        <p><strong>Rule:</strong> Non-critical errors (missing columns, unparseable values) are logged but don't abort the pipeline. Critical errors (S3 failure, DB corruption) abort immediately.</p>
+                    </div>
+                </div>
+
+                <div class="alert alert-info" style="margin-top: 2rem;">
+                    <strong>Compliance Note:</strong> All regulations documented here are enforced programmatically in the codebase. Manual overrides require code changes and are logged.
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer style="background: var(--dark); color: white; padding: 3rem 0; margin-top: 4rem;">
+        <div class="container">
+            <div style="text-align: center;">
+                <div style="font-size: 1.5rem; font-weight: 800; margin-bottom: 1rem;">Zelestra Dashboard</div>
+                <div style="color: rgba(255, 255, 255, 0.7); margin-bottom: 1rem;">
+                    Complete Architecture & Technical Documentation
+                </div>
+                <div style="color: rgba(255, 255, 255, 0.5); font-size: 0.9rem;">
+                    Generated: 2026-02-04 | Version: 1.0
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        function showSection(sectionId) {
+            // Hide all sections
+            document.querySelectorAll('.section').forEach(section => {
+                section.classList.remove('active');
+            });
+            
+            // Remove active class from all buttons
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Show selected section
+            document.getElementById(sectionId).classList.add('active');
+            
+            // Add active class to clicked button
+            event.target.classList.add('active');
+            
+            // Scroll to top smoothly
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        // Print functionality
+        function printDocumentation() {
+            window.print();
+        }
+
+        // Add keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'p' && e.ctrlKey) {
+                e.preventDefault();
+                printDocumentation();
+            }
+        });
+    </script>
+</body>
+</html>

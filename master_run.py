@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-import boto3
-from botocore.exceptions import ClientError
-from boto3.s3.transfer import TransferConfig
+import boto3  # type: ignore[import-untyped]
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+from boto3.s3.transfer import TransferConfig  # type: ignore[import-untyped]
 
 import store_data_table_duckdb
 import design_array_injestor
@@ -27,21 +27,116 @@ except ImportError as e:
     _reconnect_import_error = e
 
 
+_SECRETS_DEBUG = str(os.getenv("ZELES_SECRETS_DEBUG", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+_CLI_SECRETS_CACHE: Optional[dict] = None
+_CLI_SECRETS_SOURCE: Optional[str] = None
+
+
+def _secrets_debug(msg: str) -> None:
+    # Non-sensitive debug logging (presence + source only)
+    if _SECRETS_DEBUG:
+        print(f"[secrets] {msg}", file=sys.stderr, flush=True)
+
+
+def _load_cli_secrets() -> dict:
+    """
+    Best-effort loader for `.streamlit/secrets.toml` when running outside Streamlit.
+
+    This is a compatibility shim for CLI runs so the secrets resolution order remains:
+      1) Streamlit secrets (st.secrets, if available)
+      2) `.streamlit/secrets.toml` (treated as Streamlit secrets source for CLI)
+      3) Environment variables
+
+    Never logs secret values.
+    """
+    global _CLI_SECRETS_CACHE, _CLI_SECRETS_SOURCE
+    if _CLI_SECRETS_CACHE is not None:
+        return _CLI_SECRETS_CACHE
+
+    candidates = [
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+        Path.cwd() / ".streamlit" / "secrets.toml",
+        Path.home() / ".streamlit" / "secrets.toml",
+    ]
+
+    secrets: dict = {}
+    source: Optional[str] = None
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                try:
+                    import tomllib as _toml  # py3.11+
+                except Exception:  # pragma: no cover
+                    import tomli as _toml  # type: ignore[import-not-found]
+
+                txt = p.read_text(encoding="utf-8")
+                secrets = dict(_toml.loads(txt) or {})
+                source = str(p)
+                break
+        except Exception as e:
+            _secrets_debug(f"secrets.toml read failed at {p}: {type(e).__name__}")
+            continue
+
+    _CLI_SECRETS_CACHE = secrets
+    _CLI_SECRETS_SOURCE = source
+    if source:
+        _secrets_debug(f"loaded secrets.toml from {source}")
+    else:
+        _secrets_debug("no secrets.toml found in expected locations")
+    return _CLI_SECRETS_CACHE
+
+
+def _lookup_key(mapping: object, key: str) -> Optional[object]:
+    """
+    Lookup a key in a possibly-nested TOML dict. Returns the first match found.
+    """
+    if not isinstance(mapping, dict):
+        return None
+    if key in mapping:
+        return mapping.get(key)
+    for v in mapping.values():
+        if isinstance(v, dict):
+            found = _lookup_key(v, key)
+            if found is not None:
+                return found
+    return None
+
+
 def _get_secret(name: str) -> Optional[str]:
     """
     Read secrets from Streamlit if available; fallback to env vars.
     Never prints secret values.
     """
+    # 1) Streamlit secrets (preferred)
     try:
         import streamlit as st  # type: ignore
 
         v = st.secrets.get(name)  # type: ignore[attr-defined]
-        if v is not None and str(v).strip() != "":
+        ok = v is not None and str(v).strip() != ""
+        _secrets_debug(f"streamlit secrets: {name} => {'FOUND' if ok else 'NOT FOUND'}")
+        if ok:
             return str(v)
-    except Exception:
-        pass
+    except Exception as e:
+        _secrets_debug(f"streamlit secrets unavailable for {name}: {type(e).__name__}")
+
+    # 1b) CLI compatibility: load `.streamlit/secrets.toml` directly if Streamlit isn't active
+    try:
+        cli_secrets = _load_cli_secrets()
+        v_file = _lookup_key(cli_secrets, name)
+        ok_file = v_file is not None and str(v_file).strip() != ""
+        _secrets_debug(
+            f"secrets.toml ({_CLI_SECRETS_SOURCE or 'none'}): {name} => {'FOUND' if ok_file else 'NOT FOUND'}"
+        )
+        if ok_file:
+            return str(v_file)
+    except Exception as e:
+        _secrets_debug(f"secrets.toml lookup failed for {name}: {type(e).__name__}")
+
+    # 2) Environment variables
     v2 = os.getenv(name)
-    return v2 if v2 and v2.strip() != "" else None
+    ok_env = bool(v2 and v2.strip() != "")
+    _secrets_debug(f"env var: {name} => {'FOUND' if ok_env else 'NOT FOUND'}")
+    return v2 if ok_env else None
 
 
 def upload_duckdb_to_s3(*, db_path: Path, show_progress: bool = True) -> None:
@@ -183,7 +278,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if rc_design != 0:
         print(f"Design array ingestion failed with exit code {rc_design}. Aborting pipeline.")
         return int(rc_design)
-    print("✓ Design data ingestion completed")
+    print("[OK] Design data ingestion completed")
 
     # 2) RE-Connect pipeline (download -> inject)
     if not args.skip_reconnect:
@@ -198,9 +293,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("\n--- 2.1: Downloading RE-Connect data ---")
             try:
                 reconnect_downloads.main()
-                print("✓ RE-Connect download completed")
+                print("[OK] RE-Connect download completed")
             except Exception as e:
-                print(f"✗ RE-Connect download failed: {e}")
+                print(f"[ERROR] RE-Connect download failed: {e}")
                 if args.verbose:
                     import traceback
                     traceback.print_exc()
@@ -217,10 +312,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             
             rc_reconnect = reconnect_inject.main(reconnect_inject_args)
             if rc_reconnect != 0:
-                print(f"✗ RE-Connect ingestion failed with exit code {rc_reconnect}")
+                print(f"[ERROR] RE-Connect ingestion failed with exit code {rc_reconnect}")
                 print("  Continuing with S3 upload...")
             else:
-                print("✓ RE-Connect ingestion completed")
+                print("[OK] RE-Connect ingestion completed")
     else:
         print("=== Step 2/4: RE-Connect pipeline (SKIPPED by user request) ===")
 
@@ -246,15 +341,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if rc_apollo != 0:
         print(f"Apollo ingestion failed with exit code {rc_apollo}. Aborting pipeline (no S3 upload).")
         return int(rc_apollo)
-    print("✓ Apollo ingestion completed")
+    print("[OK] Apollo ingestion completed")
 
     # 4) Upload DuckDB -> S3 (overwrites object at bucket/key)
     print("\n=== Step 4/4: Uploading DuckDB to AWS S3 ===")
     try:
         upload_duckdb_to_s3(db_path=db_path, show_progress=not bool(args.no_progress))
-        print("✓ Upload complete. Your deployed Streamlit app will use the latest DuckDB from S3.")
+        print("[OK] Upload complete. Your deployed Streamlit app will use the latest DuckDB from S3.")
     except Exception as e:
-        print(f"✗ S3 upload failed: {e}")
+        print(f"[ERROR] S3 upload failed: {e}")
         return 1
     
     return 0

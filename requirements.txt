@@ -4,13 +4,29 @@ duckdb>=0.10.0
 tqdm>=4.66.0
 streamlit>=1.37.0
 plotly>=5.22.0
-kaleido>=0.2.1
-supabase>=2.0.0
-streamlit-aggrid>=0.3.4.post3
+# NOTE: Kaleido is used for Plotly static exports; it is not required for the CLI pipeline.
+# Some transitive deps may require native build tools on newer Python versions.
+kaleido>=0.2.1; python_version < "3.14"
+# NOTE: On Python 3.14, older `httpcore` (pulled by very old `supabase`) can crash at import time.
+# `supabase==2.15.0` uses `httpcore==1.*` (compatible with Python 3.14) and avoids native-build-only deps
+# like `pyroaring` seen in some newer Supabase/storage combinations.
+supabase==2.15.0
+# NOTE: `streamlit-aggrid` is optional (code is defensive), and some transitive deps
+# may require native build tools on newer Python versions. Keep it enabled for common
+# supported versions, but skip on Python 3.14+ unless you intentionally install build tools.
+streamlit-aggrid>=0.3.4.post3; python_version < "3.14"
 boto3>=1.34.0
+numpy>=1.24.0
+selenium>=4.0.0
+webdriver-manager>=4.0.0
+# Dash-based DSM UI (present in repo under `DSM MASTER/`)
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+dash-mantine-components>=0.12.1
 python-calamine>=0.2.0
 python-docx>=1.1.0
 docx2pdf>=0.1.8
+tomli>=2.0.1; python_version < "3.11"
 pywin32>=306;platform_system=="Windows"
 PyPDF2>=3.0.0
 reportlab>=4.0.0
