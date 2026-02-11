@@ -128,6 +128,72 @@ MODERN_UI_CSS = """
 }
 
 /* ========================================================================
+   STATEFUL NAV (radio styled as tabs) — used for deterministic UX (S1)
+   ======================================================================== */
+
+.nav-tabs div[data-testid="stRadio"] {
+    background: transparent !important;
+    padding: 0 !important;
+    margin: 0 0 1.5rem 0 !important;
+}
+
+.nav-tabs div[data-testid="stRadio"] [role="radiogroup"] {
+    display: flex !important;
+    gap: 0.5rem !important;
+    flex-wrap: nowrap !important;
+    padding: 0.5rem 0.25rem !important;
+    border-bottom: 2px solid var(--neutral-200) !important;
+}
+
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] {
+    background: white !important;
+    border: 1.5px solid var(--neutral-200) !important;
+    border-radius: 12px !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03) !important;
+    overflow: hidden !important;
+}
+
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] > div {
+    padding: 0.75rem 1.5rem !important;
+}
+
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] * {
+    font-size: 15px !important;
+    font-weight: 600 !important;
+    color: var(--neutral-700) !important;
+    letter-spacing: -0.01em !important;
+    white-space: nowrap !important;
+}
+
+/* Hide the default radio dot/input */
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] svg,
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] input {
+    display: none !important;
+}
+
+/* Hover = same as tab hover */
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"]:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.1) !important;
+    border-color: var(--primary-blue-light) !important;
+    background: var(--neutral-50) !important;
+}
+
+/* Selected = light-blue surface with dark text (readable) */
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"] {
+    background: linear-gradient(135deg, var(--primary-blue-200) 0%, var(--primary-blue-100) 100%) !important;
+    border-color: var(--primary-blue-light) !important;
+}
+
+.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"] * {
+    color: var(--neutral-900) !important;
+    font-weight: 700 !important;
+}
+
+/* ========================================================================
    MODERN CARDS & CONTAINERS
    ======================================================================== */
 
@@ -690,6 +756,17 @@ button[type="submit"]:hover {
 /* ========================================================================
    FORM SECTIONS
    ======================================================================== */
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.75rem;
+    border-radius: 999px;
+    font-weight: 700;
+    font-size: 0.85rem;
+    margin: 0.25rem 0 0.75rem 0;
+}
 
 .section-title {
     font-size: 1.125rem;

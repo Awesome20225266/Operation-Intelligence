@@ -1049,12 +1049,21 @@ def _render_view_approvals() -> None:
         permit_no = str(row.get("permit_no") or "")
         site_name = str(row.get("site_name") or "")
         status = str(row.get("derived_status") or "PENDING_AT_S3")
+        s = status.strip().upper()
+        badge = "⚪"
+        if s == "PENDING_AT_S3":
+            badge = "🔴"
+        elif s in ("APPROVED", "CLOSED"):
+            badge = "🟢"
+        elif s == "REJECTED":
+            badge = "⛔"
         created = row.get("created_at", "")
         try:
             created = pd.to_datetime(created).strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
-        return f"{permit_no} | {site_name} | {status} | {created}"
+        # Keep permit_no first so split("|")[0] remains stable.
+        return f"{permit_no} | {site_name} | {badge} {status} | {created}"
 
     options = ["(select PTW)"] + [
         _build_s3_ptw_label(r) for _, r in df.iterrows()
@@ -1089,6 +1098,29 @@ def _render_view_approvals() -> None:
     site_name = str(r.get("site_name") or "")
     status = str(r.get("derived_status") or "")
     is_db_approved = bool(r.get("is_approved", False))
+
+    # Status badge (Streamlit-safe)
+    st_status = status.strip().upper()
+    if st_status == "PENDING_AT_S3":
+        st.markdown(
+            "<div class='status-badge' style='background:#fee2e2;color:#7f1d1d;border:1px solid #fecaca;'>🔴 Pending Approval</div>",
+            unsafe_allow_html=True,
+        )
+    elif st_status == "APPROVED":
+        st.markdown(
+            "<div class='status-badge' style='background:#dcfce7;color:#065f46;border:1px solid #bbf7d0;'>🟢 Approved</div>",
+            unsafe_allow_html=True,
+        )
+    elif st_status == "CLOSED":
+        st.markdown(
+            "<div class='status-badge' style='background:#d1fae5;color:#065f46;border:1px solid #a7f3d0;'>🟢 Closed</div>",
+            unsafe_allow_html=True,
+        )
+    elif st_status == "REJECTED":
+        st.markdown(
+            "<div class='status-badge' style='background:#fee2e2;color:#7f1d1d;border:1px solid #fecaca;'>⛔ Rejected</div>",
+            unsafe_allow_html=True,
+        )
 
     fwd = r.get("date_s2_forwarded")
     fwd_str = ""
@@ -1462,6 +1494,12 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
 
 
 def render(db_path: str) -> None:
+    # Hard access guard (prevents manual bypass via session_state tampering)
+    username = (st.session_state.get("username") or "").strip().lower()
+    if username not in {"admin", "richpal"}:
+        st.error("Access Denied - S3 Only")
+        st.stop()
+
     st.markdown("# S3 Portal")
     st.caption("Final PTW Approval Stage (read-only except approval).")
 

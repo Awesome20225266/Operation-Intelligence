@@ -2689,6 +2689,12 @@ def render(db_path: str) -> None:
     - Request PTW: Full Electrical PTW form
     - View Applied PTW: Browse and download submitted PTWs
     """
+    # Hard access guard (prevents manual bypass via session_state tampering)
+    username = (st.session_state.get("username") or "").strip().lower()
+    if username not in {"admin", "labhchand"}:
+        st.error("Access Denied - S1 Only")
+        st.stop()
+
     st.markdown("# S1 Portal")
 
     # Import modern UI styles
@@ -2711,20 +2717,32 @@ def render(db_path: str) -> None:
         st.session_state["ptw_just_submitted"] = False
 
     # =========================================================================
-    # Modern Tab Navigation (matches S2/S3 design)
+    # Deterministic Navigation (no tab reset on rerun)
+    # NOTE: Streamlit `st.tabs()` can jump back to the first tab after a button
+    # click/form submit because the script reruns from top. We keep navigation
+    # state explicitly in session_state and style it like tabs via CSS.
     # =========================================================================
-    tab1, tab2, tab3, tab4 = st.tabs(["View Work Order", "Request PTW", "View Applied PTW", "Permit Closure"])
-    
-    with tab1:
+    options = ["View Work Order", "Request PTW", "View Applied PTW", "Permit Closure"]
+    if "s1_nav_page" not in st.session_state:
+        st.session_state["s1_nav_page"] = options[0]
+
+    st.markdown('<div class="nav-tabs">', unsafe_allow_html=True)
+    active = st.radio(
+        " ",
+        options=options,
+        horizontal=True,
+        key="s1_nav_page",
+        label_visibility="collapsed",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if active == "View Work Order":
         _render_view_work_order()
-    
-    with tab2:
+    elif active == "Request PTW":
         _render_request_ptw()
-    
-    with tab3:
+    elif active == "View Applied PTW":
         _render_view_applied_ptw()
-    
-    with tab4:
+    else:
         _render_permit_closure()
 
 

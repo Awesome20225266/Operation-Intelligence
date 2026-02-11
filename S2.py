@@ -1216,13 +1216,25 @@ def _render_view_submitted_ptw_body() -> None:
         permit_no = str(row.get("permit_no", "") or "")
         site = row.get("site_name", "")
         created = row.get("created_at", "")
-        status = str(row.get("status") or "").strip() or "PENDING AT S2"
+        status = str(row.get("status") or "").strip() or "PENDING_AT_S2"
+
+        s = status.strip().upper()
+        badge = "⚪"
+        if s == "PENDING_AT_S2":
+            badge = "🔴"
+        elif s == "PENDING_AT_S3":
+            badge = "🟠"
+        elif s in ("APPROVED_BY_S3", "APPROVED", "CLOSED"):
+            badge = "🟢"
+        elif s == "REJECTED":
+            badge = "⛔"
 
         try:
             created = pd.to_datetime(created).strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
-        return f"{permit_no} | {site} | {status} | {created}"
+        # Keep permit_no first so downstream parsing remains stable.
+        return f"{permit_no} | {site} | {badge} {status} | {created}"
     
     ptw_options = {
         _build_ptw_option(row): row
@@ -1248,12 +1260,47 @@ def _render_view_submitted_ptw_body() -> None:
         work_order_id = str(row.get("permit_no", "") or "")
         site_name = row.get("site_name", "")
         work_location = row.get("work_location", "")
-        status = row.get("status", "OPEN")
+        status = str(row.get("status", "OPEN") or "").strip() or "OPEN"
         form_data = row.get("form_data", {}) or {}
         date_s2_forwarded = row.get("date_s2_forwarded")
         
-        # Check if already forwarded (disable editing)
-        is_forwarded = date_s2_forwarded is not None and str(date_s2_forwarded).strip() != ""
+        # Check if forwarded based on S2 aggregated display status.
+        # Important: mixed partial-forward / partial-approve is intentionally actionable at S2
+        # and is represented as PENDING_AT_S2 even if some WOs have date_s2_forwarded.
+        is_forwarded = status.strip().upper() == "PENDING_AT_S3"
+
+        # Streamlit-safe status badge (selectbox items can't be reliably colored)
+        st_status = status.strip().upper()
+        if st_status == "PENDING_AT_S2":
+            st.markdown(
+                "<div class='status-badge' style='background:#fee2e2;color:#7f1d1d;border:1px solid #fecaca;'>🔴 Pending at S2</div>",
+                unsafe_allow_html=True,
+            )
+        elif st_status == "PENDING_AT_S3":
+            st.markdown(
+                "<div class='status-badge' style='background:#ffedd5;color:#7c2d12;border:1px solid #fed7aa;'>🟠 Pending at S3</div>",
+                unsafe_allow_html=True,
+            )
+        elif st_status in ("APPROVED_BY_S3", "APPROVED"):
+            st.markdown(
+                "<div class='status-badge' style='background:#dcfce7;color:#065f46;border:1px solid #bbf7d0;'>🟢 Approved</div>",
+                unsafe_allow_html=True,
+            )
+        elif st_status == "CLOSED":
+            st.markdown(
+                "<div class='status-badge' style='background:#d1fae5;color:#065f46;border:1px solid #a7f3d0;'>🟢 Closed</div>",
+                unsafe_allow_html=True,
+            )
+        elif st_status == "REJECTED":
+            st.markdown(
+                "<div class='status-badge' style='background:#fee2e2;color:#7f1d1d;border:1px solid #fecaca;'>⛔ Rejected</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div class='status-badge' style='background:#e0f2fe;color:#0f172a;border:1px solid #bae6fd;'>⚪ Open</div>",
+                unsafe_allow_html=True,
+            )
         
         # Check if just submitted (show success state)
         just_submitted_key = f"s2_wo_{work_order_id}_just_submitted"
@@ -2019,6 +2066,12 @@ def render(db_path: str) -> None:
     - View Work Order: Read-only view of work orders
     - View Submitted PTW: Review and forward PTWs from S1
     """
+    # Hard access guard (prevents manual bypass via session_state tampering)
+    username = (st.session_state.get("username") or "").strip().lower()
+    if username not in {"admin", "durgesh"}:
+        st.error("Access Denied - S2 Only")
+        st.stop()
+
     st.markdown("# S2 Portal")
     st.caption("PTW Review & Forwarding Stage")
 

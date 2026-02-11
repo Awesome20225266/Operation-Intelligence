@@ -25,7 +25,7 @@ import S2
 import S3
 from aws_duckdb import get_duckdb_connection
 import auth
-from access_control import is_admin
+from access_control import allowed_modules_for_user, is_admin
 
 # -----------------------------
 # App config
@@ -1243,16 +1243,35 @@ def main() -> None:
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = "portfolio"
 
-    user_info = st.session_state.get("user_info", {})
-    username = user_info.get("username")
+    user_info = st.session_state.get("user_info", {}) or {}
+    # Prefer normalized username set by auth.check_password(); fall back to user_info
+    username = (st.session_state.get("username") or user_info.get("username") or "").strip().lower() or None
+
+    allowed_modules = allowed_modules_for_user(username)
 
     if is_admin(username):
         allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot", "scb_comment", "raw_analyser", "s1", "s2", "s3"}
         default_page = "portfolio"
     else:
-        # Restricted users: ONLY these tabs must exist in the UI.
-        allowed_pages = {"scb_ot", "scb_comment", "raw_analyser"}
-        default_page = "scb_ot"
+        # PTW restricted users: only their allowed portal(s) should be accessible.
+        # Unknown/non-whitelisted users: deny access.
+        if not allowed_modules:
+            st.error("Access Denied")
+            st.stop()
+
+        allowed_pages = set()
+        if "S1" in allowed_modules:
+            allowed_pages.add("s1")
+        if "S2" in allowed_modules:
+            allowed_pages.add("s2")
+        if "S3" in allowed_modules:
+            allowed_pages.add("s3")
+
+        # Default to the single allowed portal (or first in stable order)
+        for candidate in ("s1", "s2", "s3"):
+            if candidate in allowed_pages:
+                default_page = candidate
+                break
 
     if st.session_state.nav_page not in allowed_pages:
         st.session_state.nav_page = default_page
@@ -1316,11 +1335,13 @@ def main() -> None:
                     ("s3", "✅  S3"),
                 ]
             else:
-                nav_items = [
-                    ("scb_ot", "⚡  SCB OT"),
-                    ("scb_comment", "🧾  SCB Comment"),
-                    ("raw_analyser", "🧪  Raw Analyser"),
-                ]
+                nav_items = []
+                if "S1" in allowed_modules:
+                    nav_items.append(("s1", "📋  S1"))
+                if "S2" in allowed_modules:
+                    nav_items.append(("s2", "📝  S2"))
+                if "S3" in allowed_modules:
+                    nav_items.append(("s3", "✅  S3"))
 
             for key, label in nav_items:
                 is_active = st.session_state.nav_page == key
@@ -1385,10 +1406,10 @@ def main() -> None:
     f = Filters(site_name=site_name, as_of_date=as_of_date, tariff_inr_per_kwh=float(tariff))
     page = st.session_state.nav_page
 
-    # Defensive routing safety: restricted users cannot access hidden pages even if nav_page is tampered.
-    if not is_admin(username) and page not in {"scb_ot", "scb_comment", "raw_analyser"}:
-        st.error("Unauthorized page access")
-        return
+    # Defensive routing safety: block hidden pages even if nav_page is tampered.
+    if page not in allowed_pages:
+        st.error("Access Denied")
+        st.stop()
 
     # =========================================================================
     # ANTI-GHOSTING: Create isolated page container

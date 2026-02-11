@@ -229,6 +229,12 @@ def check_password() -> bool:
                 # Success - set session state immediately
                 st.session_state["password_correct"] = True
                 st.session_state["user_info"] = res.data[0]
+                # Store normalized username for access control (required by access_control.py)
+                try:
+                    db_username = str((res.data[0] or {}).get("username") or username)
+                except Exception:
+                    db_username = str(username)
+                st.session_state["username"] = db_username.strip().lower()
                 # Clear sensitive data and error state
                 if "password_input" in st.session_state:
                     del st.session_state["password_input"]
