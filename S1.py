@@ -50,36 +50,35 @@ TABLE_PTW_REQUESTS = "ptw_requests"
 TABLE_PTW_TEMPLATES = "ptw_templates"
 
 # Internal (derived) statuses — do not change derive_ptw_status outputs
-INTERNAL_STATUSES = ["OPEN", "WIP", "APPROVED", "REJECTED"]
+INTERNAL_STATUSES = ["OPEN", "WIP", "APPROVED", "CLOSED", "REJECTED"]
 
 # Canonical UI labels (display only)
-UI_STATUSES = ["Approved", "Awaiting Approval", "Open", "Rejected"]
+UI_STATUSES = ["Closed", "Approved", "Awaiting Approval", "Open", "Rejected"]
 
 # DB <-> UI mapping (keeps DB schema intact while matching requested UI labels)
-# Note: "CLOSED" and "APPROVED" both map to "Approved" for UI display
 DB_STATUS_TO_UI = {
     "OPEN": "Open",
-    "PENDING": "Awaiting Approval",
     "WIP": "Awaiting Approval",
     "APPROVED": "Approved",
-    "CLOSED": "Approved",
+    "CLOSED": "Closed",
     "REJECTED": "Rejected",
 }
 UI_STATUS_TO_DB = {
     "Open": ["OPEN"],
-    "Awaiting Approval": ["PENDING", "WIP"],
-    "Approved": ["APPROVED", "CLOSED"],
+    "Awaiting Approval": ["WIP"],
+    "Approved": ["APPROVED"],
+    "Closed": ["CLOSED"],
     "Rejected": ["REJECTED"],
 }
 
 # Default status sort order (derived status; single source of truth)
-# Required order: Approved, Awaiting Approval (WIP), Open, Rejected
+# Required order: Closed, Approved, Awaiting Approval (WIP), Open, Rejected
 STATUS_ORDER = {
-    "APPROVED": 0,
     "CLOSED": 0,
-    "WIP": 1,
-    "OPEN": 2,
-    "REJECTED": 3,
+    "APPROVED": 1,
+    "WIP": 2,
+    "OPEN": 3,
+    "REJECTED": 4,
 }
 
 # Placeholder regex for template processing
@@ -116,9 +115,10 @@ def derive_ptw_status(row: dict) -> str:
     
     Priority Rules:
     1. REJECTED - If ANY rejection date exists (highest priority)
-    2. APPROVED - If s1_created, s2_forwarded, s3_approved all exist (no rejections)
-    3. WIP - If s1_created exists but not fully approved (no rejections)
-    4. OPEN - Fallback when all PTW date columns are NULL
+    2. CLOSED - If date_s1_closed exists
+    3. APPROVED - If s1_created, s2_forwarded, s3_approved all exist (no rejections)
+    4. WIP - If s1_created exists (no rejections)
+    5. OPEN - Fallback when all PTW date columns are NULL
     
     Args:
         row: Dict with date columns (date_s1_created, date_s2_forwarded, 
@@ -133,6 +133,7 @@ def derive_ptw_status(row: dict) -> str:
     s3_approved = row.get("date_s3_approved")
     s2_rejected = row.get("date_s2_rejected")
     s3_rejected = row.get("date_s3_rejected")
+    s1_closed = row.get("date_s1_closed")
     
     # Helper to check if value is "truthy" (not None, not NaN, not empty)
     def has_value(val) -> bool:
@@ -147,6 +148,10 @@ def derive_ptw_status(row: dict) -> str:
     # Priority 1: REJECTED (any rejection date exists)
     if has_value(s2_rejected) or has_value(s3_rejected):
         return "REJECTED"
+
+    # Priority 2: CLOSED
+    if has_value(s1_closed):
+        return "CLOSED"
     
     # Priority 2: APPROVED (full approval chain complete, no rejections)
     if has_value(s1_created) and has_value(s2_forwarded) and has_value(s3_approved):
@@ -158,7 +163,7 @@ def derive_ptw_status(row: dict) -> str:
     if has_value(s1_created):
         return "WIP"
     
-    # Priority 4: OPEN (fallback - no PTW activity)
+    # Priority 5: OPEN (fallback - no PTW activity)
     return "OPEN"
 
 
@@ -262,10 +267,9 @@ def _list_work_order_ids_by_date(selected_date: date) -> list[str]:
     
     resp = (
         sb.table(TABLE_WORK_ORDERS)
-        .select("work_order_id")
+        .select("work_order_id,date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected")
         .gte("date_planned", f"{date_str}T00:00:00")
         .lt("date_planned", f"{date_str}T23:59:59")
-        .eq("status", "OPEN")
         .order("work_order_id", desc=False)
         .execute()
     )
@@ -275,7 +279,61 @@ def _list_work_order_ids_by_date(selected_date: date) -> list[str]:
         raise RuntimeError(f"Failed to fetch work_order_ids: {err}")
     
     rows = getattr(resp, "data", None) or []
-    return [str(r["work_order_id"]) for r in rows if r.get("work_order_id")]
+    out: list[str] = []
+    for r in rows:
+        woid = str(r.get("work_order_id") or "").strip()
+        if not woid:
+            continue
+        if derive_ptw_status(r) == "OPEN":
+            out.append(woid)
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _build_work_order_display_map(selected_date: date) -> dict[str, str]:
+    """
+    Returns mapping:
+    {
+        "WO100 - IS16 - Transformer A": "WO100",
+        ...
+    }
+    Only OPEN (derived) work orders for selected date.
+    """
+    sb = get_supabase_client(prefer_service_role=True)
+
+    date_str = selected_date.isoformat()
+
+    resp = (
+        sb.table(TABLE_WORK_ORDERS)
+        .select(
+            "work_order_id,location,equipment,"
+            "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
+        )
+        .gte("date_planned", f"{date_str}T00:00:00")
+        .lt("date_planned", f"{date_str}T23:59:59")
+        .order("work_order_id", desc=False)
+        .execute()
+    )
+
+    err = getattr(resp, "error", None)
+    if err:
+        raise RuntimeError(f"Failed to fetch work orders: {err}")
+
+    rows = getattr(resp, "data", None) or []
+
+    display_map: dict[str, str] = {}
+    for r in rows:
+        if derive_ptw_status(r) != "OPEN":
+            continue
+        wo = str(r.get("work_order_id", "")).strip()
+        loc = str(r.get("location", "")).strip()
+        eq = str(r.get("equipment", "")).strip()
+        if not wo:
+            continue
+        label = f"{wo} - {loc} - {eq}".strip(" -")
+        display_map[label] = wo
+
+    return display_map
 
 
 def _get_work_order_details(work_order_id: str) -> dict | None:
@@ -376,7 +434,7 @@ def _list_statuses_from_work_orders(
     end_dt_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
 
     # Fetch date columns for status derivation
-    cols = "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
+    cols = "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected,date_s1_closed"
     
     while True:
         q = (
@@ -402,9 +460,6 @@ def _list_statuses_from_work_orders(
         for r in rows:
             # Derive status from date columns
             derived = derive_ptw_status(r)
-            # Map CLOSED -> APPROVED (internal normalization for UI)
-            if derived == "CLOSED":
-                derived = "APPROVED"
             if derived in INTERNAL_STATUSES:
                 statuses_internal.add(derived)
         
@@ -439,7 +494,7 @@ def _fetch_work_orders(
     # Include date columns for status derivation
     cols = (
         "work_order_id,location,equipment,frequency,isolation_requirement,date_planned,"
-        "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
+        "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected,date_s1_closed"
     )
     q = sb.table(TABLE_WORK_ORDERS).select(cols).eq("site_name", site_name)
 
@@ -473,24 +528,16 @@ def _fetch_work_orders(
     # DERIVE status from date columns (single source of truth)
     df["status"] = df.apply(lambda row: derive_ptw_status(row.to_dict()), axis=1)
     
-    # Filter by derived status if requested
+    # Filter by derived status if requested (derived statuses only)
     if status_ui:
         sel = str(status_ui).strip()
         internal_targets = UI_STATUS_TO_DB.get(sel, [sel.strip().upper()])
-
-        # Filter for Approved includes both APPROVED and CLOSED derived statuses
-        if "APPROVED" in internal_targets or "CLOSED" in internal_targets:
-            df = df[df["status"].isin(["APPROVED", "CLOSED"])]
-        # Awaiting Approval maps to internal WIP
-        elif "WIP" in internal_targets or "PENDING" in internal_targets:
+        target = internal_targets[0] if internal_targets else sel.strip().upper()
+        if target == "WIP":
             df = df[df["status"] == "WIP"]
         else:
-            target = internal_targets[0] if internal_targets else sel.strip().upper()
             df = df[df["status"] == target]
     
-    # Map CLOSED -> APPROVED for UI display
-    df["status"] = df["status"].replace({"CLOSED": "APPROVED"})
-
     # Select only display columns (hide internal date columns)
     ordered_cols = [
         "work_order_id",
@@ -523,7 +570,8 @@ def _highlight_status(val: Any) -> str:
     Colors:
     - OPEN: Blue (#2563eb)
     - WIP: Orange (#f97316)
-    - APPROVED/CLOSED: Green (#10b981)
+    - APPROVED: Green (#10b981)
+    - CLOSED: Darker green (#065f46)
     - REJECTED: Red (#dc2626)
     """
     status = str(val).strip().upper()
@@ -532,8 +580,10 @@ def _highlight_status(val: Any) -> str:
         return "background-color: #2563eb; color: white; font-weight: 700;"
     elif status in ("WIP", "AWAITING APPROVAL"):
         return "background-color: #f97316; color: white; font-weight: 700;"
-    elif status in ("CLOSED", "APPROVED"):
+    elif status == "APPROVED":
         return "background-color: #10b981; color: white; font-weight: 700;"
+    elif status == "CLOSED":
+        return "background-color: #065f46; color: white; font-weight: 700;"
     elif status == "REJECTED":
         return "background-color: #dc2626; color: white; font-weight: 700;"
     return ""
@@ -553,50 +603,55 @@ TEMPLATE_FILE_NAME = "Electrical_PTW_TEMPLATE.docx"
 TEMPLATE_PDF_FILE_NAME = "PDF_Electrical_PTW_TEMPLATE.pdf"  # ReportLab overlay template
 
 
-def _ptw_exists_for_work_order(work_order_id: str) -> tuple[bool, str | None]:
+def _ptw_exists_for_work_orders(selected_ids: list[str]) -> tuple[bool, str | None]:
     """
-    Enforce 1 PTW per work_order_id at S1 level.
+    Prevent duplicate PTW coverage.
+    If ANY selected work_order_id already exists in any PTW, block submission.
 
-    We check both:
-    - ptw_requests.permit_no == work_order_id (current design)
-    - ptw_requests.form_data contains {"work_order_id": work_order_id} (backward safety)
+    Backward compatible with legacy single-WO PTWs.
     """
-    if not work_order_id:
+    if not selected_ids:
         return False, None
 
     sb = get_supabase_client(prefer_service_role=True)
 
-    # Primary check: permit_no == work_order_id
-    resp1 = (
-        sb.table(TABLE_PTW_REQUESTS)
-        .select("ptw_id")
-        .eq("permit_no", work_order_id)
-        .limit(1)
-        .execute()
-    )
-    err1 = getattr(resp1, "error", None)
-    if err1:
-        raise RuntimeError(f"Failed to check existing PTW (permit_no): {err1}")
-    rows1 = getattr(resp1, "data", None) or []
-    if rows1:
-        return True, rows1[0].get("ptw_id")
+    resp = sb.table(TABLE_PTW_REQUESTS).select("ptw_id,permit_no,form_data").order("created_at", desc=True).execute()
+    err = getattr(resp, "error", None)
+    if err:
+        raise RuntimeError(f"Failed to check existing PTWs: {err}")
 
-    # Secondary check: form_data contains work_order_id
-    resp2 = (
-        sb.table(TABLE_PTW_REQUESTS)
-        .select("ptw_id")
-        .contains("form_data", {"work_order_id": work_order_id})
-        .limit(1)
-        .execute()
-    )
-    err2 = getattr(resp2, "error", None)
-    if err2:
-        raise RuntimeError(f"Failed to check existing PTW (form_data): {err2}")
-    rows2 = getattr(resp2, "data", None) or []
-    if rows2:
-        return True, rows2[0].get("ptw_id")
+    rows = getattr(resp, "data", None) or []
+    selected_set = {str(x).strip() for x in selected_ids if str(x).strip()}
+    if not selected_set:
+        return False, None
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        fd = row.get("form_data") or {}
+        if not isinstance(fd, dict):
+            fd = {}
+
+        existing_ids = fd.get("work_order_ids")
+        if isinstance(existing_ids, list) and existing_ids:
+            existing_set = {str(x).strip() for x in existing_ids if str(x).strip()}
+            if existing_set & selected_set:
+                return True, row.get("ptw_id")
+
+        # Legacy support: single-work-order PTWs
+        permit_no = str(row.get("permit_no") or "").strip()
+        legacy_wo = str(fd.get("work_order_id") or "").strip()
+        if permit_no and permit_no in selected_set:
+            return True, row.get("ptw_id")
+        if legacy_wo and legacy_wo in selected_set:
+            return True, row.get("ptw_id")
 
     return False, None
+
+
+def _ptw_exists_for_work_order(work_order_id: str) -> tuple[bool, str | None]:
+    """Backward compatible single-WO wrapper."""
+    return _ptw_exists_for_work_orders([work_order_id] if work_order_id else [])
 
 
 def _reset_ptw_form_state() -> None:
@@ -785,38 +840,78 @@ def fetch_ptw_requests(
     if df.empty:
         return df
     
-    # Derive status + lifecycle dates from work_orders date columns
-    # permit_no in ptw_requests = work_order_id in work_orders
-    work_order_ids = df["permit_no"].unique().tolist()
-    
-    if work_order_ids:
-        # Fetch date columns from work_orders for status derivation + lifecycle filtering
+    # Derive status + lifecycle dates from work_orders date columns.
+    # Multi-WO PTWs: ids are stored in form_data["work_order_ids"] (fallback to permit_no legacy).
+    def _row_work_order_ids(r: dict) -> list[str]:
+        try:
+            fd = r.get("form_data") or {}
+            if isinstance(fd, dict):
+                ids = fd.get("work_order_ids")
+                if isinstance(ids, list) and ids:
+                    return [str(x).strip() for x in ids if str(x).strip()]
+                legacy = str(fd.get("work_order_id") or "").strip()
+                if legacy:
+                    return [legacy]
+        except Exception:
+            pass
+        pn = str(r.get("permit_no") or "").strip()
+        return [pn] if pn else []
+
+    all_ids: set[str] = set()
+    ids_per_row: list[list[str]] = []
+    for _, row in df.iterrows():
+        rr = row.to_dict() if hasattr(row, "to_dict") else {}
+        ids = _row_work_order_ids(rr)
+        ids_per_row.append(ids)
+        all_ids.update(ids)
+
+    status_lookup: dict[str, str] = {}
+    s1_created_lookup: dict[str, Any] = {}
+    if all_ids:
         wo_resp = (
             sb.table(TABLE_WORK_ORDERS)
             .select(
-                "work_order_id,date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
+                "work_order_id,date_s1_created,date_s2_forwarded,date_s3_approved,"
+                "date_s2_rejected,date_s3_rejected,date_s1_closed"
             )
-            .in_("work_order_id", work_order_ids)
+            .in_("work_order_id", list(all_ids))
             .execute()
         )
         wo_data = getattr(wo_resp, "data", None) or []
-        
         if wo_data:
             wo_df = pd.DataFrame(wo_data)
-            # Create lookup dicts: work_order_id -> derived status / s1_created
-            status_lookup: dict[str, str] = {}
-            s1_created_lookup: dict[str, Any] = {}
             for _, row in wo_df.iterrows():
                 derived = derive_ptw_status(row.to_dict())
-                # Map CLOSED -> APPROVED for UI display
-                if derived == "CLOSED":
-                    derived = "APPROVED"
-                status_lookup[row["work_order_id"]] = derived
-                s1_created_lookup[row["work_order_id"]] = row.get("date_s1_created")
-            
-            # Apply derived status to PTW requests
-            df["status"] = df["permit_no"].map(status_lookup).fillna("WIP")
-            df["date_s1_created"] = df["permit_no"].map(s1_created_lookup)
+                woid = str(row.get("work_order_id") or "").strip()
+                if not woid:
+                    continue
+                status_lookup[woid] = derived
+                s1_created_lookup[woid] = row.get("date_s1_created")
+
+    def _aggregate_status(statuses: list[str]) -> str:
+        sset = {str(s).strip().upper() for s in statuses if str(s).strip()}
+        if "REJECTED" in sset:
+            return "REJECTED"
+        if sset and sset.issubset({"CLOSED"}):
+            return "CLOSED"
+        if sset and sset.issubset({"APPROVED"}):
+            return "APPROVED"
+        if sset and sset.issubset({"OPEN"}):
+            return "OPEN"
+        # Any mix defaults to WIP (submitted but not fully approved/closed)
+        return "WIP"
+
+    derived_statuses: list[str] = []
+    derived_s1_dates: list[Any] = []
+    for ids in ids_per_row:
+        sts = [status_lookup.get(i, "WIP") for i in ids] if ids else ["WIP"]
+        derived_statuses.append(_aggregate_status(sts))
+        # Use earliest non-null s1_created for date filtering/display
+        dates = [s1_created_lookup.get(i) for i in ids if s1_created_lookup.get(i) is not None]
+        derived_s1_dates.append(min(dates) if dates else None)
+
+    df["status"] = derived_statuses
+    df["date_s1_created"] = derived_s1_dates
 
     # Apply lifecycle date range filter using work_orders.date_s1_created
     if start_date or end_date:
@@ -1791,6 +1886,81 @@ def generate_ptw_pdf_from_template(form_data: dict, *, progress_callback=None) -
     return pdf_bytes
 
 
+def _add_overlay_elements(pdf_bytes: bytes, form_data: dict) -> bytes:
+    """
+    Post-process overlay for specific elements that require box-aware wrapping / verification.
+    - Undertaking checkbox (page 2)
+    - Tools/Equipment Required block (page 2)
+    """
+    try:
+        from reportlab.pdfgen import canvas  # type: ignore
+        from reportlab.lib.pagesizes import A4  # type: ignore
+        from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+    except Exception:
+        return pdf_bytes
+
+    if not isinstance(pdf_bytes, (bytes, bytearray)) or bytes(pdf_bytes)[:4] != b"%PDF":
+        return pdf_bytes
+
+    try:
+        reader = PdfReader(BytesIO(bytes(pdf_bytes)))
+        writer = PdfWriter()
+
+        packet = BytesIO()
+        c = canvas.Canvas(packet, pagesize=A4)
+
+        # ---- Undertaking Checkbox ----
+        if bool((form_data or {}).get("undertaking_checkbox")):
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(209, 91, "✓")
+
+        # ---- Tools/Equipment Required ----
+        tools_text = str((form_data or {}).get("tools_equipment_required") or "").strip()
+        if tools_text:
+            x = 32
+            y = 491
+            max_width = 550
+            line_height = 12
+
+            lines: list[str] = []
+            words = tools_text.split()
+            current = ""
+
+            for word in words:
+                test_line = (current + " " + word).strip() if current else word
+                if c.stringWidth(test_line, "Helvetica", 10) <= max_width:
+                    current = test_line
+                else:
+                    if current:
+                        lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+
+            c.setFont("Helvetica", 10)
+            for line in lines[:5]:  # limit height
+                c.drawString(x, y, line)
+                y -= line_height
+
+        c.save()
+        packet.seek(0)
+        overlay_pdf = PdfReader(packet)
+
+        for i in range(len(reader.pages)):
+            page = reader.pages[i]
+            if i == 1 and overlay_pdf.pages:  # page 2 (0-based index)
+                page.merge_page(overlay_pdf.pages[0])
+            writer.add_page(page)
+
+        output = BytesIO()
+        writer.write(output)
+        output.seek(0)
+        out = output.read()
+        return out if out[:4] == b"%PDF" else bytes(pdf_bytes)
+    except Exception:
+        return bytes(pdf_bytes)
+
+
 def _fill_pdf_template_acroform(pdf_template_bytes: bytes, data: dict) -> bytes | None:
     """
     Fill a PDF template that contains AcroForm fields.
@@ -2521,84 +2691,12 @@ def render(db_path: str) -> None:
     """
     st.markdown("# S1 Portal")
 
-    # Modern top-nav UX (match S2/S3 pills) + Anti-Ghosting CSS
-    st.markdown(
-        """
-        <style>
-          /* ==========================================================
-             ANTI-GHOSTING: smooth section fade-in (works for all pages)
-             ========================================================== */
-          @keyframes s1SectionFadeIn {
-            from { opacity: 0; transform: translateY(6px); }
-            to { opacity: 1; transform: translateY(0); }
-          }
-          .s1-section {
-            animation: s1SectionFadeIn 0.18s ease-out;
-          }
-
-          /* ==========================================================
-             TOP NAV (Match S2/S3 pill tabs) — works for segmented_control OR radio
-             ========================================================== */
-
-          /* Container spacing + underline divider like S2/S3 */
-          div[data-testid="stSegmentedControl"],
-          div[data-testid="stRadio"] {
-            margin: 10px 0 12px 0;
-            padding-bottom: 10px;
-            border-bottom: 1px solid rgba(148,163,184,0.45);
-          }
-
-          /* --- radio (horizontal) styled to match S2/S3 pill tabs --- */
-          div[data-testid="stRadio"] [role="radiogroup"] {
-            display: flex !important;
-            gap: 8px !important;
-          }
-          /* Baseweb radio wrapper = pill */
-          div[data-testid="stRadio"] [data-baseweb="radio"] {
-            padding: 0 !important;
-            margin: 0 !important;
-            border-radius: 12px !important;
-            background: rgba(226,232,240,0.35) !important;
-            border: 1px solid rgba(148,163,184,0.28) !important;
-            overflow: hidden !important;
-          }
-          div[data-testid="stRadio"] [data-baseweb="radio"] > div {
-            padding: 10px 16px !important;
-          }
-          div[data-testid="stRadio"] [data-baseweb="radio"] * {
-            font-size: 18px !important;
-            font-weight: 800 !important;
-            color: #0f172a !important;
-          }
-          /* Hide the circular dot */
-          div[data-testid="stRadio"] [data-baseweb="radio"] svg,
-          div[data-testid="stRadio"] [data-baseweb="radio"] input {
-            display: none !important;
-          }
-          /* Hover */
-          div[data-testid="stRadio"] [data-baseweb="radio"]:hover {
-            box-shadow: 0 6px 18px rgba(15,23,42,0.06) !important;
-          }
-          /* Active option (Baseweb sets aria-checked on an inner element) */
-          div[data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"] {
-            background: rgba(37,99,235,0.10) !important;
-          }
-          div[data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"] * {
-            color: #0b2a6f !important;
-          }
-          /* Active underline indicator (like S2/S3) */
-          div[data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"]::after {
-            content: "";
-            display: block;
-            height: 3px;
-            background: #e11d48; /* red underline */
-            margin-top: 6px;
-            border-radius: 2px;
-          }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Import modern UI styles
+    try:
+        from modern_ui_styles import MODERN_UI_CSS
+        st.markdown(MODERN_UI_CSS, unsafe_allow_html=True)
+    except Exception:
+        pass  # Fallback if import fails
 
     # Initialize session state for PTW
     if "s1_ptw_reset_counter" not in st.session_state:
@@ -2613,26 +2711,21 @@ def render(db_path: str) -> None:
         st.session_state["ptw_just_submitted"] = False
 
     # =========================================================================
-    # FIX (Deterministic Navigation): Replace st.tabs() with a stateful switcher.
-    # st.tabs() can reset to the first tab on the first rerun after a button click
-    # (observed: View Applied PTW → Fetch PTWs jumps to View Work Order once).
-    # This keeps the user in the same section 100% of the time.
+    # Modern Tab Navigation (matches S2/S3 design)
     # =========================================================================
-    options = ["View Work Order", "Request PTW", "View Applied PTW"]
-    if "s1_active_tab" not in st.session_state:
-        st.session_state["s1_active_tab"] = options[0]
-
-    # Use radio(horizontal=True) for deterministic behavior + full CSS control (match S2/S3 pills)
-    active = st.radio(" ", options, horizontal=True, key="s1_active_tab", label_visibility="collapsed")
-
-    st.markdown('<div class="s1-section">', unsafe_allow_html=True)
-    if active == "View Work Order":
+    tab1, tab2, tab3, tab4 = st.tabs(["View Work Order", "Request PTW", "View Applied PTW", "Permit Closure"])
+    
+    with tab1:
         _render_view_work_order()
-    elif active == "Request PTW":
+    
+    with tab2:
         _render_request_ptw()
-    else:
+    
+    with tab3:
         _render_view_applied_ptw()
-    st.markdown("</div>", unsafe_allow_html=True)
+    
+    with tab4:
+        _render_permit_closure()
 
 
 def _render_view_work_order() -> None:
@@ -2779,9 +2872,10 @@ def _render_view_work_order() -> None:
             c_rej = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
             c_open = int((df["status"].astype("string").str.upper() == "OPEN").sum())
             c_wip = int((df["status"].astype("string").str.upper() == "WIP").sum())
-            c_approved = int(df["status"].astype("string").str.upper().isin(["CLOSED", "APPROVED"]).sum())
+            c_approved = int((df["status"].astype("string").str.upper() == "APPROVED").sum())
+            c_closed = int((df["status"].astype("string").str.upper() == "CLOSED").sum())
         else:
-            total = c_rej = c_open = c_wip = c_approved = 0
+            total = c_rej = c_open = c_wip = c_approved = c_closed = 0
 
         st.session_state["s1_wo_last_kpis"] = {
             "total": total,
@@ -2789,6 +2883,7 @@ def _render_view_work_order() -> None:
             "open": c_open,
             "wip": c_wip,
             "approved": c_approved,
+            "closed": c_closed,
         }
 
         if df.empty:
@@ -2807,6 +2902,7 @@ def _render_view_work_order() -> None:
         c_open = int(k.get("open", 0) or 0)
         c_wip = int(k.get("wip", 0) or 0)
         c_approved = int(k.get("approved", 0) or 0)
+        c_closed = int(k.get("closed", 0) or 0)
 
         st.markdown(
             """
@@ -2829,6 +2925,7 @@ def _render_view_work_order() -> None:
               <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:#16a34a;">{c_open}</div></div>
               <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:#f97316;">{c_wip}</div></div>
               <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{c_approved}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Closed</div><div class="kpi-value" style="color:#065f46;">{c_closed}</div></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -2866,12 +2963,13 @@ def _render_request_ptw() -> None:
     <style>
         /* PTW Form Styling */
         .ptw-header {
-            background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
-            color: white;
+            /* Light, modern header so text stays readable */
+            background: linear-gradient(135deg, #e0f2fe 0%, #bfdbfe 100%);
+            color: #0f172a;
             padding: 20px 25px;
             border-radius: 12px;
             margin-bottom: 20px;
-            box-shadow: 0 4px 15px rgba(30, 58, 95, 0.3);
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.10);
         }
         .ptw-header h2 {
             margin: 0;
@@ -3028,8 +3126,8 @@ def _render_request_ptw() -> None:
             try:
                 _smooth_progress(prog, 0, 35, text="Validating selection...")
                 _smooth_progress(prog, 35, 80, text="Fetching OPEN work orders...")
-                wo_ids = _list_work_order_ids_by_date(selected_date)
-                st.session_state["ptw_wo_ids_for_date"] = wo_ids
+                display_map = _build_work_order_display_map(selected_date)
+                st.session_state["ptw_wo_display_map_for_date"] = display_map
                 _smooth_progress(prog, 80, 100, text="Work orders ready")
             except Exception as e:
                 st.error(f"Error fetching work orders: {e}")
@@ -3038,76 +3136,72 @@ def _render_request_ptw() -> None:
                 st.session_state["ptw_date_loading"] = False
                 load_slot.empty()
 
-        wo_ids = st.session_state.get("ptw_wo_ids_for_date") or []
+        display_map = st.session_state.get("ptw_wo_display_map_for_date") or {}
+        wo_labels = list(display_map.keys()) if isinstance(display_map, dict) else []
 
         with col_wo:
-            if not wo_ids:
+            if not wo_labels:
                 st.warning(f"No OPEN work orders found for {selected_date.strftime('%Y-%m-%d')}")
-                selected_wo_id = None
+                selected_ids: list[str] = []
             else:
-                wo_options = ["(select work order)"] + wo_ids
-
-                def _on_ptw_wo_change() -> None:
-                    # UI-only: show progress immediately on rerun for work-order detail fetch
-                    raw = st.session_state.get("ptw_wo_selector")
-                    st.session_state["ptw_selected_wo_id"] = None if raw == "(select work order)" else raw
-                    st.session_state["ptw_wo_loading"] = bool(st.session_state.get("ptw_selected_wo_id"))
-                    st.session_state["ptw_wo_details"] = None
-                    # NOTE: Do not call st.rerun() inside a widget callback (Streamlit warns it's a no-op).
-
-                selected_wo_id = st.selectbox(
-                    "Select Work Order ID",
-                    options=wo_options,
-                    index=0,
-                    key="ptw_wo_selector",
-                    on_change=_on_ptw_wo_change,
+                selected_labels = st.multiselect(
+                    "Select Work Order(s)",
+                    options=wo_labels,
+                    key="ptw_wo_multiselect",
                 )
-                if selected_wo_id == "(select work order)":
-                    selected_wo_id = None
+                selected_ids = [str(display_map.get(lbl, "")).strip() for lbl in selected_labels if str(display_map.get(lbl, "")).strip()]
 
-        # Fetch work order details with progress (mounted before the query)
-        if st.session_state.get("ptw_wo_loading") and st.session_state.get("ptw_selected_wo_id"):
+        # Fetch work order details for selected IDs (for auto-fill)
+        wo_details_list: list[dict] = []
+        if selected_ids:
             wo_prog_slot = st.empty()
-            prog = wo_prog_slot.progress(0, text="Fetching work order details...")
+            prog = wo_prog_slot.progress(0, text="Preparing selection...")
             try:
-                _smooth_progress(prog, 0, 45, text="Fetching work order details...")
-                wo_details = _get_work_order_details(st.session_state["ptw_selected_wo_id"])
-                _smooth_progress(prog, 45, 85, text="Auto-filling site and location...")
-                if wo_details:
-                    st.session_state["ptw_wo_details"] = wo_details
-                _smooth_progress(prog, 85, 100, text="Ready")
+                _smooth_progress(prog, 0, 65, text="Fetching work order details...")
+                for woid in selected_ids:
+                    d = _get_work_order_details(woid)
+                    if isinstance(d, dict) and d:
+                        wo_details_list.append(d)
+                _smooth_progress(prog, 65, 100, text="Ready")
             except Exception as e:
                 st.error(f"Error fetching work order details: {e}")
-                st.session_state["ptw_wo_details"] = None
+                wo_details_list = []
             finally:
-                st.session_state["ptw_wo_loading"] = False
                 wo_prog_slot.empty()
 
-        wo_details = st.session_state.get("ptw_wo_details") or None
         site_name_display = ""
         work_location_display = ""
         permit_validity_display = ""
         
-        if isinstance(wo_details, dict) and wo_details:
-            site_name_display = str(wo_details.get("site_name", "") or "")
-            location = str(wo_details.get("location", "") or "")
-            equipment = str(wo_details.get("equipment", "") or "")
-            work_location_display = f"{location}-{equipment}" if location and equipment else location or equipment
-            
-            # Extract date_planned for Permit Validity Date
-            date_planned = wo_details.get("date_planned")
-            if date_planned:
-                permit_validity_display = pd.to_datetime(date_planned).strftime("%d-%m-%Y")
+        if wo_details_list:
+            site_names = sorted({str(d.get("site_name", "") or "").strip() for d in wo_details_list if str(d.get("site_name", "") or "").strip()})
+            site_name_display = site_names[0] if site_names else ""
+
+            # Auto-merge locations (multi-WO)
+            locations = sorted({str(d.get("location", "") or "").strip() for d in wo_details_list if str(d.get("location", "") or "").strip()})
+            if len(locations) == 1:
+                work_location_display = locations[0]
+            elif len(locations) > 1:
+                work_location_display = " & ".join(locations)
+            else:
+                work_location_display = ""
+
+            permit_validity_display = selected_date.strftime("%d-%m-%Y")
 
         # Persist auto-filled values for submit handler (UI-only ordering; same values)
-        if selected_wo_id:
-            st.session_state["ptw_selected_wo_id"] = selected_wo_id
+        if selected_ids:
+            st.session_state["ptw_selected_wo_ids"] = selected_ids
+            # Backward compat: keep a primary ID (first) for legacy flows
+            st.session_state["ptw_selected_wo_id"] = selected_ids[0]
             st.session_state["ptw_site_name"] = site_name_display
             st.session_state["ptw_work_location"] = work_location_display
+            st.session_state["ptw_permit_no"] = "-".join(sorted(selected_ids))
         else:
+            st.session_state["ptw_selected_wo_ids"] = []
             st.session_state["ptw_selected_wo_id"] = None
             st.session_state["ptw_site_name"] = ""
             st.session_state["ptw_work_location"] = ""
+            st.session_state["ptw_permit_no"] = ""
 
         # Display auto-filled fields (read-only) - OUTSIDE form for reactive updates
         st.markdown("---")
@@ -3141,6 +3235,7 @@ def _render_request_ptw() -> None:
         _render_work_order_selection_block()
 
         # Read from session after selector block (fragment-safe)
+        selected_ids = st.session_state.get("ptw_selected_wo_ids") or []
         selected_wo_id = st.session_state.get("ptw_selected_wo_id")
         
         # Extract permit_validity_date from work order details (backend-derived, NOT user input)
@@ -3152,11 +3247,12 @@ def _render_request_ptw() -> None:
                 permit_validity_date = pd.to_datetime(date_planned).date()
 
         # Check if we can proceed with the form
-        if not selected_wo_id:
-            st.warning("Please select a Work Order ID to continue with the PTW request.")
+        if not selected_ids:
+            st.warning("Please select one or more Work Orders to continue with the PTW request.")
             return
 
         # Store for use in form submission
+        st.session_state["ptw_selected_wo_ids"] = selected_ids
         st.session_state["ptw_selected_wo_id"] = selected_wo_id
         st.session_state["ptw_site_name"] = st.session_state.get("ptw_site_name", "")
         st.session_state["ptw_work_location"] = st.session_state.get("ptw_work_location", "")
@@ -3197,7 +3293,8 @@ def _render_request_ptw() -> None:
             def _ss(k: str, default: Any) -> Any:
                 return st.session_state.get(k, default)
 
-            work_order_id = _ss("ptw_selected_wo_id", "")
+            work_order_ids = _ss("ptw_selected_wo_ids", []) or []
+            permit_no = _ss("ptw_permit_no", "") or "-".join(sorted([str(x).strip() for x in work_order_ids if str(x).strip()]))
             site_name = _ss("ptw_site_name", "")
             work_location = _ss("ptw_work_location", "")
             
@@ -3210,7 +3307,8 @@ def _render_request_ptw() -> None:
                     permit_validity_date = pd.to_datetime(date_planned).date()
 
             _handle_ptw_submit(
-                work_order_id=work_order_id,
+                work_order_ids=work_order_ids,
+                permit_no=permit_no,
                 permit_validity_date=permit_validity_date,  # Backend-derived from date_planned
                 site_name=site_name,
                 work_location=work_location,
@@ -3293,8 +3391,8 @@ def _render_request_ptw() -> None:
                 ap_height_work=_ss("ap_height_work", False),
                 ap_lifting=_ss("ap_lifting", False),
                 ap_others_text=_ss("ap_others_text", ""),
-                # Tools
-                tools_equipment=_ss("tools_equipment", ""),
+                # Tools (Section G uses key="ptw_tools_equipment")
+                tools_equipment=_ss("ptw_tools_equipment", ""),
                 # Checklist (Y/N/NA)
                 chk_jsa=_ss("chk_jsa", None),
                 chk_environment=_ss("chk_environment", None),
@@ -3583,8 +3681,12 @@ def _handle_ptw_submit(**kwargs) -> None:
         st.error("Undertaking acceptance is mandatory. Please accept the undertaking to proceed.")
         return
 
-    if not kwargs.get("work_order_id"):
-        st.error("Work Order ID is required. Please select a Work Order.")
+    work_order_ids = kwargs.get("work_order_ids") or []
+    if not isinstance(work_order_ids, list):
+        work_order_ids = []
+    work_order_ids = [str(x).strip() for x in work_order_ids if str(x).strip()]
+    if not work_order_ids:
+        st.error("Work Order selection is required. Please select one or more Work Orders.")
         return
 
     if not kwargs.get("site_name"):
@@ -3615,13 +3717,15 @@ def _handle_ptw_submit(**kwargs) -> None:
         end_time = submit_time + timedelta(hours=8)
         end_time_str = end_time.strftime("%H:%M:%S")
 
-        # Block duplicate PTW for same work_order_id (safety requirement)
-        exists, existing_ptw_id = _ptw_exists_for_work_order(kwargs["work_order_id"])
+        permit_no = str(kwargs.get("permit_no") or "").strip() or "-".join(sorted(work_order_ids))
+
+        # Block duplicate PTW for any selected work_order_id (safety requirement)
+        exists, existing_ptw_id = _ptw_exists_for_work_orders(work_order_ids)
         if exists:
             progress_placeholder.empty()
             status_placeholder.empty()
             msg_placeholder.error(
-                "This work_order_id has already been submitted for PTW."
+                "One or more selected Work Orders already have a PTW."
                 + (f" Existing PTW ID: `{existing_ptw_id}`" if existing_ptw_id else "")
             )
             st.session_state["ptw_is_submitting"] = False
@@ -3629,7 +3733,7 @@ def _handle_ptw_submit(**kwargs) -> None:
 
         # Build form data with system-controlled times
         form_data = build_form_data(
-            work_order_id=kwargs["work_order_id"],
+            work_order_id=permit_no,
             permit_validity_date=kwargs["permit_validity_date"],
             start_time=start_time_str,
             end_time=end_time_str,
@@ -3744,13 +3848,25 @@ def _handle_ptw_submit(**kwargs) -> None:
             coworker_5=kwargs.get("coworker_5", ""),
             coworker_6=kwargs.get("coworker_6", ""),
         )
+        # Store multi-WO coverage (read-only for other portals; no schema changes)
+        form_data["work_order_ids"] = work_order_ids
+
+        # Signature auto-sync (do not ask separately)
+        recv_name = str(form_data.get("receiver_name") or "").strip()
+        if recv_name:
+            form_data["receiver_signature"] = recv_name
+            form_data["permit_receiver_signature"] = recv_name
+        # Tools overlay helper expects this key (keeps existing tools_equipment intact)
+        form_data["tools_equipment_required"] = form_data.get("tools_equipment", "")
+        # Undertaking overlay helper expects this key
+        form_data["undertaking_checkbox"] = bool(form_data.get("undertaking_accept", False))
 
         progress_placeholder.progress(25, text="Saving to Supabase...")
         status_placeholder.info("Step 2/4: Saving PTW to database")
 
-        # Insert into Supabase (permit_no = work_order_id)
+        # Insert into Supabase (permit_no = combined work_order_ids)
         ptw_id = insert_ptw_request(
-            permit_no=kwargs["work_order_id"],
+            permit_no=permit_no,
             site_name=kwargs["site_name"],
             created_by=kwargs["receiver_name"],
             form_data=form_data,
@@ -3758,10 +3874,11 @@ def _handle_ptw_submit(**kwargs) -> None:
         
         # Update work_orders.date_s1_created to mark PTW submission time
         # This drives the status derivation (OPEN -> WIP)
-        _update_work_order_s1_created(
-            work_order_id=kwargs["work_order_id"],
-            s1_timestamp=submit_time.isoformat(sep=" ", timespec="seconds")
-        )
+        for wo in work_order_ids:
+            _update_work_order_s1_created(
+                work_order_id=wo,
+                s1_timestamp=submit_time.isoformat(sep=" ", timespec="seconds"),
+            )
 
         progress_placeholder.progress(50, text="Downloading template from Supabase...")
         status_placeholder.info("Step 3/4: Generating PTW document")
@@ -3775,13 +3892,14 @@ def _handle_ptw_submit(**kwargs) -> None:
         # Generate document
         doc_data = build_doc_data(form_data)
         pdf_bytes = generate_ptw_pdf(template_bytes, doc_data)  # PDF-only (raises if fails)
+        pdf_bytes = _add_overlay_elements(pdf_bytes, form_data)
 
         progress_placeholder.progress(75, text="Finalizing...")
         status_placeholder.info("Step 4/4: Finalizing submission")
 
         # Store for download (PDF only)
         st.session_state["s1_ptw_last_file"] = pdf_bytes
-        st.session_state["s1_ptw_last_permit_no"] = kwargs["work_order_id"]
+        st.session_state["s1_ptw_last_permit_no"] = permit_no
         st.session_state["s1_ptw_last_ext"] = "pdf"
 
         # Reset form for next entry
@@ -3819,6 +3937,317 @@ def _handle_ptw_submit(**kwargs) -> None:
         st.session_state["s1_ptw_last_file"] = None
         st.session_state["s1_ptw_last_permit_no"] = None
         st.session_state["ptw_is_submitting"] = False
+
+
+def _extract_work_order_ids_from_ptw_row(r: dict) -> list[str]:
+    """Multi-WO safe: prefer form_data['work_order_ids'], else legacy form_data['work_order_id'], else split permit_no."""
+    if not isinstance(r, dict):
+        return []
+    fd = r.get("form_data") if isinstance(r.get("form_data"), dict) else {}
+    if isinstance(fd, dict):
+        ids = fd.get("work_order_ids")
+        if isinstance(ids, list) and ids:
+            out = [str(x).strip() for x in ids if str(x).strip()]
+            if out:
+                return out
+        legacy = str(fd.get("work_order_id") or "").strip()
+        if legacy:
+            return [legacy]
+    pn = str(r.get("permit_no") or "").strip()
+    if pn and "-" in pn:
+        parts = [p.strip() for p in pn.split("-") if p.strip()]
+        return parts or [pn]
+    return [pn] if pn else []
+
+
+def _maybe_inject_closure_fields(*, form_data: dict, closure_dt: Any, receiver_name: str, holder_name: str, issuer_name: str) -> dict:
+    """
+    Ensure closure overlay fields exist in form_data.
+    Uses the existing overlay tag sources (closure_* keys).
+    """
+    fd = dict(form_data or {})
+    closure_dt_str = ""
+    try:
+        if closure_dt is not None:
+            closure_dt_str = str(closure_dt)
+    except Exception:
+        closure_dt_str = ""
+
+    # Only set if missing (do not overwrite)
+    def _set_if_missing(k: str, v: str) -> None:
+        if str(fd.get(k) or "").strip() == "" and str(v or "").strip() != "":
+            fd[k] = v
+
+    _set_if_missing("closure_receiver", receiver_name)
+    _set_if_missing("closure_receiver_signature", receiver_name)
+    _set_if_missing("closure_receiver_datetime", closure_dt_str)
+
+    _set_if_missing("closure_holder", holder_name)
+    _set_if_missing("closure_holder_signature", holder_name)
+    _set_if_missing("closure_holder_datetime", closure_dt_str)
+
+    _set_if_missing("closure_issuer", issuer_name)
+    _set_if_missing("closure_issuer_signature", issuer_name)
+    _set_if_missing("closure_issuer_datetime", closure_dt_str)
+
+    return fd
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _fetch_permit_closure_candidates(*, start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    Return permits that are APPROVED or CLOSED, filtered by lifecycle clock: date_s3_approved in range.
+    Multi-WO safe: aggregates PTW rows by ptw_requests.form_data['work_order_ids'].
+    """
+    sb = get_supabase_client(prefer_service_role=True)
+
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt_excl = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+
+    # Gate WOs by approved date range
+    wo_gate = (
+        sb.table(TABLE_WORK_ORDERS)
+        .select(
+            "work_order_id,site_name,location,equipment,"
+            "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected,date_s1_closed"
+        )
+        .not_.is_("date_s3_approved", "null")
+        .gte("date_s3_approved", start_dt.isoformat(sep=" ", timespec="seconds"))
+        .lt("date_s3_approved", end_dt_excl.isoformat(sep=" ", timespec="seconds"))
+        .execute()
+    )
+    wo_err = getattr(wo_gate, "error", None)
+    if wo_err:
+        raise RuntimeError(f"Failed to fetch approved work orders: {wo_err}")
+    wo_rows: list[dict[str, Any]] = getattr(wo_gate, "data", None) or []
+    gate_ids = {str(w.get("work_order_id") or "").strip() for w in wo_rows if str(w.get("work_order_id") or "").strip()}
+    if not gate_ids:
+        return pd.DataFrame()
+
+    wo_lookup = {str(w["work_order_id"]).strip(): w for w in wo_rows if isinstance(w, dict) and w.get("work_order_id")}
+
+    # Pull PTW requests and keep those that reference any gated id
+    ptw_resp = (
+        sb.table(TABLE_PTW_REQUESTS)
+        .select("ptw_id,permit_no,site_name,created_at,created_by,form_data")
+        .order("created_at", desc=True)
+        .limit(1000)
+        .execute()
+    )
+    ptw_err = getattr(ptw_resp, "error", None)
+    if ptw_err:
+        raise RuntimeError(f"Failed to fetch PTW requests: {ptw_err}")
+    ptw_rows: list[dict[str, Any]] = getattr(ptw_resp, "data", None) or []
+
+    out: list[dict[str, Any]] = []
+    for r in ptw_rows:
+        if not isinstance(r, dict):
+            continue
+        ids = _extract_work_order_ids_from_ptw_row(r)
+        if not ids:
+            continue
+        if not (set(ids) & gate_ids):
+            continue
+
+        wo_local = [wo_lookup.get(i) for i in ids if i in wo_lookup]
+        wo_local = [w for w in wo_local if isinstance(w, dict)]
+        if not wo_local:
+            continue
+
+        # Permit-level lifecycle: compute per-WO derived and aggregate
+        derived = [derive_ptw_status(w) for w in wo_local]
+        sset = {str(x).strip().upper() for x in derived if str(x).strip()}
+        if "REJECTED" in sset:
+            permit_status = "REJECTED"
+        elif sset and sset.issubset({"CLOSED"}):
+            permit_status = "CLOSED"
+        elif sset and sset.issubset({"APPROVED"}):
+            permit_status = "APPROVED"
+        else:
+            # Not eligible for closure list
+            continue
+
+        # Aggregate approved/closed timestamps
+        def _has(v) -> bool:
+            return v is not None and str(v).strip() != ""
+
+        appr_vals = [w.get("date_s3_approved") for w in wo_local if _has(w.get("date_s3_approved"))]
+        clos_vals = [w.get("date_s1_closed") for w in wo_local if _has(w.get("date_s1_closed"))]
+        appr_min = None
+        clos_min = None
+        try:
+            ts = pd.to_datetime(appr_vals, errors="coerce")
+            ts = ts.dropna() if hasattr(ts, "dropna") else ts
+            if len(ts) > 0:
+                appr_min = ts.min()
+        except Exception:
+            appr_min = appr_vals[0] if appr_vals else None
+        try:
+            ts = pd.to_datetime(clos_vals, errors="coerce")
+            ts = ts.dropna() if hasattr(ts, "dropna") else ts
+            if len(ts) > 0:
+                clos_min = ts.min()
+        except Exception:
+            clos_min = clos_vals[0] if clos_vals else None
+
+        fd = r.get("form_data") if isinstance(r.get("form_data"), dict) else {}
+        receiver_name = str(fd.get("receiver_name") or fd.get("permit_receiver_name") or r.get("created_by") or "").strip()
+        holder_name = str(fd.get("holder_name") or "").strip()
+        issuer_name = str(fd.get("permit_issuer_name") or fd.get("issuer_name") or "").strip()
+
+        out.append(
+            {
+                "ptw_id": r.get("ptw_id"),
+                "permit_no": r.get("permit_no"),
+                "site_name": r.get("site_name") or (wo_local[0].get("site_name") if wo_local else ""),
+                "work_order_ids": ids,
+                "approved_on": appr_min,
+                "closed_on": clos_min,
+                "status": permit_status,
+                "receiver_name": receiver_name,
+                "holder_name": holder_name,
+                "issuer_name": issuer_name,
+                "form_data": fd,
+            }
+        )
+
+    df = pd.DataFrame(out)
+    if df.empty:
+        return df
+    try:
+        df = df.sort_values(by=["approved_on"], ascending=[False], na_position="last")
+    except Exception:
+        pass
+    return df
+
+
+def _render_permit_closure() -> None:
+    """Render Permit Closure (S1 final stage) - updates work_orders.date_s1_closed and stores closure block in ptw_requests.form_data."""
+    st.markdown("## Permit Closure")
+    st.caption("Close S3-approved PTWs (final S1 stage). Closure is date-driven via `work_orders.date_s1_closed`.")
+
+    col1, col2, col3 = st.columns([1.4, 1.4, 1.0], vertical_alignment="bottom")
+    with col1:
+        from_date = st.date_input("From Date", value=date.today() - timedelta(days=30), key="s1_close_from")
+    with col2:
+        to_date = st.date_input("To Date", value=date.today(), key="s1_close_to")
+    with col3:
+        if "s1_close_run_fetch" not in st.session_state:
+            st.session_state["s1_close_run_fetch"] = False
+
+        def _on_fetch() -> None:
+            st.session_state["s1_close_run_fetch"] = True
+
+        st.button("Fetch PTWs", type="primary", key="s1_close_fetch", on_click=_on_fetch)
+
+    if "s1_close_df" not in st.session_state:
+        st.session_state["s1_close_df"] = None
+
+    if st.session_state.get("s1_close_run_fetch"):
+        st.session_state["s1_close_run_fetch"] = False
+        prog_slot = st.empty()
+        prog = prog_slot.progress(0, text="Loading approved PTWs...")
+        try:
+            _smooth_progress(prog, 0, 25, text="Fetching candidates...")
+            df = _fetch_permit_closure_candidates(start_date=from_date, end_date=to_date)
+            st.session_state["s1_close_df"] = df
+            _smooth_progress(prog, 25, 100, text="Ready")
+        except Exception as e:
+            st.error(f"Failed to fetch closure candidates: {e}")
+            st.session_state["s1_close_df"] = pd.DataFrame()
+        finally:
+            prog_slot.empty()
+
+    df = st.session_state.get("s1_close_df")
+    if df is None:
+        st.info("Select a date range and click 'Fetch PTWs' to load S3-approved permits.")
+        return
+    if df.empty:
+        st.info("No approved/closed PTWs found for the selected date range.")
+        return
+
+    df_display = df.copy()
+    df_display["status"] = df_display["status"].astype("string").fillna("").map(
+        lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s))
+    )
+    st.dataframe(
+        df_display[["permit_no", "site_name", "approved_on", "closed_on", "status"]],
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.divider()
+
+    # Only approved (not yet closed) are closable
+    open_df = df[df["status"].astype("string").str.upper() == "APPROVED"].copy()
+    if open_df.empty:
+        st.success("No permits pending closure in this date range.")
+        return
+
+    options = []
+    for _, r in open_df.iterrows():
+        pn = str(r.get("permit_no") or "").strip()
+        site = str(r.get("site_name") or "").strip()
+        appr = str(r.get("approved_on") or "").strip()
+        options.append(f"{pn} | {site} | Approved: {appr}")
+
+    selected_label = st.selectbox("Select Permit to Close", options=options, index=0, key="s1_close_select")
+    sel_pn = str(selected_label.split("|")[0]).strip()
+
+    # Resolve selected row
+    sel_row = None
+    for _, r in open_df.iterrows():
+        if str(r.get("permit_no") or "").strip() == sel_pn:
+            sel_row = r
+            break
+    if sel_row is None:
+        st.error("Selection could not be resolved. Please refetch.")
+        return
+
+    receiver_name = st.text_input("Permit Receiver Name", value=str(sel_row.get("receiver_name") or ""), key="s1_close_receiver")
+    holder_name = st.text_input("Permit Holder Name", value=str(sel_row.get("holder_name") or ""), key="s1_close_holder")
+    issuer_name = st.text_input("Permit Issuer Name", value=str(sel_row.get("issuer_name") or ""), key="s1_close_issuer")
+
+    if st.button("Close Permit", type="primary", key="s1_close_btn"):
+        with st.spinner("Closing permit..."):
+            sb = get_supabase_client(prefer_service_role=True)
+            now = datetime.now().isoformat(sep=" ", timespec="seconds")
+
+            ptw_id = str(sel_row.get("ptw_id") or "").strip()
+            wo_ids = sel_row.get("work_order_ids") or []
+            wo_ids = [str(x).strip() for x in (wo_ids if isinstance(wo_ids, list) else []) if str(x).strip()]
+
+            # Update all covered work orders (do not overwrite existing closures)
+            for woid in wo_ids:
+                sb.table(TABLE_WORK_ORDERS).update({"date_s1_closed": now}).eq("work_order_id", woid).is_(
+                    "date_s1_closed", "null"
+                ).execute()
+
+            # Persist closure overlay block into ptw_requests.form_data for future downloads
+            if ptw_id:
+                get_resp = (
+                    sb.table(TABLE_PTW_REQUESTS)
+                    .select("form_data")
+                    .eq("ptw_id", ptw_id)
+                    .limit(1)
+                    .execute()
+                )
+                cur = (getattr(get_resp, "data", None) or [{}])[0] or {}
+                fd = cur.get("form_data") if isinstance(cur.get("form_data"), dict) else {}
+                fd = _maybe_inject_closure_fields(
+                    form_data=fd,
+                    closure_dt=now,
+                    receiver_name=receiver_name,
+                    holder_name=holder_name,
+                    issuer_name=issuer_name,
+                )
+                sb.table(TABLE_PTW_REQUESTS).update({"form_data": fd}).eq("ptw_id", ptw_id).execute()
+
+            st.success("Permit closed successfully.")
+            # Refresh cached lists
+            st.cache_data.clear()
+            st.session_state["s1_close_run_fetch"] = True
+            st.rerun()
 
 
 def _render_view_applied_ptw() -> None:
@@ -3952,8 +4381,43 @@ def _render_view_applied_ptw() -> None:
                     # Inject approval timestamps (holder_datetime / issuer_datetime) from work_orders
                     # and apply APPROVED stamp if date_s3_approved is present.
                     _smooth_progress(prog, 0, 10, text="Checking approval status...")
-                    updated_form, approval_times = _s1_inject_approval_times(form_data, selected_permit)
+                    wo_ids = row.get("work_order_ids")
+                    if not isinstance(wo_ids, list) or not wo_ids:
+                        wo_ids = _extract_work_order_ids_from_ptw_row({"permit_no": selected_permit, "form_data": form_data})
+                    wo_ids = [str(x).strip() for x in (wo_ids or []) if str(x).strip()]
+                    primary_wo = wo_ids[0] if wo_ids else selected_permit
+
+                    updated_form, approval_times = _s1_inject_approval_times(form_data, primary_wo)
                     approved_on = approval_times.get("issuer_datetime") or ""
+
+                    # If closed, inject closure overlay fields (uses stored names; does not overwrite)
+                    closed_dt = None
+                    try:
+                        sb = get_supabase_client(prefer_service_role=True)
+                        clos_resp = (
+                            sb.table(TABLE_WORK_ORDERS)
+                            .select("date_s1_closed")
+                            .in_("work_order_id", wo_ids or [primary_wo])
+                            .execute()
+                        )
+                        clos_rows = getattr(clos_resp, "data", None) or []
+                        clos_vals = [r.get("date_s1_closed") for r in clos_rows if r.get("date_s1_closed") is not None]
+                        if clos_vals:
+                            closed_dt = pd.to_datetime(clos_vals, errors="coerce").min()
+                    except Exception:
+                        closed_dt = None
+
+                    if closed_dt is not None and str(closed_dt).strip() != "" and str(closed_dt).strip().lower() != "nat":
+                        recv = str(updated_form.get("receiver_name") or updated_form.get("permit_receiver_name") or "").strip()
+                        holder = str(updated_form.get("holder_name") or "").strip()
+                        issuer = str(updated_form.get("permit_issuer_name") or updated_form.get("issuer_name") or "").strip()
+                        updated_form = _maybe_inject_closure_fields(
+                            form_data=updated_form,
+                            closure_dt=closed_dt,
+                            receiver_name=recv,
+                            holder_name=holder,
+                            issuer_name=issuer,
+                        )
 
                     # Download template from Supabase storage
                     _smooth_progress(prog, 0, 40, text="Downloading template...")
@@ -3969,6 +4433,7 @@ def _render_view_applied_ptw() -> None:
                             pass
 
                     pdf_bytes = generate_ptw_pdf(template_bytes, doc_data, progress_callback=_progress_cb)  # PDF-only (raises if fails)
+                    pdf_bytes = _add_overlay_elements(pdf_bytes, updated_form)
 
                     # Apply APPROVED stamp on every page if S3-approved
                     if approved_on:

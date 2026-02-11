@@ -494,18 +494,17 @@ def generate_ptw_pdf_with_attachments(
     approval_times = {}
     updated_form_data = dict(form_data) if form_data else {}
     
-    if _HAS_S3_STAMP:
-        try:
-            approval_times = get_ptw_approval_times(work_order_id)
-            is_s3_approved = bool(approval_times.get("date_s3_approved_raw"))
-            
-            # Inject approval timestamps into form_data for template placeholders
-            if approval_times.get("holder_datetime"):
-                updated_form_data["holder_datetime"] = approval_times["holder_datetime"]
-            if is_s3_approved and approval_times.get("issuer_datetime"):
-                updated_form_data["issuer_datetime"] = approval_times["issuer_datetime"]
-        except Exception:
-            pass  # Continue without stamp if error
+    # Always inject holder/issuer timestamps for template placeholders (stamp is optional)
+    try:
+        approval_times = get_ptw_approval_times(work_order_id)
+        is_s3_approved = bool(approval_times.get("date_s3_approved_raw"))
+
+        if approval_times.get("holder_datetime"):
+            updated_form_data["holder_datetime"] = approval_times["holder_datetime"]
+        if is_s3_approved and approval_times.get("issuer_datetime"):
+            updated_form_data["issuer_datetime"] = approval_times["issuer_datetime"]
+    except Exception:
+        pass  # Continue without injected times if unavailable
     
     if progress_callback:
         progress_callback(10, "Downloading template...")
@@ -567,97 +566,206 @@ def _fetch_ptw_for_s2(
     end_date: date,
 ) -> pd.DataFrame:
     """
-    Fetch PTW requests for S2 review (only those with date_s1_created set).
-    
-    Returns PTWs that:
-    - Have been submitted in S1 (date_s1_created is not null)
-    - Are within the date range
+    Fetch PTW requests that are visible in S2 (multi-WO safe).
+
+    Lifecycle engine:
+    - Extract work_order_ids from form_data["work_order_ids"] if present
+      else legacy form_data["work_order_id"]
+      else fallback to permit_no (and split on "-" if it looks like multi-WO)
+    - Query work_orders once using .in_("work_order_id", all_ids)
+    - Derive per-WO status using derive_ptw_status()
+    - Aggregate to an S2 display status (3-state + rejected):
+        REJECTED
+        APPROVED_BY_S3
+        PENDING_AT_S3
+        PENDING_AT_S2
+        OPEN
+
+    Visibility rule (date-driven):
+    - Show permits that have been submitted from S1 (date_s1_created exists on at least one covered WO)
+    - Date filter uses min(date_s1_created) across covered WOs (lifecycle clock)
     """
     sb = get_supabase_client(prefer_service_role=True)
-    
+
     start_dt = datetime.combine(start_date, datetime.min.time())
-    end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
-    
-    # Fetch PTW requests (date filtering is based on work_orders.date_s1_created, not ptw_requests.created_at)
-    q = sb.table(TABLE_PTW_REQUESTS).select(
-        "ptw_id,permit_no,site_name,status,created_at,created_by,form_data"
+    end_dt_excl = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+
+    # Fetch PTW requests (do NOT derive lifecycle from ptw_requests.status)
+    resp = (
+        sb.table(TABLE_PTW_REQUESTS)
+        .select("ptw_id,permit_no,site_name,created_at,created_by,form_data")
+        .order("created_at", desc=True)
+        .execute()
     )
-    
-    q = q.order("created_at", desc=True)
-    
-    resp = q.execute()
-    
     err = getattr(resp, "error", None)
     if err:
         raise RuntimeError(f"Failed to fetch PTW requests: {err}")
-    
-    data = getattr(resp, "data", None) or []
-    df = pd.DataFrame(data)
-    
-    if df.empty:
-        return df
-    
-    # Get work order IDs to check date_s1_created
-    work_order_ids = df["permit_no"].unique().tolist()
-    
-    if work_order_ids:
-        # Fetch work orders with date columns for status derivation
+    rows: list[dict[str, Any]] = getattr(resp, "data", None) or []
+    if not rows:
+        return pd.DataFrame()
+
+    def _extract_ids(r: dict) -> list[str]:
+        fd = r.get("form_data") if isinstance(r.get("form_data"), dict) else {}
+        if isinstance(fd, dict):
+            ids = fd.get("work_order_ids")
+            if isinstance(ids, list) and ids:
+                out = [str(x).strip() for x in ids if str(x).strip()]
+                if out:
+                    return out
+            legacy = str(fd.get("work_order_id") or "").strip()
+            if legacy:
+                return [legacy]
+        pn = str(r.get("permit_no") or "").strip()
+        if pn and "-" in pn:
+            parts = [p.strip() for p in pn.split("-") if p.strip()]
+            return parts or [pn]
+        return [pn] if pn else []
+
+    ids_per_ptw: list[list[str]] = []
+    all_ids: set[str] = set()
+    for r in rows:
+        ids = _extract_ids(r if isinstance(r, dict) else {})
+        ids_per_ptw.append(ids)
+        all_ids.update(ids)
+
+    wo_lookup: dict[str, dict] = {}
+    if all_ids:
         wo_resp = (
             sb.table(TABLE_WORK_ORDERS)
             .select(
-                "work_order_id,site_name,location,equipment,"
-                "date_s1_created,date_s2_forwarded,date_s3_approved,"
-                "date_s2_rejected,date_s3_rejected,isolation_requirement"
+                "work_order_id,site_name,location,equipment,isolation_requirement,"
+                "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
             )
-            .in_("work_order_id", work_order_ids)
+            .in_("work_order_id", list(all_ids))
             .execute()
         )
-        wo_data = getattr(wo_resp, "data", None) or []
-        
-        if wo_data:
-            wo_df = pd.DataFrame(wo_data)
-            
-            # Filter to only those with date_s1_created (PTW actually submitted)
-            wo_df = wo_df[wo_df["date_s1_created"].notna()]
-            # Apply date range filter using work_orders.date_s1_created (lifecycle clock)
-            s1_ts = pd.to_datetime(wo_df["date_s1_created"], errors="coerce")
-            wo_df = wo_df[(s1_ts >= start_dt) & (s1_ts < end_dt)]
-            
-            # Create lookup dicts
-            status_lookup = {}
-            s2_forwarded_lookup = {}
-            s3_approved_lookup = {}
-            isolation_lookup = {}
-            location_lookup = {}
-            
-            for _, row in wo_df.iterrows():
-                woid = row["work_order_id"]
-                derived = derive_ptw_status(row.to_dict())
-                # Map CLOSED -> APPROVED for UI display
-                if derived == "CLOSED":
-                    derived = "APPROVED"
-                status_lookup[woid] = derived
-                s2_forwarded_lookup[woid] = row.get("date_s2_forwarded")
-                s3_approved_lookup[woid] = row.get("date_s3_approved")
-                isolation_lookup[woid] = row.get("isolation_requirement")
-                location_lookup[woid] = f"{row.get('location', '')}-{row.get('equipment', '')}"
-            
-            # Filter PTWs to only those with date_s1_created
-            valid_wo_ids = set(wo_df["work_order_id"].tolist())
-            df = df[df["permit_no"].isin(valid_wo_ids)]
-            
-            # Apply derived status and date fields onto PTW dataframe
-            df["status"] = df["permit_no"].map(status_lookup).fillna("OPEN")
-            df["date_s2_forwarded"] = df["permit_no"].map(s2_forwarded_lookup)
-            df["date_s3_approved"] = df["permit_no"].map(s3_approved_lookup)
-            df["isolation_requirement"] = df["permit_no"].map(isolation_lookup)
-            df["work_location"] = df["permit_no"].map(location_lookup)
-    
-    # Ensure expected columns exist to avoid KeyError downstream
-    if "date_s2_forwarded" not in df.columns:
-        df["date_s2_forwarded"] = pd.NA
-    if "date_s3_approved" not in df.columns:
-        df["date_s3_approved"] = pd.NA
+        wo_err = getattr(wo_resp, "error", None)
+        if wo_err:
+            raise RuntimeError(f"Failed to fetch work orders: {wo_err}")
+        wo_rows = getattr(wo_resp, "data", None) or []
+        for w in wo_rows:
+            if isinstance(w, dict) and w.get("work_order_id"):
+                wo_lookup[str(w["work_order_id"]).strip()] = w
+
+    def _has(v) -> bool:
+        return v is not None and str(v).strip() != ""
+
+    def _agg_s2_display_status(wo_rows: list[dict]) -> str:
+        if not wo_rows:
+            return "OPEN"
+
+        derived = []
+        for w in wo_rows:
+            d = derive_ptw_status(w)
+            derived.append(d)
+
+        sset = {str(x).strip().upper() for x in derived if str(x).strip()}
+        if "REJECTED" in sset:
+            return "REJECTED"
+        if "CLOSED" in sset:
+            return "CLOSED"
+        if sset and sset.issubset({"APPROVED"}):
+            return "APPROVED_BY_S3"
+
+        any_s1 = any(_has(w.get("date_s1_created")) for w in wo_rows)
+        if not any_s1:
+            return "OPEN"
+
+        any_fwd = any(_has(w.get("date_s2_forwarded")) for w in wo_rows)
+        any_s3 = any(_has(w.get("date_s3_approved")) for w in wo_rows)
+        if any_fwd and not any_s3:
+            return "PENDING_AT_S3"
+        if not any_fwd:
+            return "PENDING_AT_S2"
+
+        # Mixed partial-forward / partial-approve: still actionable at S2
+        return "PENDING_AT_S2"
+
+    out_rows: list[dict[str, Any]] = []
+    for r, ids in zip(rows, ids_per_ptw):
+        if not isinstance(r, dict):
+            continue
+        wo_rows = [wo_lookup.get(i) for i in ids if i in wo_lookup]
+        wo_rows = [w for w in wo_rows if isinstance(w, dict)]
+        display_status = _agg_s2_display_status(wo_rows)
+
+        # Date filter uses work_orders.date_s1_created (lifecycle clock): min s1_created across permit
+        s1_vals = [w.get("date_s1_created") for w in wo_rows if w.get("date_s1_created") is not None]
+        s1_min = None
+        try:
+            ts = pd.to_datetime(s1_vals, errors="coerce")
+            ts = ts.dropna() if hasattr(ts, "dropna") else ts
+            if len(ts) > 0:
+                s1_min = ts.min()
+        except Exception:
+            s1_min = s1_vals[0] if s1_vals else None
+
+        try:
+            if s1_min is not None:
+                s1_dt = pd.to_datetime(s1_min, errors="coerce")
+                if pd.isna(s1_dt) or not (s1_dt >= start_dt and s1_dt < end_dt_excl):
+                    continue
+        except Exception:
+            pass
+
+        # Visibility gate: only show permits that have an S1-submitted lifecycle clock
+        if s1_min is None:
+            continue
+
+        # Aggregate lifecycle timestamps for KPIs and display
+        s2_vals = [w.get("date_s2_forwarded") for w in wo_rows if _has(w.get("date_s2_forwarded"))]
+        s3_vals = [w.get("date_s3_approved") for w in wo_rows if _has(w.get("date_s3_approved"))]
+        s2_min = None
+        s3_min = None
+        try:
+            ts2 = pd.to_datetime(s2_vals, errors="coerce")
+            ts2 = ts2.dropna() if hasattr(ts2, "dropna") else ts2
+            if len(ts2) > 0:
+                s2_min = ts2.min()
+        except Exception:
+            s2_min = s2_vals[0] if s2_vals else None
+        try:
+            ts3 = pd.to_datetime(s3_vals, errors="coerce")
+            ts3 = ts3.dropna() if hasattr(ts3, "dropna") else ts3
+            if len(ts3) > 0:
+                s3_min = ts3.min()
+        except Exception:
+            s3_min = s3_vals[0] if s3_vals else None
+
+        # Aggregate work_location for display
+        locs = []
+        for w in wo_rows:
+            loc = str(w.get("location", "") or "").strip()
+            eq = str(w.get("equipment", "") or "").strip()
+            combo = f"{loc}-{eq}".strip("-")
+            if combo:
+                locs.append(combo)
+        work_location = " & ".join(sorted(set(locs))) if locs else ""
+
+        out_rows.append(
+            {
+                "ptw_id": r.get("ptw_id"),
+                "permit_no": r.get("permit_no"),
+                "site_name": r.get("site_name") or (wo_rows[0].get("site_name") if wo_rows else ""),
+                "created_at": r.get("created_at"),
+                "created_by": r.get("created_by"),
+                "form_data": r.get("form_data") or {},
+                "work_order_ids": ids,
+                "work_location": work_location,
+                "status": display_status,
+                "date_s1_created": s1_min,
+                "date_s2_forwarded": s2_min,
+                "date_s3_approved": s3_min,
+            }
+        )
+
+    df = pd.DataFrame(out_rows)
+    if df.empty:
+        return df
+    try:
+        df = df.sort_values(by=["date_s1_created"], ascending=[False], na_position="last")
+    except Exception:
+        pass
     return df
 
 
@@ -675,23 +783,6 @@ def _update_ptw_form_data(ptw_id: str, form_data: dict) -> None:
     err = getattr(resp, "error", None)
     if err:
         raise RuntimeError(f"Failed to update PTW form data: {err}")
-
-
-def _persist_form_data_silently(*, ptw_id: str, form_data: dict) -> None:
-    """
-    Silent autosave for field changes.
-    No progress bar.
-    No UI messaging.
-    Autosave failures should NOT interrupt user input.
-    """
-    try:
-        sb = get_supabase_client(prefer_service_role=True)
-        sb.table(TABLE_PTW_REQUESTS).update(
-            {"form_data": form_data}
-        ).eq("ptw_id", ptw_id).execute()
-    except Exception:
-        # Autosave failures should NOT interrupt user input
-        pass
 
 
 def _update_work_order_s2_forwarded(
@@ -740,6 +831,26 @@ def _revoke_s2_submission(work_order_id: str) -> None:
     err = getattr(resp, "error", None)
     if err:
         raise RuntimeError(f"Failed to revoke submission: {err}")
+
+
+def _extract_work_order_ids_from_form_data(*, work_order_id: str, form_data: dict | None) -> list[str]:
+    """Multi-WO support: prefer form_data['work_order_ids'] if present, else fallback to work_order_id."""
+    fd = form_data if isinstance(form_data, dict) else {}
+    ids = fd.get("work_order_ids")
+    if isinstance(ids, list) and ids:
+        out = [str(x).strip() for x in ids if str(x).strip()]
+        return out if out else ([work_order_id] if work_order_id else [])
+    return [work_order_id] if work_order_id else []
+
+
+def _update_work_orders_s2_forwarded(*, work_order_ids: list[str], isolation_requirement: str) -> None:
+    for woid in [str(x).strip() for x in (work_order_ids or []) if str(x).strip()]:
+        _update_work_order_s2_forwarded(woid, isolation_requirement)
+
+
+def _revoke_s2_submissions(*, work_order_ids: list[str]) -> None:
+    for woid in [str(x).strip() for x in (work_order_ids or []) if str(x).strip()]:
+        _revoke_s2_submission(woid)
 
 
 # =============================================================================
@@ -1021,9 +1132,10 @@ def _render_view_submitted_ptw_body() -> None:
                 st.session_state["s2_ptw_run_fetch"] = True
             st.button("Fetch PTWs", type="primary", key="s2_fetch_ptw", on_click=_on_fetch)
 
-        # Run fetch if requested (same click rerun), with progress mounted first
-        if st.session_state.get("s2_ptw_run_fetch"):
+        # Run fetch if requested (same click rerun) or after an action refresh, with progress mounted first
+        if st.session_state.get("s2_ptw_run_fetch") or st.session_state.get("refresh_s2"):
             st.session_state["s2_ptw_run_fetch"] = False
+            st.session_state["refresh_s2"] = False
             prog_slot = st.empty()
             prog = prog_slot.progress(0, text="Fetching submitted PTWs...")
             try:
@@ -1051,23 +1163,14 @@ def _render_view_submitted_ptw_body() -> None:
         st.info("No submitted PTWs found for the selected date range.")
         return
     
-    # Summary metrics (modern KPI cards, S2-aware)
+    # Summary metrics (modern KPI cards, S2 display statuses)
     total = int(len(df))
 
-    # PTWs awaiting S2 action (not forwarded yet and not rejected)
-    pending_s2_count = int(
-        (
-            df["date_s2_forwarded"].isna()
-            & ~df["status"].astype("string").str.upper().isin(["REJECTED"])
-        ).sum()
-    )
-
-    # Approved = PTWs that have been approved from S3
-    approved_count = int(df["date_s3_approved"].notna().sum())
-
-    rejected_count = int(
-        (df["status"].astype("string").str.upper() == "REJECTED").sum()
-    )
+    st_status = df["status"].astype("string").fillna("").str.upper()
+    pending_s2_count = int((st_status == "PENDING_AT_S2").sum())
+    pending_s3_count = int((st_status == "PENDING_AT_S3").sum())
+    approved_count = int((st_status == "APPROVED_BY_S3").sum())
+    rejected_count = int((st_status == "REJECTED").sum())
 
     st.markdown(
         f"""
@@ -1080,6 +1183,11 @@ def _render_view_submitted_ptw_body() -> None:
           <div class="kpi-card">
             <div class="kpi-title">Pending at S2</div>
             <div class="kpi-value" style="color:#f97316;">{pending_s2_count}</div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="kpi-title">Pending at S3</div>
+            <div class="kpi-value" style="color:#dc2626;">{pending_s3_count}</div>
           </div>
 
           <div class="kpi-card">
@@ -1102,32 +1210,19 @@ def _render_view_submitted_ptw_body() -> None:
     def _build_ptw_option(row):
         """
         Build dropdown label for PTW selection.
-        States (priority order):
-        - 🟢 APPROVED FROM S3 (date_s3_approved set)
-        - 🟢 FORWARDED TO S3 (date_s2_forwarded set, date_s3_approved null)
-        - PENDING AT S2 (no forwarding timestamp)
+        Required format:
+          {permit_no} | {site_name} | {STATUS} | {created_at}
         """
-        wo = str(row.get("permit_no", "") or "")
+        permit_no = str(row.get("permit_no", "") or "")
         site = row.get("site_name", "")
         created = row.get("created_at", "")
-        forwarded_ts = row.get("date_s2_forwarded")
-        approved_ts = row.get("date_s3_approved")
+        status = str(row.get("status") or "").strip() or "PENDING AT S2"
 
         try:
             created = pd.to_datetime(created).strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
-
-        # PRIORITY 1: Approved from S3
-        if approved_ts is not None and str(approved_ts).strip() != "":
-            return f"🟢 {wo} | {site} | APPROVED FROM S3 | {created}"
-
-        # PRIORITY 2: Forwarded to S3 (but not yet approved)
-        if forwarded_ts is not None and str(forwarded_ts).strip() != "":
-            return f"🟢 {wo} | {site} | FORWARDED TO S3 | {created}"
-
-        # PRIORITY 3: Pending at S2
-        return f"{wo} | {site} | PENDING AT S2 | {created}"
+        return f"{permit_no} | {site} | {status} | {created}"
     
     ptw_options = {
         _build_ptw_option(row): row
@@ -1428,16 +1523,6 @@ def _render_ptw_detail_body(
         # Track active PTW by work_order_id (stable across reruns)
         st.session_state["s2_active_ptw_id"] = work_order_id
 
-    def _queue_autosave(section_id: str) -> None:
-        """
-        Queue a section-scoped autosave.
-        - Remembers which section triggered the save
-        - Uses global s2_autosave_* keys so sections can render local indicators
-        """
-        _set_active()
-        st.session_state["s2_autosave_pending"] = True
-        st.session_state["s2_autosave_section"] = section_id
-
     # PRE-RUN ACTION HANDLING (progress must appear BEFORE the form is rebuilt)
     # If an action was requested by an on_change or button click, handle it first,
     # show progress immediately, and stop rendering the rest of the expander body.
@@ -1448,30 +1533,6 @@ def _render_ptw_detail_body(
     submit_req = f"{key_prefix}submit_requested"
     if submit_req not in st.session_state:
         st.session_state[submit_req] = False
-
-    # =========================================================================
-    # IMPROVED AUTOSAVE: Silent, section-scoped, no global progress bar
-    # =========================================================================
-    autosave_section: str | None = None
-    if st.session_state.get("s2_autosave_pending"):
-        # Capture which section triggered autosave for this render
-        autosave_section = st.session_state.get("s2_autosave_section")
-        try:
-            updated = dict(form_data or {})
-            updated["holder_name"] = st.session_state.get(f"{key_prefix}holder_name", updated.get("holder_name", ""))
-            updated["isolation_required"] = st.session_state.get(
-                f"{key_prefix}isolation_required", updated.get("isolation_required", "")
-            )
-            updated["toolbox_conducted"] = bool(
-                st.session_state.get(f"{key_prefix}toolbox_conducted", updated.get("toolbox_conducted", False))
-            )
-            updated["s2_remarks"] = st.session_state.get(f"{key_prefix}s2_remarks", updated.get("s2_remarks", ""))
-            _persist_form_data_silently(ptw_id=ptw_id, form_data=updated)
-        finally:
-            # Clear autosave pending; section indicator will render below
-            st.session_state["s2_autosave_pending"] = False
-            st.session_state["s2_autosave_progress"] = 100
-        # autosave_section is preserved for section-level indicators (cleared after render)
 
     # Handle preview request FIRST (avoid rebuilding the whole form before progress appears)
     if st.session_state.get(prev_req):
@@ -1485,9 +1546,13 @@ def _render_ptw_detail_body(
             updated_form["isolation_required"] = st.session_state.get(
                 f"{key_prefix}isolation_required", updated_form.get("isolation_required", "")
             )
-            updated_form["toolbox_conducted"] = bool(
-                st.session_state.get(f"{key_prefix}toolbox_conducted", updated_form.get("toolbox_conducted", False))
-            )
+            # Toolbox is evidence-driven (no autosave checkbox); treat as conducted if files exist
+            try:
+                existing_toolbox = _list_evidence_files(work_order_id, "toolbox")
+            except Exception:
+                existing_toolbox = []
+            uploaded_toolbox = st.session_state.get(f"{key_prefix}toolbox_files", []) or []
+            updated_form["toolbox_conducted"] = bool(existing_toolbox or uploaded_toolbox)
             updated_form["s2_remarks"] = st.session_state.get(f"{key_prefix}s2_remarks", updated_form.get("s2_remarks", ""))
 
             def progress_callback(pct, msg):
@@ -1513,13 +1578,15 @@ def _render_ptw_detail_body(
         isolation_required = st.session_state.get(
             f"{key_prefix}isolation_required", (form_data or {}).get("isolation_required", "")
         )
-        toolbox_conducted = bool(
-            st.session_state.get(f"{key_prefix}toolbox_conducted", (form_data or {}).get("toolbox_conducted", False))
-        )
+        try:
+            existing_toolbox = _list_evidence_files(work_order_id, "toolbox")
+        except Exception:
+            existing_toolbox = []
+        toolbox_files_uploaded = st.session_state.get(f"{key_prefix}toolbox_files", []) or []
+        toolbox_conducted = bool(existing_toolbox or toolbox_files_uploaded)
         s2_remarks = st.session_state.get(f"{key_prefix}s2_remarks", (form_data or {}).get("s2_remarks", ""))
 
         isolation_files_uploaded = st.session_state.get(f"{key_prefix}isolation_files", [])
-        toolbox_files_uploaded = st.session_state.get(f"{key_prefix}toolbox_files", [])
 
         updated_form = _handle_s2_submit(
             ptw_id=ptw_id,
@@ -1544,7 +1611,7 @@ def _render_ptw_detail_body(
             )
             return
     
-    if is_forwarded or status in ("CLOSED", "APPROVED", "REJECTED"):
+    if is_forwarded or status in ("CLOSED", "APPROVED", "APPROVED_BY_S3", "REJECTED"):
         st.info(
             f"This PTW has been {'forwarded to S3' if is_forwarded else 'finalized'}. "
             "Editing is disabled."
@@ -1566,7 +1633,7 @@ def _render_ptw_detail_body(
         
         with btn_col1:
             # Revoke button (only if forwarded but not yet approved/rejected)
-            if is_forwarded and status == "WIP":
+            if is_forwarded and status == "PENDING_AT_S3":
                 req_key = f"{key_prefix}revoke_requested"
 
                 def _on_revoke() -> None:
@@ -1581,19 +1648,18 @@ def _render_ptw_detail_body(
                     prog = prog_slot.progress(0, text="Revoking...")
                     try:
                         _smooth_progress(prog, 0, 60, text="Updating database...")
-                        _revoke_s2_submission(work_order_id)
+                        wo_ids = _extract_work_order_ids_from_form_data(work_order_id=work_order_id, form_data=form_data)
+                        _revoke_s2_submissions(work_order_ids=wo_ids)
                         _smooth_progress(prog, 60, 100, text="Done")
                         prog_slot.empty()
                         st.success("Submission revoked. You can now edit the PTW.")
                         # Clear the just_submitted flag so the editable form appears immediately
                         st.session_state[f"s2_wo_{work_order_id}_just_submitted"] = False
-                        # Force a full re-fetch to get updated is_forwarded status
-                        st.session_state.pop("s2_ptw_view_df", None)
-                        st.session_state["s2_ptw_run_fetch"] = True
+                        # Trigger a refresh (refetch) without forcing a hard rerun
+                        st.session_state["refresh_s2"] = True
                         # Ensure this PTW stays expanded after refresh
                         st.session_state["s2_active_ptw_id"] = work_order_id
-                        # Force rerun to show the editable form immediately
-                        st.rerun()
+                        return
                     except Exception as e:
                         prog_slot.empty()
                         st.error(f"Failed to revoke: {e}")
@@ -1663,19 +1729,8 @@ def _render_ptw_detail_body(
         value=form_data.get("holder_name", ""),
         key=f"{key_prefix}holder_name",
         placeholder="Enter the name of the permit holder",
-        on_change=lambda: _queue_autosave("section_b"),
         height=38,
     )
-    # Section-level progress indicator (incremental, scoped)
-    if autosave_section == "section_b":
-        progress_slot = st.empty()
-        bar = progress_slot.progress(0, text="Saving Section B…")
-        for i in range(0, 101, 20):
-            bar.progress(i)
-            _time.sleep(0.05)
-        progress_slot.empty()
-        st.session_state["s2_autosave_section"] = None
-        st.session_state["s2_autosave_progress"] = 0
     
     st.divider()
     
@@ -1684,16 +1739,12 @@ def _render_ptw_detail_body(
     
     current_isolation = form_data.get("isolation_required", "")
     isolation_idx = 0 if current_isolation.upper() != "NO" else 1
-    
-    def _on_iso_change() -> None:
-        _queue_autosave("section_c")
     isolation_required = st.radio(
         "Is Isolation Required? *",
         options=["YES", "NO"],
         index=isolation_idx,
         key=f"{key_prefix}isolation_required",
         horizontal=True,
-        on_change=_on_iso_change,
     )
     
     # File upload for isolation evidence (mandatory if YES)
@@ -1723,66 +1774,48 @@ def _render_ptw_detail_body(
     else:
         st.session_state[isolation_files_key] = []
     
-    # Section-level progress indicator (incremental, scoped)
-    if autosave_section == "section_c":
-        progress_slot = st.empty()
-        bar = progress_slot.progress(0, text="Saving Section C…")
-        for i in range(0, 101, 20):
-            bar.progress(i)
-            _time.sleep(0.05)
-        progress_slot.empty()
-        st.session_state["s2_autosave_section"] = None
-        st.session_state["s2_autosave_progress"] = 0
-    
     st.divider()
     
     # Section D: Tool Box Talk (MANDATORY)
     st.markdown("### D. Tool Box Talk Confirmation (Required)")
-    
-    toolbox_conducted = st.checkbox(
-        "Tool Box Talk Conducted *",
-        value=form_data.get("toolbox_conducted", False),
-        key=f"{key_prefix}toolbox_conducted",
-        on_change=lambda: _queue_autosave("section_d"),
-    )
-    
-    # File upload for toolbox evidence (mandatory if checked)
+
+    # Toolbox evidence (always visible; conducted is evidence-driven)
     existing_toolbox_files = _list_evidence_files(work_order_id, "toolbox")
     toolbox_files_key = f"{key_prefix}toolbox_files"
-    
-    if toolbox_conducted:
-        st.caption("Upload toolbox talk evidence (images or PDFs) - Required")
-        
-        # Show existing files
-        if existing_toolbox_files:
-            st.success(f"✓ {len(existing_toolbox_files)} toolbox file(s) already uploaded")
-            with st.expander("View uploaded files"):
-                for f in existing_toolbox_files:
-                    st.write(f"  📎 {f['name']}")
-        
-        # New file upload
-        toolbox_upload = st.file_uploader(
-            "Upload Toolbox Talk Evidence",
-            type=["pdf", "jpg", "jpeg", "png", "gif", "webp"],
-            accept_multiple_files=True,
-            key=f"{key_prefix}toolbox_upload",
-        )
-        
-        # Store in session state
-        st.session_state[toolbox_files_key] = toolbox_upload if toolbox_upload else []
-    else:
-        st.session_state[toolbox_files_key] = []
-    
-    # Section-level progress indicator (incremental, scoped)
-    if autosave_section == "section_d":
-        progress_slot = st.empty()
-        bar = progress_slot.progress(0, text="Saving Section D…")
+
+    st.caption("Upload toolbox talk evidence (images or PDFs) - Required")
+
+    # Show existing files
+    if existing_toolbox_files:
+        st.success(f"✓ {len(existing_toolbox_files)} toolbox file(s) already uploaded")
+        with st.expander("View uploaded files"):
+            for f in existing_toolbox_files:
+                st.write(f"  📎 {f['name']}")
+
+    # New file upload (always visible)
+    toolbox_upload = st.file_uploader(
+        "Upload Toolbox Talk Evidence",
+        type=["pdf", "jpg", "jpeg", "png", "gif", "webp"],
+        accept_multiple_files=True,
+        key=f"{key_prefix}toolbox_upload",
+    )
+    st.session_state[toolbox_files_key] = toolbox_upload if toolbox_upload else []
+
+    # Modern upload UX (only when user selects new files)
+    ack_key = f"{key_prefix}toolbox_upload_ack"
+    try:
+        curr_names = [getattr(f, "name", "") for f in (toolbox_upload or [])]
+        curr_names = [n for n in curr_names if str(n).strip()]
+    except Exception:
+        curr_names = []
+    if curr_names and st.session_state.get(ack_key) != curr_names:
+        prog = st.progress(0, text="Uploading toolbox evidence…")
         for i in range(0, 101, 20):
-            bar.progress(i)
-            _time.sleep(0.05)
-        progress_slot.empty()
-        st.session_state["s2_autosave_section"] = None
-        st.session_state["s2_autosave_progress"] = 0
+            prog.progress(i, text="Uploading toolbox evidence…")
+            _time.sleep(0.02)
+        prog.empty()
+        st.success("Files selected. They’ll upload on Submit.")
+        st.session_state[ack_key] = curr_names
     
     st.divider()
     
@@ -1794,18 +1827,7 @@ def _render_ptw_detail_body(
         value=form_data.get("s2_remarks", ""),
         key=f"{key_prefix}s2_remarks",
         placeholder="Add any additional remarks or notes...",
-        on_change=lambda: _queue_autosave("section_e"),
     )
-    # Section-level progress indicator (incremental, scoped)
-    if autosave_section == "section_e":
-        progress_slot = st.empty()
-        bar = progress_slot.progress(0, text="Saving Section E…")
-        for i in range(0, 101, 20):
-            bar.progress(i)
-            _time.sleep(0.05)
-        progress_slot.empty()
-        st.session_state["s2_autosave_section"] = None
-        st.session_state["s2_autosave_progress"] = 0
     
     st.divider()
     
@@ -1821,10 +1843,10 @@ def _render_ptw_detail_body(
     if isolation_required == "YES":
         if not existing_isolation_files and not isolation_files_uploaded:
             validation_errors.append("Isolation evidence file is required when Isolation = YES")
-    
-    if toolbox_conducted:
-        if not existing_toolbox_files and not toolbox_files_uploaded:
-            validation_errors.append("Toolbox Talk evidence file is required")
+
+    # Toolbox evidence is mandatory in S2
+    if not existing_toolbox_files and not toolbox_files_uploaded:
+        validation_errors.append("Toolbox Talk evidence file is required")
     
     # Show validation status
     if validation_errors:
@@ -1959,7 +1981,8 @@ def _handle_s2_submit(
         progress.progress(75, text="Forwarding to S3...")
         status_msg.info("Forwarding PTW for final approval...")
         
-        _update_work_order_s2_forwarded(work_order_id, isolation_required)
+        wo_ids = _extract_work_order_ids_from_form_data(work_order_id=work_order_id, form_data=updated_form)
+        _update_work_orders_s2_forwarded(work_order_ids=wo_ids, isolation_requirement=isolation_required)
         
         # Step 4: Done
         progress.progress(100, text="Complete!")
@@ -1970,6 +1993,8 @@ def _handle_s2_submit(
         # Use work_order_id-based key (stable) so success view doesn't disappear on reruns.
         st.session_state[f"s2_wo_{work_order_id}_just_submitted"] = True
         st.session_state["s2_active_ptw_id"] = str(work_order_id)
+        # Refresh list without "vanishing" items (keep same date filters)
+        st.session_state["refresh_s2"] = True
         
         return updated_form
         
@@ -1997,18 +2022,20 @@ def render(db_path: str) -> None:
     st.markdown("# S2 Portal")
     st.caption("PTW Review & Forwarding Stage")
 
+    # Import modern UI styles
+    try:
+        from modern_ui_styles import MODERN_UI_CSS
+        st.markdown(MODERN_UI_CSS, unsafe_allow_html=True)
+    except Exception:
+        pass  # Fallback if import fails
+
     _apply_modern_tabs_css()
     
     # Initialize session state
     if "s2_ptw_view_df" not in st.session_state:
         st.session_state["s2_ptw_view_df"] = None
-    # Section-scoped autosave state (shared across PTW detail renders)
-    if "s2_autosave_section" not in st.session_state:
-        st.session_state["s2_autosave_section"] = None
-    if "s2_autosave_pending" not in st.session_state:
-        st.session_state["s2_autosave_pending"] = False
-    if "s2_autosave_progress" not in st.session_state:
-        st.session_state["s2_autosave_progress"] = 0
+    if "refresh_s2" not in st.session_state:
+        st.session_state["refresh_s2"] = False
     
     # Top horizontal tabs
     tab1, tab2 = st.tabs(["View Work Order", "View Submitted PTW"])

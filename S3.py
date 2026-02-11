@@ -494,62 +494,222 @@ def _render_view_work_order_s3() -> None:
 
 def _fetch_all_s3_ptws(*, start_date: date, end_date: date) -> pd.DataFrame:
     """
-    Fetch ALL PTWs that have reached S3 (both pending approval and already approved).
-    S1 created + S2 forwarded (regardless of S3 approval status).
-    Filtered by date_s2_forwarded within date range.
+    Fetch PTWs visible in S3 (multi-WO safe).
+
+    Rules:
+    - Extract work_order_ids from ptw_requests.form_data["work_order_ids"] if present,
+      else legacy form_data["work_order_id"], else fallback to permit_no (and split on "-" if needed).
+    - Fetch work_orders for all referenced ids in one .in_() call.
+    - Aggregate lifecycle (priority):
+        REJECTED
+        APPROVED
+        PENDING AT S3
+        PENDING AT S2
+        OPEN
+
+    S3 should show:
+      PENDING_AT_S3 (date_s2_forwarded set AND date_s3_approved NULL)
+      APPROVED (date_s3_approved set)
+
+    Date filter is applied on lifecycle clock: work_orders.date_s2_forwarded within range
     """
     sb = get_supabase_client(prefer_service_role=True)
 
     start_dt = datetime.combine(start_date, datetime.min.time())
     end_dt_excl = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
 
-    cols = (
-        "work_order_id,site_name,location,equipment,"
-        "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
-    )
-
-    q = (
+    # Candidate WO ids by lifecycle date filter (performance gate)
+    wo_gate_resp = (
         sb.table(TABLE_WORK_ORDERS)
-        .select(cols)
+        .select("work_order_id,date_s2_forwarded")
         .not_.is_("date_s1_created", "null")
         .not_.is_("date_s2_forwarded", "null")
         .gte("date_s2_forwarded", start_dt.isoformat(sep=" ", timespec="seconds"))
         .lt("date_s2_forwarded", end_dt_excl.isoformat(sep=" ", timespec="seconds"))
-        .order("date_s2_forwarded", desc=True)
+        .execute()
     )
+    gate_err = getattr(wo_gate_resp, "error", None)
+    if gate_err:
+        raise RuntimeError(f"Failed to fetch forwarded work orders: {gate_err}")
+    gate_rows = getattr(wo_gate_resp, "data", None) or []
+    gate_ids = {str(r.get("work_order_id") or "").strip() for r in gate_rows if str(r.get("work_order_id") or "").strip()}
+    if not gate_ids:
+        return pd.DataFrame()
 
-    resp = q.execute()
-    err = getattr(resp, "error", None)
-    if err:
-        raise RuntimeError(f"Failed to fetch PTWs: {err}")
+    # Fetch recent PTW requests and keep those that reference any gated id
+    ptw_resp = (
+        sb.table(TABLE_PTW_REQUESTS)
+        .select("ptw_id,permit_no,site_name,created_at,created_by,form_data")
+        .order("created_at", desc=True)
+        .limit(500)
+        .execute()
+    )
+    ptw_err = getattr(ptw_resp, "error", None)
+    if ptw_err:
+        raise RuntimeError(f"Failed to fetch PTW requests: {ptw_err}")
+    ptw_rows: list[dict[str, Any]] = getattr(ptw_resp, "data", None) or []
+    if not ptw_rows:
+        return pd.DataFrame()
 
-    data = getattr(resp, "data", None) or []
-    df = pd.DataFrame(data)
+    def _extract_ids(r: dict) -> list[str]:
+        fd = r.get("form_data") if isinstance(r.get("form_data"), dict) else {}
+        if isinstance(fd, dict):
+            ids = fd.get("work_order_ids")
+            if isinstance(ids, list) and ids:
+                out = [str(x).strip() for x in ids if str(x).strip()]
+                if out:
+                    return out
+            legacy = str(fd.get("work_order_id") or "").strip()
+            if legacy:
+                return [legacy]
+        pn = str(r.get("permit_no") or "").strip()
+        if pn and "-" in pn:
+            parts = [p.strip() for p in pn.split("-") if p.strip()]
+            return parts or [pn]
+        return [pn] if pn else []
+
+    candidates: list[dict[str, Any]] = []
+    all_ids: set[str] = set()
+    for r in ptw_rows:
+        if not isinstance(r, dict):
+            continue
+        ids = _extract_ids(r)
+        if not ids:
+            continue
+        if not (set(ids) & gate_ids):
+            continue
+        r["_work_order_ids"] = ids
+        candidates.append(r)
+        all_ids.update(ids)
+
+    if not candidates or not all_ids:
+        return pd.DataFrame()
+
+    # Fetch work_orders for all referenced ids (single call)
+    wo_resp = (
+        sb.table(TABLE_WORK_ORDERS)
+        .select(
+            "work_order_id,site_name,location,equipment,"
+            "date_s1_created,date_s2_forwarded,date_s3_approved,date_s2_rejected,date_s3_rejected"
+        )
+        .in_("work_order_id", list(all_ids))
+        .execute()
+    )
+    wo_err = getattr(wo_resp, "error", None)
+    if wo_err:
+        raise RuntimeError(f"Failed to fetch work orders: {wo_err}")
+    wo_rows = getattr(wo_resp, "data", None) or []
+    wo_lookup: dict[str, dict] = {}
+    for w in wo_rows:
+        if isinstance(w, dict) and w.get("work_order_id"):
+            wo_lookup[str(w["work_order_id"]).strip()] = w
+
+    def _has(v) -> bool:
+        return v is not None and str(v).strip() != ""
+
+    def _aggregate(wo_rows_local: list[dict]) -> str:
+        derived = []
+        for w in wo_rows_local:
+            d = derive_ptw_status(w)
+            derived.append(d)
+        sset = {str(x).strip().upper() for x in derived if str(x).strip()}
+        if "REJECTED" in sset:
+            return "REJECTED"
+        if sset and sset.issubset({"APPROVED"}):
+            return "APPROVED"
+        all_fwd = all(_has(w.get("date_s2_forwarded")) for w in wo_rows_local)
+        none_s3 = all(not _has(w.get("date_s3_approved")) for w in wo_rows_local)
+        if all_fwd and none_s3:
+            return "PENDING AT S3"
+        all_s1 = all(_has(w.get("date_s1_created")) for w in wo_rows_local)
+        none_fwd = all(not _has(w.get("date_s2_forwarded")) for w in wo_rows_local)
+        if all_s1 and none_fwd:
+            return "PENDING AT S2"
+        return "OPEN"
+
+    out: list[dict[str, Any]] = []
+    for r in candidates:
+        ids = r.get("_work_order_ids") or []
+        wo_rows_local = [wo_lookup.get(i) for i in ids if i in wo_lookup]
+        wo_rows_local = [w for w in wo_rows_local if isinstance(w, dict)]
+        if len(wo_rows_local) != len(ids):
+            continue
+        lifecycle = _aggregate(wo_rows_local)
+        if lifecycle not in ("PENDING AT S3", "APPROVED"):
+            continue
+
+        # Filter: min date_s2_forwarded within selected range (already gated, but keep safe)
+        fwd_vals = [w.get("date_s2_forwarded") for w in wo_rows_local if _has(w.get("date_s2_forwarded"))]
+        fwd_min = None
+        fwd_max = None
+        try:
+            ts = pd.to_datetime(fwd_vals, errors="coerce")
+            ts = ts.dropna() if hasattr(ts, "dropna") else ts
+            if len(ts) > 0:
+                fwd_min = ts.min()
+                fwd_max = ts.max()
+        except Exception:
+            fwd_min = fwd_vals[0] if fwd_vals else None
+            fwd_max = fwd_vals[0] if fwd_vals else None
+        try:
+            if fwd_min is not None:
+                fwd_dt = pd.to_datetime(fwd_min, errors="coerce")
+                if pd.isna(fwd_dt) or not (fwd_dt >= start_dt and fwd_dt < end_dt_excl):
+                    continue
+        except Exception:
+            pass
+
+        # Approval timestamp (aggregated)
+        s3_vals = [w.get("date_s3_approved") for w in wo_rows_local if _has(w.get("date_s3_approved"))]
+        s3_min = None
+        try:
+            ts3 = pd.to_datetime(s3_vals, errors="coerce")
+            ts3 = ts3.dropna() if hasattr(ts3, "dropna") else ts3
+            if len(ts3) > 0:
+                s3_min = ts3.min()
+        except Exception:
+            s3_min = s3_vals[0] if s3_vals else None
+
+        primary = ids[0] if ids else ""
+        is_approved = lifecycle == "APPROVED"
+        derived_status = "APPROVED" if is_approved else "PENDING_AT_S3"
+        out.append(
+            {
+                "work_order_id": primary,
+                "permit_no": r.get("permit_no"),
+                "site_name": r.get("site_name") or (wo_rows_local[0].get("site_name") if wo_rows_local else ""),
+                "created_at": r.get("created_at"),
+                "date_s2_forwarded": fwd_max,
+                "date_s3_approved": s3_min,
+                "derived_status": derived_status,
+                "is_approved": is_approved,
+            }
+        )
+
+    df = pd.DataFrame(out)
     if df.empty:
         return df
-
-    df["work_location"] = df.apply(
-        lambda r: f"{(r.get('location') or '').strip()}-{(r.get('equipment') or '').strip()}".strip("-"),
-        axis=1,
-    )
-    df["derived_status"] = df.apply(lambda r: derive_ptw_status(r.to_dict()), axis=1)
-    
-    # Add approval status flag for UI display
-    df["is_approved"] = df["date_s3_approved"].notna() & (df["date_s3_approved"].astype(str).str.strip() != "")
-    
+    try:
+        df = df.sort_values(by=["date_s2_forwarded"], ascending=[False], na_position="last")
+    except Exception:
+        pass
     return df
 
 
-def _fetch_ptw_requests_for_work_orders(work_order_ids: list[str]) -> dict[str, dict]:
-    """Return mapping work_order_id -> ptw_requests row (latest by created_at if duplicates exist)."""
-    if not work_order_ids:
+def _fetch_ptw_requests_for_permits(permit_nos: list[str]) -> dict[str, dict]:
+    """
+    Return mapping primary_work_order_id -> ptw_requests row (latest by created_at if duplicates exist),
+    fetched by permit_no (supports multi-WO permit_no like WO1-WO2).
+    """
+    permit_nos = [str(x).strip() for x in (permit_nos or []) if str(x).strip()]
+    if not permit_nos:
         return {}
 
     sb = get_supabase_client(prefer_service_role=True)
     resp = (
         sb.table(TABLE_PTW_REQUESTS)
         .select("ptw_id,permit_no,site_name,created_at,created_by,form_data")
-        .in_("permit_no", work_order_ids)
+        .in_("permit_no", permit_nos)
         .order("created_at", desc=True)
         .execute()
     )
@@ -560,12 +720,23 @@ def _fetch_ptw_requests_for_work_orders(work_order_ids: list[str]) -> dict[str, 
     rows: list[dict[str, Any]] = getattr(resp, "data", None) or []
     out: dict[str, dict] = {}
     for r in rows:
-        woid = str(r.get("permit_no") or "")
-        if not woid:
+        if not isinstance(r, dict):
             continue
-        # keep the first (latest) row if duplicates exist
-        if woid not in out:
-            out[woid] = r
+        fd = r.get("form_data") if isinstance(r.get("form_data"), dict) else {}
+        primary = ""
+        if isinstance(fd, dict):
+            ids = fd.get("work_order_ids")
+            if isinstance(ids, list) and ids:
+                primary = str(ids[0]).strip()
+            if not primary:
+                primary = str(fd.get("work_order_id") or "").strip()
+        if not primary:
+            pn = str(r.get("permit_no") or "").strip()
+            primary = pn.split("-")[0].strip() if pn else ""
+        if not primary:
+            continue
+        if primary not in out:
+            out[primary] = r
     return out
 
 
@@ -613,12 +784,12 @@ def _approve_work_order(*, work_order_id: str, issuer_name: str) -> tuple[bool, 
     ts = datetime.now().isoformat(sep=" ", timespec="seconds")
 
     # Update PTW form_data with issuer_name + issuer_datetime (so template can render it)
+    # Multi-WO support: locate PTW by permit_no OR by work_order_id inside form_data.work_order_ids
     ptw_resp = (
         sb.table(TABLE_PTW_REQUESTS)
-        .select("ptw_id,form_data")
-        .eq("permit_no", work_order_id)
+        .select("ptw_id,permit_no,form_data,created_at")
         .order("created_at", desc=True)
-        .limit(1)
+        .limit(50)
         .execute()
     )
     ptw_err = getattr(ptw_resp, "error", None)
@@ -628,8 +799,26 @@ def _approve_work_order(*, work_order_id: str, issuer_name: str) -> tuple[bool, 
     ptw_rows = getattr(ptw_resp, "data", None) or []
     if not ptw_rows:
         return False, "No PTW request found for this work_order_id."
+    chosen = None
+    for r in ptw_rows:
+        if not isinstance(r, dict):
+            continue
+        if str(r.get("permit_no") or "").strip() == str(work_order_id).strip():
+            chosen = r
+            break
+        fd = r.get("form_data") or {}
+        if isinstance(fd, dict):
+            ids = fd.get("work_order_ids")
+            if isinstance(ids, list) and str(work_order_id).strip() in {str(x).strip() for x in ids}:
+                chosen = r
+                break
+            if str(fd.get("work_order_id") or "").strip() == str(work_order_id).strip():
+                chosen = r
+                break
+    if chosen is None:
+        return False, "No PTW request found for this work_order_id."
 
-    form_data = (ptw_rows[0].get("form_data") or {}) if isinstance(ptw_rows[0], dict) else {}
+    form_data = (chosen.get("form_data") or {}) if isinstance(chosen, dict) else {}
     if not isinstance(form_data, dict):
         form_data = {}
     form_data["issuer_name"] = issuer_name
@@ -638,27 +827,37 @@ def _approve_work_order(*, work_order_id: str, issuer_name: str) -> tuple[bool, 
     upd_ptw = (
         sb.table(TABLE_PTW_REQUESTS)
         .update({"form_data": form_data})
-        .eq("ptw_id", ptw_rows[0].get("ptw_id"))
+        .eq("ptw_id", chosen.get("ptw_id"))
         .execute()
     )
     upd_ptw_err = getattr(upd_ptw, "error", None)
     if upd_ptw_err:
         return False, f"Failed to update PTW issuer info: {upd_ptw_err}"
 
-    # Approve only if not already approved (prevents duplicate approvals)
-    upd = (
-        sb.table(TABLE_WORK_ORDERS)
-        .update({"date_s3_approved": ts})
-        .eq("work_order_id", work_order_id)
-        .is_("date_s3_approved", "null")
-        .execute()
-    )
-    upd_err = getattr(upd, "error", None)
-    if upd_err:
-        return False, f"Failed to approve work order: {upd_err}"
+    # Approve all covered work orders (multi-WO safe)
+    covered = form_data.get("work_order_ids")
+    if not isinstance(covered, list) or not covered:
+        covered = [work_order_id]
+    covered_ids = [str(x).strip() for x in covered if str(x).strip()]
+    if not covered_ids:
+        covered_ids = [work_order_id]
 
-    updated_rows = getattr(upd, "data", None) or []
-    if not updated_rows:
+    any_updated = False
+    for woid in covered_ids:
+        upd = (
+            sb.table(TABLE_WORK_ORDERS)
+            .update({"date_s3_approved": ts})
+            .eq("work_order_id", woid)
+            .is_("date_s3_approved", "null")
+            .execute()
+        )
+        upd_err = getattr(upd, "error", None)
+        if upd_err:
+            return False, f"Failed to approve work order: {upd_err}"
+        updated_rows = getattr(upd, "data", None) or []
+        if updated_rows:
+            any_updated = True
+    if not any_updated:
         return False, "This PTW appears to already be approved (date_s3_approved is set)."
 
     return True, ts
@@ -668,17 +867,48 @@ def _revoke_s3_approval(*, work_order_id: str) -> tuple[bool, str]:
     """Revoke S3 approval by clearing date_s3_approved."""
     sb = get_supabase_client(prefer_service_role=True)
     
-    resp = (
-        sb.table(TABLE_WORK_ORDERS)
-        .update({"date_s3_approved": None})
-        .eq("work_order_id", work_order_id)
-        .execute()
-    )
-    
-    err = getattr(resp, "error", None)
-    if err:
-        return False, f"Failed to revoke approval: {err}"
-    
+    # Multi-WO safe: attempt to locate PTW and revoke all covered work orders; fallback to single
+    try:
+        ptw_resp = (
+            sb.table(TABLE_PTW_REQUESTS)
+            .select("permit_no,form_data,created_at")
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+        ptw_rows = getattr(ptw_resp, "data", None) or []
+        covered_ids: list[str] = []
+        for r in ptw_rows:
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("permit_no") or "").strip() == str(work_order_id).strip():
+                fd = r.get("form_data") if isinstance(r.get("form_data"), dict) else {}
+                ids = fd.get("work_order_ids") if isinstance(fd, dict) else None
+                if isinstance(ids, list) and ids:
+                    covered_ids = [str(x).strip() for x in ids if str(x).strip()]
+                break
+            fd = r.get("form_data") or {}
+            if isinstance(fd, dict):
+                ids = fd.get("work_order_ids")
+                if isinstance(ids, list) and str(work_order_id).strip() in {str(x).strip() for x in ids}:
+                    covered_ids = [str(x).strip() for x in ids if str(x).strip()]
+                    break
+        if not covered_ids:
+            covered_ids = [work_order_id]
+    except Exception:
+        covered_ids = [work_order_id]
+
+    for woid in covered_ids:
+        resp = (
+            sb.table(TABLE_WORK_ORDERS)
+            .update({"date_s3_approved": None})
+            .eq("work_order_id", woid)
+            .execute()
+        )
+        err = getattr(resp, "error", None)
+        if err:
+            return False, f"Failed to revoke approval: {err}"
+
     return True, "Approval revoked successfully"
 
 
@@ -770,7 +1000,7 @@ def _render_view_approvals() -> None:
             _smooth_progress(prog, 0, 20, text="Validating date range...")
             _smooth_progress(prog, 20, 70, text="Loading from database...")
             df = _fetch_all_s3_ptws(start_date=start_date, end_date=end_date)
-            ptw_map = _fetch_ptw_requests_for_work_orders(df["work_order_id"].astype(str).tolist() if not df.empty else [])
+            ptw_map = _fetch_ptw_requests_for_permits(df["permit_no"].astype(str).tolist() if not df.empty else [])
             st.session_state["s3_pending_df"] = df
             st.session_state["s3_ptw_map"] = ptw_map
             _smooth_progress(prog, 70, 100, text="PTWs ready")
@@ -816,21 +1046,15 @@ def _render_view_approvals() -> None:
 
     def _build_s3_ptw_label(row: pd.Series) -> str:
         """Build label for S3 PTW selectbox."""
-        work_order_id = str(row.get("work_order_id") or "")
+        permit_no = str(row.get("permit_no") or "")
         site_name = str(row.get("site_name") or "")
-
-        # Prefer explicit approval flag; fall back to derived status
-        status = "APPROVED" if bool(row.get("is_approved", False)) else str(row.get("derived_status") or "")
-
-        fwd = row.get("date_s2_forwarded")
-        fwd_str = ""
+        status = str(row.get("derived_status") or "PENDING_AT_S3")
+        created = row.get("created_at", "")
         try:
-            if fwd is not None and str(fwd).strip():
-                fwd_str = pd.to_datetime(fwd).strftime("%Y-%m-%d %H:%M")
+            created = pd.to_datetime(created).strftime("%Y-%m-%d %H:%M")
         except Exception:
-            fwd_str = str(fwd)
-
-        return f"{work_order_id} | {site_name} | {status} | Forwarded: {fwd_str}"
+            pass
+        return f"{permit_no} | {site_name} | {status} | {created}"
 
     options = ["(select PTW)"] + [
         _build_s3_ptw_label(r) for _, r in df.iterrows()
@@ -842,25 +1066,26 @@ def _render_view_approvals() -> None:
         key="s3_selected_ptw_label",
     )
 
-    # Map selection back to active work_order_id
+    # Map selection back to active permit_no, then resolve primary work_order_id
     if selected_label and selected_label != "(select PTW)":
-        selected_wo = selected_label.split("|")[0].strip()
-        st.session_state["s3_active_approval_id"] = selected_wo
+        selected_permit = selected_label.split("|")[0].strip()
+        st.session_state["s3_active_permit_no"] = selected_permit
     else:
-        st.session_state["s3_active_approval_id"] = None
+        st.session_state["s3_active_permit_no"] = None
 
-    active_wo = st.session_state.get("s3_active_approval_id")
-    if not active_wo:
+    active_permit = st.session_state.get("s3_active_permit_no")
+    if not active_permit:
         return
 
     # Locate the active row in the current dataset
-    active_row = df[df["work_order_id"].astype(str) == str(active_wo)]
+    active_row = df[df["permit_no"].astype(str) == str(active_permit)]
     if active_row.empty:
         st.warning("Selected PTW is no longer available in the current filter set.")
         return
 
     r = active_row.iloc[0]
     work_order_id = str(r.get("work_order_id") or "")
+    permit_no = str(r.get("permit_no") or "")
     site_name = str(r.get("site_name") or "")
     status = str(r.get("derived_status") or "")
     is_db_approved = bool(r.get("is_approved", False))
@@ -890,7 +1115,14 @@ def _render_view_approvals() -> None:
     prog = prog_slot.progress(0, text="Loading PTW details...")
     try:
         _smooth_progress(prog, 0, 40, text="Fetching PTW form data...")
-        ptw_data = ptw_map.get(work_order_id)
+        ptw_data = ptw_map.get(work_order_id) or {}
+        # Safety: if mapping missed due to primary-id mismatch, try to locate by permit_no
+        if not ptw_data:
+            # best-effort scan (small dict)
+            for _k, _v in (ptw_map or {}).items():
+                if isinstance(_v, dict) and str(_v.get("permit_no") or "").strip() == permit_no:
+                    ptw_data = _v
+                    break
 
         _smooth_progress(prog, 40, 70, text="Preparing approval view...")
         # (ptw_data is passed via ptw_map into the render helpers)
@@ -1232,6 +1464,13 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
 def render(db_path: str) -> None:
     st.markdown("# S3 Portal")
     st.caption("Final PTW Approval Stage (read-only except approval).")
+
+    # Import modern UI styles
+    try:
+        from modern_ui_styles import MODERN_UI_CSS
+        st.markdown(MODERN_UI_CSS, unsafe_allow_html=True)
+    except Exception:
+        pass  # Fallback if import fails
 
     # Modern tabs styling + Anti-Ghosting CSS
     st.markdown(
