@@ -19,6 +19,7 @@ All evidence files are stored in Supabase Storage under ptw-evidence bucket.
 
 import os
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from io import BytesIO
 from typing import Any
 
@@ -810,7 +811,7 @@ def _update_work_order_s2_forwarded(
     resp = (
         sb.table(TABLE_WORK_ORDERS)
         .update({
-            "date_s2_forwarded": datetime.now().isoformat(sep=" ", timespec="seconds"),
+            "date_s2_forwarded": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(sep=" ", timespec="seconds"),
             "isolation_requirement": isolation_requirement,
         })
         .eq("work_order_id", work_order_id)

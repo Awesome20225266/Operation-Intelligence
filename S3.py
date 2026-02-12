@@ -20,6 +20,7 @@ Rules:
 
 import time
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from io import BytesIO
 from typing import Any
 
@@ -781,7 +782,7 @@ def _update_ptw_issuer_name(*, work_order_id: str, issuer_name: str) -> tuple[bo
 def _approve_work_order(*, work_order_id: str, issuer_name: str) -> tuple[bool, str]:
     """Atomic approval: set date_s3_approved only if still NULL. Returns (ok, message/timestamp)."""
     sb = get_supabase_client(prefer_service_role=True)
-    ts = datetime.now().isoformat(sep=" ", timespec="seconds")
+    ts = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(sep=" ", timespec="seconds")
 
     # Update PTW form_data with issuer_name + issuer_datetime (so template can render it)
     # Multi-WO support: locate PTW by permit_no OR by work_order_id inside form_data.work_order_ids

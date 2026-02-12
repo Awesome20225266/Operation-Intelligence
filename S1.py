@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time as _time
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from io import BytesIO
 from pathlib import Path
 import re
@@ -170,44 +171,23 @@ def derive_ptw_status(row: dict) -> str:
 def _update_work_order_s1_created(work_order_id: str, s1_timestamp: str) -> None:
     """
     Update work_orders.date_s1_created when PTW is submitted.
-    
-    Only updates if date_s1_created is currently NULL (won't overwrite).
-    
-    Args:
-        work_order_id: The work order ID to update
-        s1_timestamp: ISO timestamp string for date_s1_created
+    Only updates if currently NULL (atomic DB-side check).
+    Time must already be IST when passed.
     """
     sb = get_supabase_client(prefer_service_role=True)
-    
-    # First check if date_s1_created already has a value
-    check_resp = (
-        sb.table(TABLE_WORK_ORDERS)
-        .select("date_s1_created")
-        .eq("work_order_id", work_order_id)
-        .limit(1)
-        .execute()
-    )
-    
-    check_data = getattr(check_resp, "data", None) or []
-    if check_data:
-        existing = check_data[0].get("date_s1_created")
-        if existing is not None and str(existing).strip():
-            # Already has a value, don't overwrite
-            return
-    
-    # Update date_s1_created
+
     resp = (
         sb.table(TABLE_WORK_ORDERS)
         .update({"date_s1_created": s1_timestamp})
         .eq("work_order_id", work_order_id)
+        .is_("date_s1_created", None)  # atomic NULL check
         .execute()
     )
-    
+
     err = getattr(resp, "error", None)
     if err:
-        # Log but don't fail the PTW submission
         import logging
-        logging.warning(f"Failed to update date_s1_created for {work_order_id}: {err}")
+        logging.warning(f"Failed to update date_s1_created: {err}")
 
 
 # =============================================================================
@@ -3732,8 +3712,8 @@ def _handle_ptw_submit(**kwargs) -> None:
         progress_placeholder.progress(0, text="Validating inputs...")
         status_placeholder.info("Step 1/4: Validating form data")
 
-        # System-controlled timestamps
-        submit_time = datetime.now()
+        # System-controlled timestamps (IST timezone)
+        submit_time = datetime.now(ZoneInfo("Asia/Kolkata"))
         start_time_str = submit_time.strftime("%H:%M:%S")
         end_time = submit_time + timedelta(hours=8)
         end_time_str = end_time.strftime("%H:%M:%S")
