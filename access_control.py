@@ -2,6 +2,32 @@ from __future__ import annotations
 
 from typing import Optional
 
+
+# =============================================================================
+# ROLE-BASED TAB ACCESS (comma-separated roles from dashboard_users.role)
+# =============================================================================
+
+
+def get_allowed_pages_from_role(role: Optional[str]) -> set[str]:
+    """
+    Convert comma-separated role string into allowed page set.
+    Case-insensitive.
+    """
+    if not role:
+        return set()
+
+    return {r.strip().lower() for r in role.split(",") if r.strip()}
+
+
+def user_allowed_pages() -> set[str]:
+    """
+    Fetch allowed pages from session_state role.
+    """
+    import streamlit as st
+
+    role = st.session_state.get("role", "")
+    return get_allowed_pages_from_role(role)
+
 # ---------------------------------
 # Username-based access control
 # ---------------------------------

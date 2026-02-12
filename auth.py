@@ -222,19 +222,28 @@ def check_password() -> bool:
 
         try:
             sb = get_supabase_client(prefer_service_role=True)
-            # Optimized query: only select needed fields, single query
-            res = sb.table("dashboard_users").select("id,username,is_admin").eq("username", username).eq("password", password).limit(1).execute()
+            # Optimized query: select needed fields including role (drives tab access)
+            res = sb.table("dashboard_users").select("id,username,is_admin,role").eq("username", username).eq("password", password).limit(1).execute()
             
             if res.data and len(res.data) > 0:
                 # Success - set session state immediately
                 st.session_state["password_correct"] = True
-                st.session_state["user_info"] = res.data[0]
-                # Store normalized username for access control (required by access_control.py)
+
+                user_row = res.data[0] or {}
                 try:
-                    db_username = str((res.data[0] or {}).get("username") or username)
+                    db_username = str(user_row.get("username") or username)
                 except Exception:
                     db_username = str(username)
-                st.session_state["username"] = db_username.strip().lower()
+                db_username_norm = db_username.strip().lower()
+
+                # Store normalized username + role in session (role drives tab access)
+                role_val = user_row.get("role") if isinstance(user_row, dict) else ""
+                st.session_state["user_info"] = {
+                    "username": db_username_norm,
+                    "role": role_val,
+                }
+                st.session_state["username"] = db_username_norm
+                st.session_state["role"] = role_val
                 # Clear sensitive data and error state
                 if "password_input" in st.session_state:
                     del st.session_state["password_input"]

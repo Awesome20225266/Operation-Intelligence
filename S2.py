@@ -494,7 +494,7 @@ def generate_ptw_pdf_with_attachments(
     approval_times = {}
     updated_form_data = dict(form_data) if form_data else {}
     
-    # Always inject holder/issuer timestamps for template placeholders (stamp is optional)
+    # Always inject holder/issuer timestamps AND signatures for template placeholders
     try:
         approval_times = get_ptw_approval_times(work_order_id)
         is_s3_approved = bool(approval_times.get("date_s3_approved_raw"))
@@ -505,6 +505,15 @@ def generate_ptw_pdf_with_attachments(
             updated_form_data["issuer_datetime"] = approval_times["issuer_datetime"]
     except Exception:
         pass  # Continue without injected times if unavailable
+    
+    # Inject signatures from names (required for PDF template placeholders)
+    holder_name = updated_form_data.get("holder_name") or updated_form_data.get("permit_holder_name") or ""
+    issuer_name = updated_form_data.get("issuer_name") or updated_form_data.get("permit_issuer_name") or ""
+    
+    if holder_name and not updated_form_data.get("holder_signature"):
+        updated_form_data["holder_signature"] = holder_name
+    if issuer_name and not updated_form_data.get("issuer_signature"):
+        updated_form_data["issuer_signature"] = issuer_name
     
     if progress_callback:
         progress_callback(10, "Downloading template...")
@@ -1211,11 +1220,14 @@ def _render_view_submitted_ptw_body() -> None:
         """
         Build dropdown label for PTW selection.
         Required format:
-          {permit_no} | {site_name} | {STATUS} | {created_at}
+          {permit_no} | {site_name} | {STATUS} | {date_s1_created}
+        
+        IMPORTANT: Use date_s1_created (lifecycle clock) NOT created_at.
         """
         permit_no = str(row.get("permit_no", "") or "")
         site = row.get("site_name", "")
-        created = row.get("created_at", "")
+        # Use lifecycle clock (S1 submission time), not ptw_requests.created_at
+        s1_created = row.get("date_s1_created", "")
         status = str(row.get("status") or "").strip() or "PENDING_AT_S2"
 
         s = status.strip().upper()
@@ -1230,11 +1242,11 @@ def _render_view_submitted_ptw_body() -> None:
             badge = "⛔"
 
         try:
-            created = pd.to_datetime(created).strftime("%Y-%m-%d %H:%M")
+            s1_created = pd.to_datetime(s1_created).strftime("%d-%m-%Y %H:%M")
         except Exception:
             pass
         # Keep permit_no first so downstream parsing remains stable.
-        return f"{permit_no} | {site} | {badge} {status} | {created}"
+        return f"{permit_no} | {site} | {badge} {status} | {s1_created}"
     
     ptw_options = {
         _build_ptw_option(row): row
@@ -2067,8 +2079,10 @@ def render(db_path: str) -> None:
     - View Submitted PTW: Review and forward PTWs from S1
     """
     # Hard access guard (prevents manual bypass via session_state tampering)
-    username = (st.session_state.get("username") or "").strip().lower()
-    if username not in {"admin", "durgesh"}:
+    from access_control import user_allowed_pages
+
+    allowed_pages = user_allowed_pages()
+    if "s2" not in allowed_pages:
         st.error("Access Denied - S2 Only")
         st.stop()
 

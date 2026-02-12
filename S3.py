@@ -1045,7 +1045,11 @@ def _render_view_approvals() -> None:
     # ---------------------------------------------------------------------
 
     def _build_s3_ptw_label(row: pd.Series) -> str:
-        """Build label for S3 PTW selectbox."""
+        """
+        Build label for S3 PTW selectbox.
+        
+        IMPORTANT: Use date_s2_forwarded (S2 forwarding time / lifecycle clock) NOT created_at.
+        """
         permit_no = str(row.get("permit_no") or "")
         site_name = str(row.get("site_name") or "")
         status = str(row.get("derived_status") or "PENDING_AT_S3")
@@ -1057,13 +1061,14 @@ def _render_view_approvals() -> None:
             badge = "🟢"
         elif s == "REJECTED":
             badge = "⛔"
-        created = row.get("created_at", "")
+        # Use lifecycle clock (S2 forwarding time), not ptw_requests.created_at
+        s2_fwd = row.get("date_s2_forwarded", "")
         try:
-            created = pd.to_datetime(created).strftime("%Y-%m-%d %H:%M")
+            s2_fwd = pd.to_datetime(s2_fwd).strftime("%d-%m-%Y %H:%M")
         except Exception:
             pass
         # Keep permit_no first so split("|")[0] remains stable.
-        return f"{permit_no} | {site_name} | {badge} {status} | {created}"
+        return f"{permit_no} | {site_name} | {badge} {status} | {s2_fwd}"
 
     options = ["(select PTW)"] + [
         _build_s3_ptw_label(r) for _, r in df.iterrows()
@@ -1391,13 +1396,24 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
             st.error(f"Failed to generate preview: {e}")
 
     # Handle approve request FIRST (progress-first UX)
+    # Prevent double-click by using approval lock
+    approval_lock_key = f"{key_prefix}approval_in_progress"
+    if approval_lock_key not in st.session_state:
+        st.session_state[approval_lock_key] = False
+    
     if st.session_state.get(approve_req_key):
         st.session_state[approve_req_key] = False
         issuer_value = st.session_state.get(issuer_key, "")
         
         if not issuer_value.strip():
             st.error("Permit Issuer Name is required.")
+        elif st.session_state.get(approval_lock_key):
+            # Already processing, skip
+            pass
         else:
+            # Set lock to prevent double execution
+            st.session_state[approval_lock_key] = True
+            
             prog_slot = st.empty()
             prog = prog_slot.progress(0, text="Approving PTW...")
             ok = False
@@ -1435,6 +1451,9 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
                     st.session_state[just_approved_key] = True
                     st.session_state["s3_active_approval_id"] = work_order_id
                     
+                    # Clear approval lock
+                    st.session_state[approval_lock_key] = False
+                    
                     # Render success view immediately, using refreshed map
                     _render_post_approval_view(
                         work_order_id=work_order_id,
@@ -1446,9 +1465,13 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
                 else:
                     prog_slot.empty()
                     st.error(str(approval_ts))
+                    # Clear approval lock on failure
+                    st.session_state[approval_lock_key] = False
             except Exception as e:
                 prog_slot.empty()
                 st.error(f"Approval failed: {e}")
+                # Clear approval lock on exception
+                st.session_state[approval_lock_key] = False
 
     # Render form - NO autosave, purely local state until "Approve" is clicked
     issuer_name = st.text_area(
@@ -1495,8 +1518,10 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
 
 def render(db_path: str) -> None:
     # Hard access guard (prevents manual bypass via session_state tampering)
-    username = (st.session_state.get("username") or "").strip().lower()
-    if username not in {"admin", "richpal"}:
+    from access_control import user_allowed_pages
+
+    allowed_pages = user_allowed_pages()
+    if "s3" not in allowed_pages:
         st.error("Access Denied - S3 Only")
         st.stop()
 

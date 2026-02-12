@@ -2689,9 +2689,11 @@ def render(db_path: str) -> None:
     - Request PTW: Full Electrical PTW form
     - View Applied PTW: Browse and download submitted PTWs
     """
-    # Hard access guard (prevents manual bypass via session_state tampering)
-    username = (st.session_state.get("username") or "").strip().lower()
-    if username not in {"admin", "labhchand"}:
+    # Hard access guard (role-based)
+    from access_control import user_allowed_pages
+
+    allowed_pages = user_allowed_pages()
+    if "s1" not in allowed_pages:
         st.error("Access Denied - S1 Only")
         st.stop()
 
@@ -2726,15 +2728,23 @@ def render(db_path: str) -> None:
     if "s1_nav_page" not in st.session_state:
         st.session_state["s1_nav_page"] = options[0]
 
-    st.markdown('<div class="nav-tabs">', unsafe_allow_html=True)
-    active = st.radio(
-        " ",
-        options=options,
-        horizontal=True,
-        key="s1_nav_page",
-        label_visibility="collapsed",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Prefer segmented control for a true "tab" look (and deterministic state).
+    _seg = getattr(st, "segmented_control", None)
+    if callable(_seg):
+        try:
+            active = _seg(" ", options=options, key="s1_nav_page", label_visibility="collapsed")
+        except TypeError:
+            # Older Streamlit: label_visibility may not exist
+            active = _seg(" ", options=options, key="s1_nav_page")
+    else:
+        # Fallback: radio (still deterministic, but UI may vary by Streamlit version)
+        active = st.radio(
+            " ",
+            options=options,
+            horizontal=True,
+            key="s1_nav_page",
+            label_visibility="collapsed",
+        )
 
     if active == "View Work Order":
         _render_view_work_order()
@@ -3204,7 +3214,8 @@ def _render_request_ptw() -> None:
             else:
                 work_location_display = ""
 
-            permit_validity_display = selected_date.strftime("%d-%m-%Y")
+            # Permit validity is CURRENT DATE (not work order date)
+            permit_validity_display = date.today().strftime("%d-%m-%Y")
 
         # Persist auto-filled values for submit handler (UI-only ordering; same values)
         if selected_ids:
@@ -3256,13 +3267,9 @@ def _render_request_ptw() -> None:
         selected_ids = st.session_state.get("ptw_selected_wo_ids") or []
         selected_wo_id = st.session_state.get("ptw_selected_wo_id")
         
-        # Extract permit_validity_date from work order details (backend-derived, NOT user input)
-        permit_validity_date = date.today()  # fallback
-        wo_details = st.session_state.get("ptw_wo_details")
-        if isinstance(wo_details, dict) and wo_details:
-            date_planned = wo_details.get("date_planned")
-            if date_planned:
-                permit_validity_date = pd.to_datetime(date_planned).date()
+        # Permit validity is current date (NOT work order date)
+        # As per requirement: validity = current datetime at submission
+        permit_validity_date = date.today()
 
         # Check if we can proceed with the form
         if not selected_ids:
@@ -3316,18 +3323,14 @@ def _render_request_ptw() -> None:
             site_name = _ss("ptw_site_name", "")
             work_location = _ss("ptw_work_location", "")
             
-            # Extract permit_validity_date from work order details (backend-derived)
-            permit_validity_date = date.today()  # fallback
-            wo_details = _ss("ptw_wo_details", None)
-            if isinstance(wo_details, dict) and wo_details:
-                date_planned = wo_details.get("date_planned")
-                if date_planned:
-                    permit_validity_date = pd.to_datetime(date_planned).date()
+            # Permit validity is current date (NOT work order date)
+            # As per requirement: validity = current datetime at submission
+            permit_validity_date = date.today()
 
             _handle_ptw_submit(
                 work_order_ids=work_order_ids,
                 permit_no=permit_no,
-                permit_validity_date=permit_validity_date,  # Backend-derived from date_planned
+                permit_validity_date=permit_validity_date,  # Current datetime
                 site_name=site_name,
                 work_location=work_location,
                 work_description=_ss("ptw_work_desc", ""),
@@ -3907,10 +3910,21 @@ def _handle_ptw_submit(**kwargs) -> None:
         except Exception as e:
             raise RuntimeError(f"Failed to download template: {e}") from e
 
-        # Generate document
-        doc_data = build_doc_data(form_data)
-        pdf_bytes = generate_ptw_pdf(template_bytes, doc_data)  # PDF-only (raises if fails)
-        pdf_bytes = _add_overlay_elements(pdf_bytes, form_data)
+        # Generate document (with attachments if S2's generator is available)
+        try:
+            from S2 import generate_ptw_pdf_with_attachments
+            # Note: at S1 submission, no evidence files exist yet, but using this generator
+            # ensures consistency. Attachments page will be empty for S1-only PDFs.
+            pdf_bytes = generate_ptw_pdf_with_attachments(
+                form_data=form_data,
+                work_order_id=permit_no,
+                progress_callback=None,
+            )
+        except Exception:
+            # Fallback: basic PDF without attachments
+            doc_data = build_doc_data(form_data)
+            pdf_bytes = generate_ptw_pdf(template_bytes, doc_data)  # PDF-only (raises if fails)
+            pdf_bytes = _add_overlay_elements(pdf_bytes, form_data)
 
         progress_placeholder.progress(75, text="Finalizing...")
         status_placeholder.info("Step 4/4: Finalizing submission")
@@ -4188,11 +4202,21 @@ def _render_permit_closure() -> None:
     df_display["status"] = df_display["status"].astype("string").fillna("").map(
         lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s))
     )
-    st.dataframe(
-        df_display[["permit_no", "site_name", "approved_on", "closed_on", "status"]],
-        width="stretch",
-        hide_index=True,
+    # Color-code closure statuses (Approved = orange, Closed = green)
+    disp = df_display[["permit_no", "site_name", "approved_on", "closed_on", "status"]].copy()
+
+    def _style_closure_status(v: object) -> str:
+        s = str(v or "").strip().lower()
+        if s == "closed":
+            return "background-color: #dcfce7; color: #065f46; font-weight: 800;"
+        if s == "approved":
+            return "background-color: #ffedd5; color: #7c2d12; font-weight: 800;"
+        return ""
+
+    styled = disp.style.map(_style_closure_status, subset=["status"]).set_table_styles(
+        [{"selector": "th", "props": [("font-weight", "800"), ("color", "#0f172a")]}]
     )
+    st.dataframe(styled, width="stretch", hide_index=True)
 
     st.divider()
 
@@ -4209,7 +4233,16 @@ def _render_permit_closure() -> None:
         appr = str(r.get("approved_on") or "").strip()
         options.append(f"{pn} | {site} | Approved: {appr}")
 
-    selected_label = st.selectbox("Select Permit to Close", options=options, index=0, key="s1_close_select")
+    selected_label = st.selectbox(
+        "Select Permit to Close",
+        options=["(select permit)"] + options,
+        index=0,
+        key="s1_close_select",
+    )
+    if not selected_label or selected_label == "(select permit)":
+        st.info("Select a permit to view closure details.")
+        return
+
     sel_pn = str(selected_label.split("|")[0]).strip()
 
     # Resolve selected row
@@ -4222,11 +4255,20 @@ def _render_permit_closure() -> None:
         st.error("Selection could not be resolved. Please refetch.")
         return
 
-    receiver_name = st.text_input("Permit Receiver Name", value=str(sel_row.get("receiver_name") or ""), key="s1_close_receiver")
-    holder_name = st.text_input("Permit Holder Name", value=str(sel_row.get("holder_name") or ""), key="s1_close_holder")
-    issuer_name = st.text_input("Permit Issuer Name", value=str(sel_row.get("issuer_name") or ""), key="s1_close_issuer")
+    receiver_name = str(sel_row.get("receiver_name") or "")
+    holder_name = str(sel_row.get("holder_name") or "")
+    issuer_name = str(sel_row.get("issuer_name") or "")
 
-    if st.button("Close Permit", type="primary", key="s1_close_btn"):
+    st.text_input("Permit Receiver Name", value=receiver_name, key="s1_close_receiver", disabled=True)
+    st.text_input("Permit Holder Name", value=holder_name, key="s1_close_holder", disabled=True)
+    st.text_input("Permit Issuer Name", value=issuer_name, key="s1_close_issuer", disabled=True)
+
+    declared = st.checkbox(
+        "I declare that the work area is restored to original state and all isolations are normalized.",
+        key="s1_close_declaration",
+    )
+
+    if st.button("Close Permit", type="primary", key="s1_close_btn", disabled=not declared):
         with st.spinner("Closing permit..."):
             sb = get_supabase_client(prefer_service_role=True)
             now = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -4437,26 +4479,34 @@ def _render_view_applied_ptw() -> None:
                             issuer_name=issuer,
                         )
 
-                    # Download template from Supabase storage
-                    _smooth_progress(prog, 0, 40, text="Downloading template...")
-                    template_bytes = _download_template_from_supabase()
-
-                    # Generate document
-                    _smooth_progress(prog, 40, 85, text="Generating PDF...")
-                    doc_data = build_doc_data(updated_form)
+                    # Generate document with attachments (uses S2's generator)
+                    _smooth_progress(prog, 0, 85, text="Generating PDF with attachments...")
+                    
                     def _progress_cb(pct: int, msg: str) -> None:
                         try:
-                            prog.progress(int(pct), text=msg)
+                            prog.progress(int(85 * pct // 100), text=msg)
                         except Exception:
                             pass
-
-                    pdf_bytes = generate_ptw_pdf(template_bytes, doc_data, progress_callback=_progress_cb)  # PDF-only (raises if fails)
-                    pdf_bytes = _add_overlay_elements(pdf_bytes, updated_form)
-
-                    # Apply APPROVED stamp on every page if S3-approved
-                    if approved_on:
-                        _smooth_progress(prog, 85, 95, text="Applying APPROVED stamp...")
-                        pdf_bytes = _s1_add_floating_approval_stamp(pdf_bytes, approved_on=approved_on)
+                    
+                    try:
+                        from S2 import generate_ptw_pdf_with_attachments
+                        # Use first work_order_id from permit's coverage
+                        wo_ids = _extract_work_order_ids_from_ptw_row({"form_data": updated_form})
+                        primary_wo_id = wo_ids[0] if wo_ids else selected_permit
+                        pdf_bytes = generate_ptw_pdf_with_attachments(
+                            form_data=updated_form,
+                            work_order_id=primary_wo_id,
+                            progress_callback=_progress_cb,
+                        )
+                    except Exception:
+                        # Fallback: basic PDF without attachments
+                        _smooth_progress(prog, 0, 40, text="Downloading template...")
+                        template_bytes = _download_template_from_supabase()
+                        _smooth_progress(prog, 40, 85, text="Generating PDF...")
+                        doc_data = build_doc_data(updated_form)
+                        pdf_bytes = generate_ptw_pdf(template_bytes, doc_data, progress_callback=_progress_cb)
+                        pdf_bytes = _add_overlay_elements(pdf_bytes, updated_form)
+                    
                     _smooth_progress(prog, 85, 100, text="Download ready")
                     prog_slot.empty()
 

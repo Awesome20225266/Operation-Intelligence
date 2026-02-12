@@ -25,7 +25,7 @@ import S2
 import S3
 from aws_duckdb import get_duckdb_connection
 import auth
-from access_control import allowed_modules_for_user, is_admin
+from access_control import user_allowed_pages
 
 # -----------------------------
 # App config
@@ -33,6 +33,23 @@ from access_control import allowed_modules_for_user, is_admin
 
 APP_NAME = "Zel - EYE: OI"
 DB_DEFAULT = "master.duckdb"
+
+# All available pages (key, label)
+ALL_PAGES = [
+    ("portfolio", "📊  Portfolio Analytics"),
+    ("operation", "🏥  Operation Theatre"),
+    ("reconnect", "🔌  Re Connect"),
+    ("add_comments", "📝  Add Comments"),
+    ("scb_comment", "🧾  SCB Comment"),
+    ("dfm", "🛠️  Fault Detector"),
+    ("visual_analyser", "🖥️  Visual Analyser"),
+    ("meta_viewer", "🧭  Meta Viewer"),
+    ("scb_ot", "⚡  SCB OT"),
+    ("raw_analyser", "🧪  Raw Analyser"),
+    ("s1", "📋  S1"),
+    ("s2", "📝  S2"),
+    ("s3", "✅  S3"),
+]
 
 st.set_page_config(
     page_title=f"{APP_NAME} | Dashboard",
@@ -1247,31 +1264,19 @@ def main() -> None:
     # Prefer normalized username set by auth.check_password(); fall back to user_info
     username = (st.session_state.get("username") or user_info.get("username") or "").strip().lower() or None
 
-    allowed_modules = allowed_modules_for_user(username)
+    allowed_pages = user_allowed_pages()
 
-    if is_admin(username):
-        allowed_pages = {"portfolio", "operation", "reconnect", "add_comments", "dfm", "visual_analyser", "meta_viewer", "scb_ot", "scb_comment", "raw_analyser", "s1", "s2", "s3"}
-        default_page = "portfolio"
-    else:
-        # PTW restricted users: only their allowed portal(s) should be accessible.
-        # Unknown/non-whitelisted users: deny access.
-        if not allowed_modules:
-            st.error("Access Denied")
-            st.stop()
+    # Deny access if no roles assigned
+    if not allowed_pages:
+        st.error("Access Denied")
+        st.stop()
 
-        allowed_pages = set()
-        if "S1" in allowed_modules:
-            allowed_pages.add("s1")
-        if "S2" in allowed_modules:
-            allowed_pages.add("s2")
-        if "S3" in allowed_modules:
-            allowed_pages.add("s3")
-
-        # Default to the single allowed portal (or first in stable order)
-        for candidate in ("s1", "s2", "s3"):
-            if candidate in allowed_pages:
-                default_page = candidate
-                break
+    # Set default page to first allowed page (stable order)
+    default_page = "portfolio"
+    for key, _ in ALL_PAGES:
+        if key in allowed_pages:
+            default_page = key
+            break
 
     if st.session_state.nav_page not in allowed_pages:
         st.session_state.nav_page = default_page
@@ -1318,30 +1323,12 @@ def main() -> None:
 
             st.markdown("<div class='sb-divider'></div>", unsafe_allow_html=True)
 
-            if is_admin(username):
-                nav_items = [
-                    ("portfolio", "📊  Portfolio Analytics"),
-                    ("operation", "🏥  Operation Theatre"),
-                    ("reconnect", "🔌  Re Connect"),
-                    ("add_comments", "📝  Add Comments"),
-                    ("scb_comment", "🧾  SCB Comment"),
-                    ("dfm", "🛠️  Fault Detector"),
-                    ("visual_analyser", "🖥️  Visual Analyser"),
-                    ("meta_viewer", "🧭  Meta Viewer"),
-                    ("scb_ot", "⚡  SCB OT"),
-                    ("raw_analyser", "🧪  Raw Analyser"),
-                    ("s1", "📋  S1"),
-                    ("s2", "📝  S2"),
-                    ("s3", "✅  S3"),
-                ]
-            else:
-                nav_items = []
-                if "S1" in allowed_modules:
-                    nav_items.append(("s1", "📋  S1"))
-                if "S2" in allowed_modules:
-                    nav_items.append(("s2", "📝  S2"))
-                if "S3" in allowed_modules:
-                    nav_items.append(("s3", "✅  S3"))
+            # Build nav_items filtered by user's allowed_pages (role-based)
+            nav_items = [
+                (key, label)
+                for key, label in ALL_PAGES
+                if key in allowed_pages
+            ]
 
             for key, label in nav_items:
                 is_active = st.session_state.nav_page == key
@@ -1431,6 +1418,9 @@ def main() -> None:
         st.session_state["_last_rendered_page"] = page
     
     # Route to page content (only ONE page renders per execution)
+    if page not in allowed_pages:
+        st.error("Access Denied")
+        st.stop()
     if page == "portfolio":
         portfolio_analytics.render(db_path)
     elif page == "operation":

@@ -131,13 +131,60 @@ MODERN_UI_CSS = """
    STATEFUL NAV (radio styled as tabs) — used for deterministic UX (S1)
    ======================================================================== */
 
-.nav-tabs div[data-testid="stRadio"] {
-    background: transparent !important;
-    padding: 0 !important;
-    margin: 0 0 1.5rem 0 !important;
+/* S1 segmented_control styled EXACTLY like S2 tabs */
+div[data-testid="stSegmentedControl"] {
+    margin-top: 1rem !important;
+    margin-bottom: 2rem !important;
 }
 
-.nav-tabs div[data-testid="stRadio"] [role="radiogroup"] {
+div[data-testid="stSegmentedControl"] > div {
+    display: flex !important;
+    gap: 0.5rem !important;
+    padding: 0.5rem 0.25rem !important;
+    border-bottom: 2px solid var(--neutral-200) !important;
+    background: transparent !important;
+}
+
+div[data-testid="stSegmentedControl"] button {
+    background: white !important;
+    border: 1.5px solid var(--neutral-200) !important;
+    border-radius: 12px !important;
+    padding: 0.75rem 1.5rem !important;
+    margin: 0 !important;
+    font-weight: 600 !important;
+    font-size: 15px !important;
+    color: var(--neutral-700) !important;
+    letter-spacing: -0.01em !important;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03) !important;
+    white-space: nowrap !important;
+}
+
+div[data-testid="stSegmentedControl"] button:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.1) !important;
+    border-color: var(--primary-blue-light) !important;
+    background: var(--neutral-50) !important;
+}
+
+div[data-testid="stSegmentedControl"] button[aria-pressed="true"] {
+    background: linear-gradient(135deg, var(--primary-blue-200) 0%, var(--primary-blue-100) 100%) !important;
+    color: var(--neutral-900) !important;
+    border-color: var(--primary-blue-light) !important;
+    font-weight: 700 !important;
+    box-shadow: 0 6px 18px rgba(37, 99, 235, 0.18),
+                0 2px 6px rgba(37, 99, 235, 0.10) !important;
+}
+
+/* Fallback: if segmented_control doesn't exist, style radio to match tabs */
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) {
+    background: transparent !important;
+    padding: 0 !important;
+    margin-top: 1rem !important;
+    margin-bottom: 2rem !important;
+}
+
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [role="radiogroup"] {
     display: flex !important;
     gap: 0.5rem !important;
     flex-wrap: nowrap !important;
@@ -145,7 +192,7 @@ MODERN_UI_CSS = """
     border-bottom: 2px solid var(--neutral-200) !important;
 }
 
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] {
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"] {
     background: white !important;
     border: 1.5px solid var(--neutral-200) !important;
     border-radius: 12px !important;
@@ -156,11 +203,11 @@ MODERN_UI_CSS = """
     overflow: hidden !important;
 }
 
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] > div {
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"] > div {
     padding: 0.75rem 1.5rem !important;
 }
 
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] * {
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"] * {
     font-size: 15px !important;
     font-weight: 600 !important;
     color: var(--neutral-700) !important;
@@ -169,13 +216,13 @@ MODERN_UI_CSS = """
 }
 
 /* Hide the default radio dot/input */
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] svg,
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] input {
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"] svg,
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"] input {
     display: none !important;
 }
 
 /* Hover = same as tab hover */
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"]:hover {
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"]:hover {
     transform: translateY(-2px) !important;
     box-shadow: 0 4px 12px rgba(37, 99, 235, 0.1) !important;
     border-color: var(--primary-blue-light) !important;
@@ -183,12 +230,12 @@ MODERN_UI_CSS = """
 }
 
 /* Selected = light-blue surface with dark text (readable) */
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"] {
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"] [aria-checked="true"] {
     background: linear-gradient(135deg, var(--primary-blue-200) 0%, var(--primary-blue-100) 100%) !important;
     border-color: var(--primary-blue-light) !important;
 }
 
-.nav-tabs div[data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"] * {
+div[data-testid="stRadio"]:has(input[name="s1_nav_page"]) [data-baseweb="radio"] [aria-checked="true"] * {
     color: var(--neutral-900) !important;
     font-weight: 700 !important;
 }
