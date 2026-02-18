@@ -305,40 +305,39 @@ def _render_view_work_order_s3() -> None:
             color: #0b2a6f;
             box-shadow: 0 8px 20px rgba(15,23,42,0.08);
         }
+
+        /* Reduce space below page title */
+        h1 {
+            margin-bottom: 10px !important;
+        }
+
+        /* Reduce space above tabs */
+        .stTabs {
+            margin-top: -10px !important;
+        }
+
+        /* Remove extra gap inside tab container */
+        .stTabs [data-baseweb="tab-list"] {
+            padding-top: 0px !important;
+            margin-top: 0px !important;
+        }
+
+        /* Remove large default Streamlit top padding */
+        .block-container {
+            padding-top: 1rem !important;
+        }
         
         /* Table hover */
         .stDataFrame tbody tr:hover {
           background-color: rgba(148, 163, 184, 0.18) !important;
         }
         
-        /* KPI cards */
-        .kpi-row {
-            display: flex;
-            gap: 1rem;
-            margin: 1.5rem 0;
-        }
-        .kpi-card {
-            flex: 1;
-            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
-            border: 2px solid #e2e8f0;
-            border-radius: 12px;
-            padding: 1.5rem;
-            text-align: center;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-        .kpi-title {
-            font-size: 0.875rem;
-            color: #64748b;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 0.5rem;
-        }
-        .kpi-value {
-            font-size: 2rem;
-            font-weight: 700;
-            line-height: 1;
-        }
+        /* KPI cards (match S1/S2) */
+        .kpi-row { display: flex; gap: 12px; flex-wrap: wrap; margin: 10px 0 14px 0; }
+        .kpi-card { flex: 1 1 160px; background: white; border: 1px solid rgba(148,163,184,0.35);
+                    border-radius: 14px; padding: 14px 16px; box-shadow: 0 6px 18px rgba(15,23,42,0.06); }
+        .kpi-title { font-size: 14px; color: #475569; margin-bottom: 6px; font-weight: 700; }
+        .kpi-value { font-size: 34px; font-weight: 900; line-height: 1.05; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -353,29 +352,25 @@ def _render_view_work_order_s3() -> None:
         st.session_state["s3_wo_last_df"] = None
         st.session_state["s3_wo_last_kpis"] = None
         st.session_state["s3_wo_last_meta"] = None
-    if "s3_wo_run_fetch" not in st.session_state:
-        st.session_state["s3_wo_run_fetch"] = False
+    if "s3_wo_fetch_requested" not in st.session_state:
+        st.session_state["s3_wo_fetch_requested"] = False
 
     site_options = ["(select)"] + sites
-
     ss_site = st.session_state.get("s3_wo_site")
     ss_start = st.session_state.get("s3_wo_start")
     ss_end = st.session_state.get("s3_wo_end")
-
     have_site = ss_site not in (None, "(select)", "")
     have_dates = isinstance(ss_start, date) and isinstance(ss_end, date)
-
     if have_site and have_dates:
         locs = _list_locations_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
         statuses_ui = _list_statuses_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
     else:
         locs, statuses_ui = [], []
-
     loc_options = ["(all)"] + locs
     status_options = ["(all)"] + (statuses_ui if statuses_ui else UI_STATUSES)
 
     # Filters section
-    c1, c2, c3, c4, c5, c6 = st.columns([2.0, 1.3, 1.3, 1.4, 1.4, 1.0], vertical_alignment="bottom")
+    c1, c2, c3, c4 = st.columns([2.0, 1.5, 1.5, 1.0], vertical_alignment="bottom")
     with c1:
         site_name = st.selectbox("Site Name", options=site_options, index=0, key="s3_wo_site")
     with c2:
@@ -383,18 +378,12 @@ def _render_view_work_order_s3() -> None:
     with c3:
         end_date = st.date_input("End Date", value=None, key="s3_wo_end")
     with c4:
-        location = st.selectbox("Location", options=loc_options, index=0, key="s3_wo_location")
-    with c5:
-        status_ui = st.selectbox("Status", options=status_options, index=0, key="s3_wo_status")
-    with c6:
-        def _on_submit() -> None:
-            st.session_state["s3_wo_run_fetch"] = True
-        st.button("Submit", type="primary", key="s3_wo_submit", on_click=_on_submit, use_container_width=True)
+        if st.button("Submit", type="primary", key="s3_wo_submit", use_container_width=True):
+            st.session_state["s3_wo_fetch_requested"] = True
 
-    # Handle queued fetch action (progress-first UX)
-    if st.session_state.get("s3_wo_run_fetch"):
-        st.session_state["s3_wo_run_fetch"] = False
-        
+    # Heavy work in separate block with spinner to avoid progress flicker
+    if st.session_state.get("s3_wo_fetch_requested"):
+        st.session_state["s3_wo_fetch_requested"] = False
         if not site_name or site_name == "(select)":
             st.error("Please select a Site Name.")
         elif start_date is None or end_date is None:
@@ -402,43 +391,36 @@ def _render_view_work_order_s3() -> None:
         elif start_date > end_date:
             st.error("Start Date must be on or before End Date.")
         else:
-            prog_slot = st.empty()
-            prog = prog_slot.progress(0, text="Validating filters...")
+            progress_slot = st.empty()
+            prog = progress_slot.progress(0, text="Validating filters...")
             try:
                 _smooth_progress(prog, 0, 20, text="Validating filters...")
                 _smooth_progress(prog, 20, 70, text="Fetching work orders from database...")
-
-                loc_val = None if location in (None, "(all)") else location
-                st_val = None if status_ui in (None, "(all)") else status_ui
-
                 df = _fetch_work_orders(
                     site_name=site_name,
                     start_date=start_date,
                     end_date=end_date,
-                    status_ui=st_val,
-                    location=loc_val,
+                    status_ui=None,
+                    location=None,
                 )
-
                 _smooth_progress(prog, 70, 90, text="Calculating KPIs...")
-
                 st.session_state["s3_wo_last_df"] = df
                 st.session_state["s3_wo_last_meta"] = {
                     "site": site_name,
                     "start": start_date,
                     "end": end_date,
-                    "location": location,
-                    "status": status_ui,
+                    "location": None,
+                    "status": None,
                 }
-
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     total = int(len(df))
                     c_rej = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
                     c_open = int((df["status"].astype("string").str.upper() == "OPEN").sum())
                     c_wip = int((df["status"].astype("string").str.upper() == "WIP").sum())
-                    # Approved KPI must use derived status (single source of truth)
-                    c_approved = int((df["status"].astype("string").str.upper() == "APPROVED").sum())
+                    c_approved = int(df["status"].astype("string").str.upper().isin(["APPROVED", "CLOSED"]).sum())
+                    c_closed = int((df["status"].astype("string").str.upper() == "CLOSED").sum())
                 else:
-                    total = c_rej = c_open = c_wip = c_approved = 0
+                    total = c_rej = c_open = c_wip = c_approved = c_closed = 0
 
                 st.session_state["s3_wo_last_kpis"] = {
                     "total": total,
@@ -446,28 +428,39 @@ def _render_view_work_order_s3() -> None:
                     "open": c_open,
                     "wip": c_wip,
                     "approved": c_approved,
+                    "closed": c_closed,
                 }
-
                 _smooth_progress(prog, 90, 100, text="Work orders ready")
             except Exception as e:
                 st.error(f"Failed to fetch work orders: {e}")
             finally:
-                prog_slot.empty()
+                progress_slot.empty()
 
-    # Display results
+    # Display results (outside button/action block)
     df_last = st.session_state.get("s3_wo_last_df")
-    if isinstance(df_last, pd.DataFrame) and not df_last.empty:
+    if isinstance(df_last, pd.DataFrame) and df_last.empty:
+        st.info("No work orders found for the selected filters.")
+    elif isinstance(df_last, pd.DataFrame) and not df_last.empty:
         kpis = st.session_state.get("s3_wo_last_kpis") or {}
+        COLOR_MAP = {
+            "total": "#0f172a",
+            "open": "#2563eb",
+            "wip": "#f97316",
+            "approved": "#10b981",
+            "closed": "#065f46",
+            "rejected": "#dc2626",
+        }
         
         # Modern KPI cards (same as S2)
         st.markdown(
             f"""
             <div class="kpi-row">
-              <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:#2563eb;">{kpis.get("total", 0)}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:#dc2626;">{kpis.get("rejected", 0)}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:#10b981;">{kpis.get("open", 0)}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:#f97316;">{kpis.get("wip", 0)}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{kpis.get("approved", 0)}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:{COLOR_MAP['total']};">{kpis.get("total", 0)}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:{COLOR_MAP['rejected']};">{kpis.get("rejected", 0)}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:{COLOR_MAP['open']};">{kpis.get("open", 0)}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:{COLOR_MAP['wip']};">{kpis.get("wip", 0)}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:{COLOR_MAP['approved']};">{kpis.get("approved", 0)}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Closed</div><div class="kpi-value" style="color:{COLOR_MAP['closed']};">{kpis.get("closed", 0)}</div></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1437,8 +1430,8 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
                         if start_date and end_date:
                             df_refreshed = _fetch_all_s3_ptws(start_date=start_date, end_date=end_date)
                             st.session_state["s3_pending_df"] = df_refreshed
-                            ptw_map_refreshed = _fetch_ptw_requests_for_work_orders(
-                                df_refreshed["work_order_id"].astype(str).tolist() if not df_refreshed.empty else []
+                            ptw_map_refreshed = _fetch_ptw_requests_for_permits(
+                                df_refreshed["permit_no"].astype(str).tolist() if not df_refreshed.empty else []
                             )
                             st.session_state["s3_ptw_map"] = ptw_map_refreshed
                     except Exception as refresh_err:

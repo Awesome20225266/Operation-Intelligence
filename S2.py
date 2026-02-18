@@ -31,6 +31,8 @@ from PIL import Image
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+from reportlab.platypus import Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 from PyPDF2 import PdfReader, PdfWriter  # type: ignore
 
 from supabase_link import get_supabase_client
@@ -152,6 +154,24 @@ def _apply_modern_tabs_css() -> None:
                       border-radius: 14px; padding: 14px 16px; box-shadow: 0 6px 18px rgba(15,23,42,0.06); }
           .kpi-title { font-size: 14px; color: #475569; margin-bottom: 6px; font-weight: 700; }
           .kpi-value { font-size: 34px; font-weight: 900; line-height: 1.05; }
+
+          /* Reduce space below page title */
+          h1 {
+            margin-bottom: 10px !important;
+          }
+          /* Reduce space above tabs */
+          .stTabs {
+            margin-top: -10px !important;
+          }
+          /* Remove extra gap inside tab container */
+          .stTabs [data-baseweb="tab-list"] {
+            padding-top: 0px !important;
+            margin-top: 0px !important;
+          }
+          /* Remove large default Streamlit top padding */
+          .block-container {
+            padding-top: 1rem !important;
+          }
         </style>
         """,
         unsafe_allow_html=True,
@@ -342,7 +362,19 @@ def _create_attachments_page(
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-    
+    max_width = width - 120
+
+    styles = getSampleStyleSheet()
+    normal_style = styles["Normal"]
+
+    def draw_wrapped_text(text: str, x: float, y: float, max_w: float) -> float:
+        """Draw text with wrapping; return new y position."""
+        text_esc = (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        p = Paragraph(text_esc, normal_style)
+        w, h = p.wrap(max_w, 100)
+        p.drawOn(c, x, y - h)
+        return y - h - 5
+
     y_position = height - 50
     
     # Header
@@ -406,26 +438,25 @@ def _create_attachments_page(
                         c.drawImage(img_reader, 50, y_pos - img.height, 
                                    width=img.width, height=img.height)
                         
-                        # Draw file name below image
+                        # Draw file name below image (wrapped)
                         c.setFont("Helvetica", 9)
-                        c.drawString(50, y_pos - img.height - 15, f"{idx + 1}. {file_name}")
-                        
-                        y_pos -= (img.height + 35)
+                        y_pos = draw_wrapped_text(f"{idx + 1}. {file_name}", 50, y_pos - img.height - 15, max_width)
+                        y_pos -= 20
                         
                     except Exception:
                         # Fallback to text reference
                         c.setFont("Helvetica", 10)
-                        c.drawString(70, y_pos, f"{idx + 1}. {file_name} (image)")
-                        y_pos -= 20
+                        y_pos = draw_wrapped_text(f"{idx + 1}. {file_name} (image)", 70, y_pos, max_width)
+                        y_pos -= 15
                 else:
                     c.setFont("Helvetica", 10)
-                    c.drawString(70, y_pos, f"{idx + 1}. {file_name} (image - unable to load)")
-                    y_pos -= 20
+                    y_pos = draw_wrapped_text(f"{idx + 1}. {file_name} (image - unable to load)", 70, y_pos, max_width)
+                    y_pos -= 15
             else:
                 # For PDFs and other documents, just list them
                 c.setFont("Helvetica", 10)
-                c.drawString(70, y_pos, f"{idx + 1}. {file_name}")
-                y_pos -= 20
+                y_pos = draw_wrapped_text(f"{idx + 1}. {file_name}", 70, y_pos, max_width)
+                y_pos -= 15
         
         y_pos -= 10
         return y_pos
@@ -674,22 +705,11 @@ def _fetch_ptw_for_s2(
             return "REJECTED"
         if "CLOSED" in sset:
             return "CLOSED"
-        if sset and sset.issubset({"APPROVED"}):
-            return "APPROVED_BY_S3"
-
-        any_s1 = any(_has(w.get("date_s1_created")) for w in wo_rows)
-        if not any_s1:
-            return "OPEN"
-
-        any_fwd = any(_has(w.get("date_s2_forwarded")) for w in wo_rows)
-        any_s3 = any(_has(w.get("date_s3_approved")) for w in wo_rows)
-        if any_fwd and not any_s3:
-            return "PENDING_AT_S3"
-        if not any_fwd:
-            return "PENDING_AT_S2"
-
-        # Mixed partial-forward / partial-approve: still actionable at S2
-        return "PENDING_AT_S2"
+        if "APPROVED" in sset:
+            return "APPROVED"
+        if "WIP" in sset:
+            return "WIP"
+        return "OPEN"
 
     out_rows: list[dict[str, Any]] = []
     for r, ids in zip(rows, ids_per_ptw):
@@ -899,48 +919,33 @@ def _render_view_work_order_s2() -> None:
         )
         return
 
-    # Mount progress UI early (BEFORE dependent filter queries) to avoid "reload then progress".
-    early_prog_slot = st.empty()
-    early_msg_slot = st.empty()
-    
     # Initialize session state
     if "s2_wo_last_df" not in st.session_state:
         st.session_state["s2_wo_last_df"] = None
         st.session_state["s2_wo_last_meta"] = None
     if "s2_wo_last_kpis" not in st.session_state:
         st.session_state["s2_wo_last_kpis"] = None
-    if "s2_wo_run_fetch" not in st.session_state:
-        st.session_state["s2_wo_run_fetch"] = False
+    if "s2_wo_fetch_requested" not in st.session_state:
+        st.session_state["s2_wo_fetch_requested"] = False
     
     site_options = ["(select)"] + sites
     
-    # Get current selections for dependent filters
     ss_site = st.session_state.get("s2_wo_site")
     ss_start = st.session_state.get("s2_wo_start")
     ss_end = st.session_state.get("s2_wo_end")
-    
     have_site = ss_site not in (None, "(select)", "")
     have_dates = isinstance(ss_start, date) and isinstance(ss_end, date)
-    
-    # If Submit was clicked, skip dependent filter queries so progress mounts immediately.
-    if st.session_state.get("s2_wo_run_fetch"):
-        locs, statuses_ui = [], []
+    if have_site and have_dates:
+        locs = _list_locations_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
+        statuses_ui = _list_statuses_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
     else:
-        if have_site and have_dates:
-            locs = _list_locations_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
-            statuses_ui = _list_statuses_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
-        else:
-            locs = []
-            statuses_ui = []
-    
+        locs = []
+        statuses_ui = []
     loc_options = ["(all)"] + locs
     status_options = ["(all)"] + (statuses_ui if statuses_ui else UI_STATUSES)
-    
-    def _on_s2_wo_submit_click() -> None:
-        st.session_state["s2_wo_run_fetch"] = True
 
     with st.form("s2_view_work_orders_filters", clear_on_submit=False):
-        c1, c2, c3, c4, c5 = st.columns([2.0, 1.3, 1.3, 1.4, 1.4], vertical_alignment="bottom")
+        c1, c2, c3, c4 = st.columns([2.0, 1.5, 1.5, 1.0], vertical_alignment="bottom")
         with c1:
             site_name = st.selectbox("Site Name", options=site_options, index=0, key="s2_wo_site")
         with c2:
@@ -948,87 +953,65 @@ def _render_view_work_order_s2() -> None:
         with c3:
             end_date = st.date_input("End Date", value=None, key="s2_wo_end")
         with c4:
-            location = st.selectbox("Location", options=loc_options, index=0, key="s2_wo_location")
-        with c5:
-            status_ui = st.selectbox("Status", options=status_options, index=0, key="s2_wo_status")
-        
-        submitted = st.form_submit_button("Submit", on_click=_on_s2_wo_submit_click)
+            submitted = st.form_submit_button("Submit", use_container_width=True)
     
-    if submitted or st.session_state.get("s2_wo_run_fetch"):
-        st.session_state["s2_wo_run_fetch"] = False
+    if submitted:
+        st.session_state["s2_wo_fetch_requested"] = True
+    
+    if st.session_state.get("s2_wo_fetch_requested"):
+        st.session_state["s2_wo_fetch_requested"] = False
         if not site_name or site_name == "(select)":
-            early_prog_slot.empty()
-            early_msg_slot.empty()
             st.error("Please select a Site Name.")
-            return
-        if start_date is None or end_date is None:
-            early_prog_slot.empty()
-            early_msg_slot.empty()
+        elif start_date is None or end_date is None:
             st.error("Please select both Start Date and End Date.")
-            return
-        if start_date > end_date:
-            early_prog_slot.empty()
-            early_msg_slot.empty()
+        elif start_date > end_date:
             st.error("Start Date must be on or before End Date.")
-            return
-        
-        # Progress UX
-        prog = early_prog_slot.progress(0, text="Safety First: Initializing...")
-        early_msg_slot.caption("Safety First: Always verify permits and isolation before starting work.")
-        _smooth_progress(prog, 0, 18, text="Validating filters...")
-        _smooth_progress(prog, 18, 55, text="Fetching work orders...")
-        
-        loc_val = None if location in (None, "(all)") else location
-        st_val = None if status_ui in (None, "(all)") else status_ui
-        
-        df = _fetch_work_orders(
-            site_name=site_name,
-            start_date=start_date,
-            end_date=end_date,
-            status_ui=st_val,
-            location=loc_val,
-        )
-        
-        _smooth_progress(prog, 55, 88, text="Preparing results...")
-        _smooth_progress(prog, 88, 100, text="Results ready")
-        early_prog_slot.empty()
-        early_msg_slot.empty()
-        
-        # Persist results
-        st.session_state["s2_wo_last_df"] = df
-        st.session_state["s2_wo_last_meta"] = {
-            "site_name": site_name,
-            "start_date": start_date,
-            "end_date": end_date,
-            "status": st_val,
-            "location": loc_val,
-        }
-        
-        # Update KPIs
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            total = int(len(df))
-            c_rej = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
-            c_open = int((df["status"].astype("string").str.upper() == "OPEN").sum())
-            c_wip = int((df["status"].astype("string").str.upper() == "WIP").sum())
-            c_approved = int(df["status"].astype("string").str.upper().isin(["CLOSED", "APPROVED"]).sum())
         else:
-            total = c_rej = c_open = c_wip = c_approved = 0
-        
-        st.session_state["s2_wo_last_kpis"] = {
-            "total": total,
-            "rejected": c_rej,
-            "open": c_open,
-            "wip": c_wip,
-            "approved": c_approved,
-        }
-        
-        if df.empty:
-            st.info("No work orders found for the selected filters.")
-            return
+            progress_slot = st.empty()
+            prog = progress_slot.progress(0, text="Safety First: Initializing...")
+            _smooth_progress(prog, 0, 18, text="Validating filters...")
+            _smooth_progress(prog, 18, 55, text="Fetching work orders...")
+            df = _fetch_work_orders(
+                site_name=site_name,
+                start_date=start_date,
+                end_date=end_date,
+                status_ui=None,
+                location=None,
+            )
+            _smooth_progress(prog, 55, 88, text="Preparing results...")
+            _smooth_progress(prog, 88, 100, text="Results ready")
+            progress_slot.empty()
+            st.session_state["s2_wo_last_df"] = df
+            st.session_state["s2_wo_last_meta"] = {
+                "site_name": site_name,
+                "start_date": start_date,
+                "end_date": end_date,
+                "status": None,
+                "location": None,
+            }
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                total = int(len(df))
+                c_rej = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
+                c_open = int((df["status"].astype("string").str.upper() == "OPEN").sum())
+                c_wip = int((df["status"].astype("string").str.upper() == "WIP").sum())
+                c_approved = int(df["status"].astype("string").str.upper().isin(["APPROVED", "CLOSED"]).sum())
+                c_closed = int((df["status"].astype("string").str.upper() == "CLOSED").sum())
+            else:
+                total = c_rej = c_open = c_wip = c_approved = c_closed = 0
+            st.session_state["s2_wo_last_kpis"] = {
+                "total": total,
+                "rejected": c_rej,
+                "open": c_open,
+                "wip": c_wip,
+                "approved": c_approved,
+                "closed": c_closed,
+            }
     
-    # Render cached results
+    # Render cached results (outside button/action block)
     df_last = st.session_state.get("s2_wo_last_df")
-    if isinstance(df_last, pd.DataFrame) and not df_last.empty:
+    if isinstance(df_last, pd.DataFrame) and df_last.empty:
+        st.info("No work orders found for the selected filters.")
+    elif isinstance(df_last, pd.DataFrame) and not df_last.empty:
         df = df_last
         
         # KPI cards
@@ -1038,15 +1021,25 @@ def _render_view_work_order_s2() -> None:
         c_open = int(k.get("open", 0) or 0)
         c_wip = int(k.get("wip", 0) or 0)
         c_approved = int(k.get("approved", 0) or 0)
+        c_closed = int(k.get("closed", 0) or 0)
+        COLOR_MAP = {
+            "total": "#0f172a",
+            "open": "#2563eb",
+            "wip": "#f97316",
+            "approved": "#10b981",
+            "closed": "#065f46",
+            "rejected": "#dc2626",
+        }
 
         st.markdown(
             f"""
             <div class="kpi-row">
-              <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:#2563eb;">{total}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:#dc2626;">{c_rej}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:#16a34a;">{c_open}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:#f97316;">{c_wip}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{c_approved}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:{COLOR_MAP['total']};">{total}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:{COLOR_MAP['rejected']};">{c_rej}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:{COLOR_MAP['open']};">{c_open}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:{COLOR_MAP['wip']};">{c_wip}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:{COLOR_MAP['approved']};">{c_approved}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Closed</div><div class="kpi-value" style="color:{COLOR_MAP['closed']};">{c_closed}</div></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1115,10 +1108,10 @@ def _render_view_submitted_ptw_body() -> None:
     
     if "s2_active_ptw_id" not in st.session_state:
         st.session_state["s2_active_ptw_id"] = None
-    if "s2_ptw_run_fetch" not in st.session_state:
-        st.session_state["s2_ptw_run_fetch"] = False
+    if "s2_ptw_fetch_requested" not in st.session_state:
+        st.session_state["s2_ptw_fetch_requested"] = False
 
-    # Date range filter + fetch (fragmented + queued) so progress mounts immediately.
+    # Date range filter + fetch (button only sets state; heavy work in separate block)
     def _filters_block() -> None:
         col1, col2, col3 = st.columns([1.5, 1.5, 1])
         with col1:
@@ -1138,29 +1131,28 @@ def _render_view_submitted_ptw_body() -> None:
         with col3:
             st.write("")
             st.write("")
-            def _on_fetch() -> None:
-                st.session_state["s2_ptw_run_fetch"] = True
-            st.button("Fetch PTWs", type="primary", key="s2_fetch_ptw", on_click=_on_fetch)
+            if st.button("Fetch PTWs", type="primary", key="s2_fetch_ptw"):
+                st.session_state["s2_ptw_fetch_requested"] = True
 
-        # Run fetch if requested (same click rerun) or after an action refresh, with progress mounted first
-        if st.session_state.get("s2_ptw_run_fetch") or st.session_state.get("refresh_s2"):
-            st.session_state["s2_ptw_run_fetch"] = False
+        # Heavy work: only when requested or after refresh, with spinner to avoid flicker
+        if st.session_state.get("s2_ptw_fetch_requested") or st.session_state.get("refresh_s2"):
+            st.session_state["s2_ptw_fetch_requested"] = False
             st.session_state["refresh_s2"] = False
-            prog_slot = st.empty()
-            prog = prog_slot.progress(0, text="Fetching submitted PTWs...")
-            try:
-                _smooth_progress(prog, 0, 20, text="Validating date range...")
-                _smooth_progress(prog, 20, 70, text="Loading from database...")
-                df = _fetch_ptw_for_s2(start_date=start_date, end_date=end_date)
-                st.session_state["s2_ptw_view_df"] = df
-                _smooth_progress(prog, 70, 100, text="PTWs ready")
-            except Exception as e:
-                st.error(f"Failed to fetch PTW requests: {e}")
-                st.session_state["s2_ptw_view_df"] = pd.DataFrame()
-            finally:
-                prog_slot.empty()
+            with st.spinner("Fetching submitted PTWs..."):
+                progress_slot = st.empty()
+                prog = progress_slot.progress(0, text="Fetching submitted PTWs...")
+                try:
+                    _smooth_progress(prog, 0, 20, text="Validating date range...")
+                    _smooth_progress(prog, 20, 70, text="Loading from database...")
+                    df = _fetch_ptw_for_s2(start_date=start_date, end_date=end_date)
+                    st.session_state["s2_ptw_view_df"] = df
+                    _smooth_progress(prog, 70, 100, text="PTWs ready")
+                except Exception as e:
+                    st.error(f"Failed to fetch PTW requests: {e}")
+                    st.session_state["s2_ptw_view_df"] = pd.DataFrame()
+                finally:
+                    progress_slot.empty()
 
-    # Note: This function may already be running inside a fragment above.
     _filters_block()
     
     df = st.session_state.get("s2_ptw_view_df")

@@ -101,6 +101,21 @@ _BASE_CSS = """
     display: none !important;
     visibility: hidden !important;
   }
+
+  /* Ensure sidebar collapse button is NEVER clipped or hidden */
+  [data-testid="stSidebarCollapseButton"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    position: relative !important;
+    z-index: 9999 !important;
+    pointer-events: auto !important;
+  }
+  section[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] {
+    position: absolute !important;
+    top: 10px !important;
+    right: 10px !important;
+  }
   
   /* Hide footer ("Made with Streamlit") */
   footer,
@@ -183,26 +198,104 @@ _BASE_CSS = """
   }
 
   /* Content padding */
-  .block-container { padding-top: 1.2rem !important; }
+  .block-container { padding-top: 1rem !important; }
 
   /* Page background */
   .stApp { background: #f6f8fb; }
 
-  /* Reduce default top padding */
-  .block-container { padding-top: 0.6rem; }
+  /* ============================================================
+     ENTERPRISE SIDEBAR — FIXED HEADER + SCROLLABLE NAV
+     ============================================================ */
 
-  /* Sidebar - styled (do NOT force width/visibility; allow Streamlit to collapse/expand) */
+  /* Main sidebar container */
   section[data-testid="stSidebar"] {
     background: linear-gradient(180deg, #0b1020 0%, #070a14 100%) !important;
-    padding-top: 0 !important;
   }
-  section[data-testid="stSidebar"] > div {
-    padding-top: 0 !important;
-    margin-top: 0 !important;
+
+  /* Force sidebar to full viewport height */
+  section[data-testid="stSidebar"] > div:first-child {
+    height: 100vh !important;
+    display: flex !important;
+    flex-direction: column !important;
+    padding: 0 !important;
   }
-  section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
-    padding-top: 0 !important;
-    margin-top: 0 !important;
+
+  /* Sidebar content wrapper */
+  [data-testid="stSidebarContent"] {
+    display: flex !important;
+    flex-direction: column !important;
+    height: 100% !important;
+    padding: 0 !important;
+  }
+
+  /* Header (TOP FIXED) */
+  .sidebar-top {
+    flex-shrink: 0 !important;
+    padding: 16px 18px 10px 18px !important;
+    position: sticky !important;
+    top: 0 !important;
+    background: linear-gradient(180deg, #0b1020 0%, #070a14 100%) !important;
+    z-index: 5 !important;
+  }
+
+  /* Scrollable NAV AREA */
+  .sidebar-nav {
+    flex: 1 1 auto !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    padding: 6px 10px !important;
+  }
+
+  /* Bottom fixed section */
+  .sidebar-bottom {
+    flex-shrink: 0 !important;
+    padding: 12px 14px 18px 14px !important;
+    border-top: 1px solid rgba(255,255,255,0.08) !important;
+  }
+
+  /* Scrollbar styling */
+  .sidebar-nav::-webkit-scrollbar {
+    width: 4px;
+  }
+  .sidebar-nav::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.25);
+    border-radius: 4px;
+  }
+  .sidebar-nav::-webkit-scrollbar-thumb:hover {
+    background: rgba(255,255,255,0.4);
+  }
+
+  .sb-welcome {
+    font-size: 15px;
+    font-weight: 600;
+    color: #ffffff !important;
+    margin: 4px 18px 10px 18px;
+    opacity: 0.9;
+  }
+  .sb-avatar-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 18px 12px 18px;
+  }
+  .sb-avatar {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: linear-gradient(135deg, #ffb300, #ff6b35);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 800; color: #0b1020; flex-shrink: 0;
+  }
+  .sb-user-name { font-size: 13px; font-weight: 700; color: #fff; }
+  .sb-role-badge {
+    display: inline-block; font-size: 9px; font-weight: 700;
+    background: rgba(255,179,0,0.18); color: #ffb300;
+    border: 1px solid rgba(255,179,0,0.3); border-radius: 4px;
+    padding: 1px 6px; letter-spacing: 0.5px; text-transform: uppercase; margin-top: 2px;
+  }
+  section[data-testid="stSidebar"] input[type="text"] {
+    background: rgba(255,255,255,0.07) !important;
+    border: 1px solid rgba(255,255,255,0.12) !important;
+    color: #ffffff !important; border-radius: 8px !important; font-size: 13px !important;
+  }
+  section[data-testid="stSidebar"] input[type="text"]::placeholder {
+    color: rgba(255,255,255,0.4) !important;
   }
   section[data-testid="stSidebar"] * { 
     color: #e9eefc; 
@@ -252,17 +345,17 @@ _BASE_CSS = """
     box-shadow: none !important;
     color: #ffffff !important;
     font-weight: 650 !important;
-    font-size: 16px !important;
+    font-size: 14px !important;
     text-align: left !important;
     justify-content: flex-start !important;
-    padding: 12px 14px !important;
-    margin: 4px 14px !important;
+    padding: 10px 12px !important;
+    margin: 2px 10px !important;
     border-radius: 10px !important;
     transition: background 0.15s ease, border-color 0.15s ease !important;
-    height: 46px !important;
+    height: 40px !important;
     display: flex !important;
     align-items: center !important;
-    gap: 10px !important;
+    gap: 8px !important;
   }
   section[data-testid="stSidebar"] button[kind="secondary"] * {
     color: #ffffff !important;
@@ -282,16 +375,16 @@ _BASE_CSS = """
     color: #0b1020 !important;                /* dark text on yellow */
     box-shadow: 0 10px 26px rgba(255, 179, 0, 0.18) !important;
     font-weight: 800 !important;
-    font-size: 16px !important;
+    font-size: 14px !important;
     text-align: left !important;
     justify-content: flex-start !important;
-    padding: 12px 14px !important;
-    margin: 4px 14px !important;
+    padding: 10px 12px !important;
+    margin: 2px 10px !important;
     border-radius: 10px !important;
-    height: 46px !important;
+    height: 40px !important;
     display: flex !important;
     align-items: center !important;
-    gap: 10px !important;
+    gap: 8px !important;
   }
   section[data-testid="stSidebar"] button[kind="primary"] * {
     color: #0b1020 !important;
@@ -315,7 +408,7 @@ _BASE_CSS = """
     flex-direction: column;
     justify-content: space-between;
   }
-  .kpi-label { color: #5c6b8a; font-size: 14px; margin-bottom: 8px; }
+  .kpi-label { color: inherit; font-size: 14px; margin-bottom: 8px; }
   .kpi-value { font-size: 36px; font-weight: 800; color: #0b1220; line-height: 1.1; }
   .kpi-unit { font-size: 20px; font-weight: 700; color: #0b1220; margin-left: 6px; }
   .kpi-sub { margin-top: 10px; display: flex; gap: 10px; align-items: baseline; }
@@ -339,12 +432,12 @@ _BASE_CSS = """
     margin: 4px 0 8px 0;
   }
   .panel-sub {
-    color: #5c6b8a;
+    color: inherit;
     font-weight: 650;
     font-size: 12px;
     margin: -2px 0 10px 0;
   }
-  .muted { color: #5c6b8a; }
+  .muted { color: inherit; }
 
   /* Topbar (simple) */
   .topbar {
@@ -362,7 +455,7 @@ _BASE_CSS = """
     display: flex;
     gap: 14px;
     align-items: center;
-    color: #5c6b8a;
+    color: inherit;
     font-weight: 600;
   }
 </style>
@@ -370,7 +463,90 @@ _BASE_CSS = """
 
 
 def _inject_css() -> None:
-    st.markdown(_BASE_CSS, unsafe_allow_html=True)
+    theme = st.session_state.get("app_theme", "light")
+    if theme == "dark":
+        bg, card, text, border, sub_text = "#0f172a", "#111827", "#f1f5f9", "#1f2937", "#94a3b8"
+    else:
+        bg, card, text, border, sub_text = "#f6f8fb", "#ffffff", "#0b1220", "#e8edf6", "#5c6b8a"
+
+    dynamic = f"""<style>
+.stApp {{ background: {bg} !important; color: {text} !important; }}
+.panel, .kpi-card {{
+    background: {card} !important;
+    border: 1px solid {border} !important;
+    color: {text} !important;
+}}
+.panel-title, .kpi-value, .kpi-unit, .topbar-title {{ color: {text} !important; }}
+.kpi-label, .panel-sub, .muted, .topbar-right {{ color: {sub_text} !important; }}
+[data-testid="stMarkdownContainer"] p {{ color: {text} !important; }}
+body {{ color-scheme: {"dark" if theme == "dark" else "light"} !important; }}
+</style>"""
+    st.markdown(_BASE_CSS + dynamic, unsafe_allow_html=True)
+
+
+def _inject_sidebar_freeze_layout() -> None:
+    """
+    Streamlit renders each widget into isolated containers, so HTML wrappers
+    (sidebar-top/nav/bottom) won't automatically contain the buttons.
+    This injects a DOM rearranger that directly moves button containers:
+      - Last 2 buttons (theme + logout) → .sidebar-bottom
+      - All others → .sidebar-nav (scrollable)
+    """
+    st.components.v1.html(
+        """
+        <script>
+        (function () {
+          const doc = window.parent.document;
+
+          function restructure() {
+            const sidebar = doc.querySelector('[data-testid="stSidebarContent"]');
+            if (!sidebar) return;
+
+            const nav = sidebar.querySelector('.sidebar-nav');
+            const bottom = sidebar.querySelector('.sidebar-bottom');
+            if (!nav || !bottom) return;
+
+            // Already restructured
+            if (nav.dataset.done === '1') return;
+            nav.dataset.done = '1';
+
+            // Collect all button containers in the sidebar
+            const allBtns = Array.from(sidebar.querySelectorAll('.stButton'))
+              .filter(btn => !nav.contains(btn) && !bottom.contains(btn));
+
+            if (allBtns.length < 2) return;
+
+            // Last 2 buttons are footer (theme + logout)
+            const footerBtns = allBtns.slice(-2);
+            const navBtns = allBtns.slice(0, -2);
+
+            // Move nav buttons into scrollable area
+            navBtns.forEach(btn => nav.appendChild(btn));
+            
+            // Move footer buttons into fixed bottom
+            footerBtns.forEach(btn => bottom.appendChild(btn));
+          }
+
+          // Run immediately and after a short delay (to ensure buttons are rendered)
+          restructure();
+          setTimeout(restructure, 100);
+          setTimeout(restructure, 300);
+
+          // Watch for Streamlit rerenders
+          const sidebar = doc.querySelector('section[data-testid="stSidebar"]');
+          if (!sidebar) return;
+
+          const obs = new MutationObserver(() => {
+            const nav = doc.querySelector('.sidebar-nav');
+            if (nav) nav.dataset.done = '0';
+            setTimeout(restructure, 50);
+          });
+          obs.observe(sidebar, { childList: true, subtree: true });
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 # =============================================================================
@@ -577,6 +753,116 @@ def _show_page_transition(page: str) -> None:
     transition_container.empty()
 
 
+def _render_global_alerts() -> None:
+    alerts = st.session_state.get("_global_alerts", [])
+    if not alerts:
+        return
+    for alert in alerts:
+        t = alert.get("type", "info")
+        msg = alert.get("msg", "")
+        if t == "warning": st.warning(msg, icon="⚠️")
+        elif t == "error": st.error(msg, icon="🚨")
+        elif t == "success": st.success(msg, icon="✅")
+        else: st.info(msg, icon="ℹ️")
+    st.session_state["_global_alerts"] = []
+
+
+def _inject_session_timeout(timeout_minutes: int = 30, warn_before_minutes: int = 5) -> None:
+    timeout_ms = timeout_minutes * 60 * 1000
+    warn_ms = (timeout_minutes - warn_before_minutes) * 60 * 1000
+    st.components.v1.html(
+        f"""
+        <script>
+        (function() {{
+            let warnTimer, logoutTimer;
+            function resetTimers() {{
+                clearTimeout(warnTimer); clearTimeout(logoutTimer);
+                warnTimer = setTimeout(() => {{
+                    if (confirm("⚠️ You will be logged out in {warn_before_minutes} minutes due to inactivity.\\n\\nClick OK to stay logged in.")) {{
+                        resetTimers();
+                    }}
+                }}, {warn_ms});
+                logoutTimer = setTimeout(() => {{
+                    const buttons = window.parent.document.querySelectorAll('button');
+                    for (let b of buttons) {{ if (b.innerText.includes('Logout')) {{ b.click(); break; }} }}
+                }}, {timeout_ms});
+            }}
+            ['mousemove','keydown','mousedown','touchstart'].forEach(evt =>
+                window.parent.document.addEventListener(evt, resetTimers, true)
+            );
+            resetTimers();
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+_PAGE_META = {
+    "portfolio":       ("📊", "Portfolio Analytics",    "Performance overview across all sites"),
+    "operation":       ("🏥", "Operation Theatre",      "Inverter and string-level diagnostics"),
+    "reconnect":       ("🔌", "Re Connect",             "DSM reconnection analysis"),
+    "add_comments":    ("📝", "Add Comments",           "Annotate site events"),
+    "scb_comment":     ("🧾", "SCB Comment",            "SCB-level comment management"),
+    "dfm":             ("🛠️",  "Fault Detector",         "Digital fault monitoring"),
+    "visual_analyser": ("🖥️",  "Visual Analyser",        "Visual data explorer"),
+    "meta_viewer":     ("🧭", "Meta Viewer",            "Metadata inspection"),
+    "scb_ot":          ("⚡", "SCB OT",                "SCB operation theatre"),
+    "raw_analyser":    ("🧪", "Raw Analyser",           "Raw data deep-dive"),
+    "s1":              ("📋", "S1",                    "S1 portal"),
+    "s2":              ("📝", "S2",                    "S2 portal"),
+    "s3":              ("✅", "S3",                    "S3 portal"),
+}
+
+
+def render_breadcrumb(page: str, as_of_date: date) -> None:
+    icon, label, desc = _PAGE_META.get(page, ("📄", page.title(), ""))
+    date_str = as_of_date.strftime("%d %b %Y")
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;justify-content:space-between;
+                    margin-bottom:12px;padding:10px 16px;border-radius:10px;
+                    background:rgba(37,99,235,0.06);border:1px solid rgba(37,99,235,0.1);">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <span style="font-size:20px;">{icon}</span>
+                <div>
+                    <span style="font-size:11px;color:#64748b;font-weight:600;">Zelestra EYE &rsaquo; </span>
+                    <span style="font-size:15px;font-weight:800;">{label}</span>
+                    <div style="font-size:11px;color:#94a3b8;">{desc}</div>
+                </div>
+            </div>
+            <div style="font-size:12px;color:#64748b;font-weight:600;">📅 As of {date_str}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_coming_soon(icon: str, title: str, description: str, eta: str = "Q3 2025", contact: str = "ops-team@zelestra.com") -> None:
+    st.markdown(
+        f"""
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                    padding:60px 20px;text-align:center;border-radius:18px;
+                    border:2px dashed rgba(148,163,184,0.25);margin:20px 0;">
+            <div style="font-size:56px;margin-bottom:16px;">{icon}</div>
+            <div style="font-size:24px;font-weight:800;margin-bottom:8px;">{title}</div>
+            <div style="font-size:14px;color:#64748b;max-width:420px;line-height:1.6;margin-bottom:20px;">{description}</div>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center;">
+                <div style="background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.2);
+                            border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;color:#2563eb;">
+                    🗓️ Expected: {eta}
+                </div>
+                <div style="background:rgba(148,163,184,0.08);border:1px solid rgba(148,163,184,0.2);
+                            border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;color:#64748b;">
+                    ✉️ {contact}
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # -----------------------------
 # Data access
 # -----------------------------
@@ -593,7 +879,7 @@ def _connect(db_path: str) -> duckdb.DuckDBPyConnection:
     return get_duckdb_connection(db_local=db_path)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def list_sites(db_path: str) -> list[str]:
     con = _connect(db_path)
     try:
@@ -603,7 +889,7 @@ def list_sites(db_path: str) -> list[str]:
         con.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def get_available_dates(db_path: str, site_name: str) -> list[date]:
     con = _connect(db_path)
     try:
@@ -616,7 +902,7 @@ def get_available_dates(db_path: str, site_name: str) -> list[date]:
         con.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def get_daily_row(db_path: str, site_name: str, d: date) -> pd.DataFrame:
     con = _connect(db_path)
     try:
@@ -632,7 +918,7 @@ def get_daily_row(db_path: str, site_name: str, d: date) -> pd.DataFrame:
         con.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def get_budget_row(db_path: str, site_name: str, d: date) -> pd.DataFrame:
     con = _connect(db_path)
     try:
@@ -648,7 +934,7 @@ def get_budget_row(db_path: str, site_name: str, d: date) -> pd.DataFrame:
         con.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def get_pr_equipment(db_path: str, site_name: str, d: date) -> pd.DataFrame:
     con = _connect(db_path)
     try:
@@ -665,7 +951,7 @@ def get_pr_equipment(db_path: str, site_name: str, d: date) -> pd.DataFrame:
         con.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def get_syd_equipment(db_path: str, site_name: str, d: date) -> pd.DataFrame:
     con = _connect(db_path)
     try:
@@ -786,14 +1072,27 @@ PLOTLY_COLORS = {
     "accent": "#f59e0b",  # amber
 }
 
+PLOTLY_CONFIG = {
+    "displayModeBar": "hover",
+    "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d", "hoverCompareCartesian"],
+    "modeBarButtonsToAdd": ["toggleSpikelines"],
+    "toImageButtonOptions": {
+        "format": "png", "filename": "zelestra_chart",
+        "height": 500, "width": 900, "scale": 2
+    },
+    "displaylogo": False,
+    "scrollZoom": False,
+}
+
 
 def _plotly_base_layout(title: str, *, x_title: str | None = None, y_title: str | None = None) -> dict[str, Any]:
+    _font_color = "#f1f5f9" if st.session_state.get("app_theme", "dark") == "dark" else "#0b1220"
     layout: dict[str, Any] = dict(
-        title=dict(text=title, x=0.02, xanchor="left", font=dict(size=18, color="#0b1220")),
+        title=dict(text=title, x=0.02, xanchor="left", font=dict(size=18, color=_font_color)),
         margin=dict(l=14, r=10, t=46, b=12),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#0b1220"),
+        font=dict(color=_font_color),
         xaxis=dict(
             showgrid=True,
             gridcolor="rgba(148, 163, 184, 0.25)",
@@ -1004,7 +1303,7 @@ def page_dashboard(db_path: str, f: Filters) -> None:
                 title="Generation: Actual vs Target (Last 24h)",
                 y_title="kWh",
             )
-            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+            st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
         except Exception as e:
             st.error(f"Error rendering generation chart: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1034,7 +1333,7 @@ def page_dashboard(db_path: str, f: Filters) -> None:
                 title="Irradiance: Actual vs Target (Last 24h)",
                 y_title="W/m²",
             )
-            st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
+            st.plotly_chart(fig2, width="stretch", config=PLOTLY_CONFIG)
         except Exception as e:
             st.error(f"Error rendering irradiance chart: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1060,7 +1359,7 @@ def page_inverter_bd(db_path: str, f: Filters) -> None:
             x_title="PR (%)",
             color=PLOTLY_COLORS["accent"],
         )
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
     except Exception as e:
         st.error(f"Error rendering inverter chart: {e}")
 
@@ -1085,7 +1384,7 @@ def page_string_bd(db_path: str, f: Filters) -> None:
             x_title="SYD (%)",
             color=PLOTLY_COLORS["actual"],
         )
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
     except Exception as e:
         st.error(f"Error rendering string chart: {e}")
 
@@ -1133,7 +1432,7 @@ def page_losses(db_path: str, f: Filters) -> None:
         )
         fig.update_layout(**_plotly_base_layout("Loss Breakdown", y_title="kWh"))
         fig.update_xaxes(showgrid=False)
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
     except Exception as e:
         st.error(f"Error rendering loss chart: {e}")
 
@@ -1243,6 +1542,9 @@ def _init_app_state() -> None:
         # Add Comments state (form persistence)
         "comments_edit_id": None,
         "comments_edit_row": None,
+
+        "app_theme": "light",
+        "_global_alerts": [],
     }
 
     for key, default_value in defaults.items():
@@ -1252,6 +1554,9 @@ def _init_app_state() -> None:
 
 def main() -> None:
     _inject_css()
+    _inject_sidebar_freeze_layout()
+    _inject_session_timeout(timeout_minutes=30, warn_before_minutes=5)
+    _render_global_alerts()
 
     # Initialize global state for ALL tabs (bidirectional persistence)
     _init_app_state()
@@ -1303,27 +1608,29 @@ def main() -> None:
 
     try:
         with st.sidebar:
-            # Sidebar header
+            username_disp = username or "Unknown"
+            
+            # Fixed header at top
             st.markdown(
-                """
-                <div class="sb-header">
-                  <div>
-                    <div class="sb-title-top">Zelestra</div>
-                    <div class="sb-title">Operation Intelligence</div>
+                f"""
+                <div class="sidebar-top">
+                  <div class="sb-header">
+                    <div>
+                      <div class="sb-title-top">Zelestra</div>
+                      <div class="sb-title">Operation Intelligence</div>
+                    </div>
                   </div>
+                  <div class="sb-welcome">Welcome, {username_disp}</div>
+                  <div class="sb-divider"></div>
                 </div>
-                <div class="sb-divider"></div>
                 """,
                 unsafe_allow_html=True,
             )
 
-            # User info
-            username_disp = username or "Unknown"
-            st.markdown(f"### Welcome, **{username_disp}**")
+            # Empty scrollable nav container (JS will move buttons here)
+            st.markdown('<div class="sidebar-nav"></div>', unsafe_allow_html=True)
 
-            st.markdown("<div class='sb-divider'></div>", unsafe_allow_html=True)
-
-            # Build nav_items filtered by user's allowed_pages (role-based)
+            # Nav buttons (will be moved into .sidebar-nav by JS)
             nav_items = [
                 (key, label)
                 for key, label in ALL_PAGES
@@ -1333,12 +1640,33 @@ def main() -> None:
             for key, label in nav_items:
                 is_active = st.session_state.nav_page == key
                 btn_type = "primary" if is_active else "secondary"
+                
+                # Add subtle group separator before S-series pages
+                if key == "s1":
+                    st.markdown(
+                        '<div style="height:1px;background:rgba(255,255,255,0.07);margin:8px 14px;"></div>',
+                        unsafe_allow_html=True
+                    )
+                
                 if st.button(label, key=f"nav_{key}", type=btn_type, use_container_width=True):
                     st.session_state.nav_page = key
                     st.rerun()
-            
-            # Logout button at the bottom
-            st.markdown("<div class='sb-divider'></div>", unsafe_allow_html=True)
+
+            # Empty footer container (JS will move last 2 buttons here)
+            st.markdown('<div class="sidebar-bottom"></div>', unsafe_allow_html=True)
+
+            # Footer buttons (will be moved into .sidebar-bottom by JS)
+            current_theme = st.session_state.get("app_theme", "light")
+            if current_theme == "light":
+                theme_label = "🌙 Switch to Dark Mode"
+            else:
+                theme_label = "☀️ Switch to Light Mode"
+            if st.button(theme_label, use_container_width=True, type="secondary"):
+                st.session_state.app_theme = (
+                    "light" if st.session_state.get("app_theme", "light") == "dark" else "dark"
+                )
+                st.rerun()
+
             if st.button("🚪 Logout", use_container_width=True, type="secondary"):
                 auth.logout()
     except Exception as e:
@@ -1430,11 +1758,17 @@ def main() -> None:
     elif page == "add_comments":
         add_comments.render(db_path)
     elif page == "dfm":
-        st.markdown("## Digital Fault Monitoring")
-        st.info("Coming soon")
+        render_coming_soon(
+            icon="🛠️", title="Digital Fault Monitoring",
+            description="Automated fault detection across inverters and strings using rule-based and ML anomaly detection.",
+            eta="Q3 2025",
+        )
     elif page == "visual_analyser":
-        st.markdown("## Visual Analyser")
-        st.info("Coming soon")
+        render_coming_soon(
+            icon="🖥️", title="Visual Analyser",
+            description="Interactive visual exploration of raw sensor data with heatmaps, correlation matrices, and trend overlays.",
+            eta="Q4 2025",
+        )
     elif page == "meta_viewer":
         meta_viewer.render(db_path)
     elif page == "scb_ot":

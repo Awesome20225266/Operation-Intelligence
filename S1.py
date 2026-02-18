@@ -105,6 +105,76 @@ def _smooth_progress(prog: Any, start: int, end: int, *, text: str, step_delay_s
         _time.sleep(step_delay_s)
 
 
+def _apply_modern_tabs_css() -> None:
+    """Match S2/S3 tab UX (UI-only) + Anti-Ghosting CSS."""
+    st.markdown(
+        """
+        <style>
+          /* ==============================================
+             ANTI-GHOSTING: Prevent old tab content flash
+             ============================================== */
+          .stTabs [data-baseweb="tab-panel"] {
+            opacity: 0;
+            animation: tabContentFadeIn 0.2s ease-out forwards;
+          }
+          @keyframes tabContentFadeIn {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+          }
+          .stTabs [data-baseweb="tab-panel"][hidden] {
+            display: none !important;
+            visibility: hidden !important;
+          }
+          /* ==============================================
+             TABS STYLING
+             ============================================== */
+          .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+            padding: 6px 4px 10px 4px;
+            border-bottom: 1px solid rgba(148,163,184,0.45);
+          }
+          .stTabs [data-baseweb="tab"] {
+            font-size: 18px;
+            font-weight: 800;
+            padding: 10px 16px;
+            border-radius: 12px;
+            background: rgba(226,232,240,0.35);
+            color: #0f172a;
+            border: 1px solid rgba(148,163,184,0.28);
+            transition: all 0.15s ease;
+          }
+          .stTabs [aria-selected="true"] {
+            background: linear-gradient(135deg, rgba(37,99,235,0.14), rgba(59,130,246,0.09));
+            border: 1px solid rgba(37,99,235,0.35);
+            color: #0b2a6f;
+            box-shadow: 0 8px 20px rgba(15,23,42,0.08);
+          }
+          .stTabs [data-baseweb="tab-panel"] {
+            padding-top: 12px;
+          }
+          /* Reduce space below page title */
+          h1 {
+            margin-bottom: 10px !important;
+          }
+          /* Reduce space above tabs */
+          .stTabs {
+            margin-top: -10px !important;
+          }
+          /* Remove extra gap inside tab container */
+          .stTabs [data-baseweb="tab-list"] {
+            padding-top: 0px !important;
+            margin-top: 0px !important;
+          }
+          /* Remove large default Streamlit top padding (S1 page) */
+          .block-container {
+            padding-top: 1rem !important;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # =============================================================================
 # STATUS DERIVATION (SINGLE SOURCE OF TRUTH)
 # =============================================================================
@@ -154,13 +224,11 @@ def derive_ptw_status(row: dict) -> str:
     if has_value(s1_closed):
         return "CLOSED"
     
-    # Priority 2: APPROVED (full approval chain complete, no rejections)
-    if has_value(s1_created) and has_value(s2_forwarded) and has_value(s3_approved):
+    # Priority 3: APPROVED (single source of truth: date_s3_approved is set)
+    if has_value(s3_approved):
         return "APPROVED"
     
-    # Priority 3: WIP (PTW started but not fully approved)
-    # Case 1: Only s1_created exists
-    # Case 2: s1_created and s2_forwarded exist but not s3_approved
+    # Priority 4: WIP (PTW started but not approved/closed)
     if has_value(s1_created):
         return "WIP"
     
@@ -2677,7 +2745,16 @@ def render(db_path: str) -> None:
         st.error("Access Denied - S1 Only")
         st.stop()
 
-    st.markdown("# S1 Portal")
+    st.markdown(
+        """
+        <div style='margin-top:-35px; margin-bottom:8px;'>
+            <h1 style='font-size:30px; font-weight:800; margin-bottom:4px;'>
+                S1 Portal – Permit Receiver
+            </h1>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     # Import modern UI styles
     try:
@@ -2698,41 +2775,19 @@ def render(db_path: str) -> None:
     if "ptw_just_submitted" not in st.session_state:
         st.session_state["ptw_just_submitted"] = False
 
-    # =========================================================================
-    # Deterministic Navigation (no tab reset on rerun)
-    # NOTE: Streamlit `st.tabs()` can jump back to the first tab after a button
-    # click/form submit because the script reruns from top. We keep navigation
-    # state explicitly in session_state and style it like tabs via CSS.
-    # =========================================================================
-    options = ["View Work Order", "Request PTW", "View Applied PTW", "Permit Closure"]
-    if "s1_nav_page" not in st.session_state:
-        st.session_state["s1_nav_page"] = options[0]
-
-    # Prefer segmented control for a true "tab" look (and deterministic state).
-    _seg = getattr(st, "segmented_control", None)
-    if callable(_seg):
-        try:
-            active = _seg(" ", options=options, key="s1_nav_page", label_visibility="collapsed")
-        except TypeError:
-            # Older Streamlit: label_visibility may not exist
-            active = _seg(" ", options=options, key="s1_nav_page")
-    else:
-        # Fallback: radio (still deterministic, but UI may vary by Streamlit version)
-        active = st.radio(
-            " ",
-            options=options,
-            horizontal=True,
-            key="s1_nav_page",
-            label_visibility="collapsed",
-        )
-
-    if active == "View Work Order":
+    st.markdown("<div style='margin-top:5px;'>", unsafe_allow_html=True)
+    _apply_modern_tabs_css()
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["View Work Order", "Request PTW", "View Applied PTW", "Permit Closure"]
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+    with tab1:
         _render_view_work_order()
-    elif active == "Request PTW":
+    with tab2:
         _render_request_ptw()
-    elif active == "View Applied PTW":
+    with tab3:
         _render_view_applied_ptw()
-    else:
+    with tab4:
         _render_permit_closure()
 
 
@@ -2763,144 +2818,93 @@ def _render_view_work_order() -> None:
         )
         return
 
-    # Mount progress UI early (BEFORE any dependent filter queries) to avoid "page loads then progress".
-    early_prog_slot = st.empty()
-    early_msg_slot = st.empty()
-
     # Initialize session state
     if "s1_wo_last_df" not in st.session_state:
         st.session_state["s1_wo_last_df"] = None
         st.session_state["s1_wo_last_meta"] = None
     if "s1_wo_last_kpis" not in st.session_state:
         st.session_state["s1_wo_last_kpis"] = None
-    if "s1_wo_run_fetch" not in st.session_state:
-        st.session_state["s1_wo_run_fetch"] = False
+    if "s1_wo_fetch_requested" not in st.session_state:
+        st.session_state["s1_wo_fetch_requested"] = False
 
     site_options = ["(select)"] + sites
 
-    # Get current selections for dependent filters
-    ss_site = st.session_state.get("s1_wo_site")
-    ss_start = st.session_state.get("s1_wo_start")
-    ss_end = st.session_state.get("s1_wo_end")
+    with st.form("s1_view_work_orders_filters", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns([2.0, 1.5, 1.5, 1.0], vertical_alignment="bottom")
+        with c1:
+            site_name = st.selectbox("Site Name", options=site_options, index=0, key="s1_wo_site")
+        with c2:
+            start_date = st.date_input("Start Date", value=None, key="s1_wo_start")
+        with c3:
+            end_date = st.date_input("End Date", value=None, key="s1_wo_end")
+        with c4:
+            submitted = st.form_submit_button("Submit", use_container_width=True)
 
-    have_site = ss_site not in (None, "(select)", "")
-    have_dates = isinstance(ss_start, date) and isinstance(ss_end, date)
+    if submitted:
+        st.session_state["s1_wo_fetch_requested"] = True
 
-    # If we're about to fetch results (Submit clicked), skip dependent filter queries on this rerun
-    # so the progress bar mounts immediately. (No query/business logic changes; just UI ordering.)
-    if st.session_state.get("s1_wo_run_fetch"):
-        locs, statuses_ui = [], []
-    else:
-        if have_site and have_dates:
-            locs = _list_locations_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
-            statuses_ui = _list_statuses_from_work_orders(site_name=str(ss_site), start_date=ss_start, end_date=ss_end)
-        else:
-            locs = []
-            statuses_ui = []
-
-    loc_options = ["(all)"] + locs
-    status_options = ["(all)"] + (statuses_ui if statuses_ui else UI_STATUSES)
-
-    def _on_s1_wo_submit_click() -> None:
-        # Flag allows next rerun to mount progress UI immediately before any heavy work.
-        st.session_state["s1_wo_run_fetch"] = True
-
-    # Filters OUTSIDE form to prevent Enter key triggering submit
-    c1, c2, c3, c4, c5 = st.columns([2.0, 1.3, 1.3, 1.4, 1.4], vertical_alignment="bottom")
-    with c1:
-        site_name = st.selectbox("Site Name", options=site_options, index=0, key="s1_wo_site")
-    with c2:
-        start_date = st.date_input("Start Date", value=None, key="s1_wo_start")
-    with c3:
-        end_date = st.date_input("End Date", value=None, key="s1_wo_end")
-    with c4:
-        location = st.selectbox("Location", options=loc_options, index=0, key="s1_wo_location")
-    with c5:
-        status_ui = st.selectbox("Status", options=status_options, index=0, key="s1_wo_status")
-
-    # Submit button (no form wrapper)
-    submitted = st.button("Submit", type="primary", on_click=_on_s1_wo_submit_click)
-
-    # If Submit was clicked, do the fetch with progress mounted at the top.
-    if submitted or st.session_state.get("s1_wo_run_fetch"):
-        # Ensure we only auto-run once per click
-        st.session_state["s1_wo_run_fetch"] = False
+    # Heavy work in separate block with spinner to avoid progress flicker
+    if st.session_state.get("s1_wo_fetch_requested"):
+        st.session_state["s1_wo_fetch_requested"] = False
 
         if not site_name or site_name == "(select)":
-            early_prog_slot.empty()
-            early_msg_slot.empty()
             st.error("Please select a Site Name.")
-            return
-        if start_date is None or end_date is None:
-            early_prog_slot.empty()
-            early_msg_slot.empty()
+        elif start_date is None or end_date is None:
             st.error("Please select both Start Date and End Date.")
-            return
-        if start_date > end_date:
-            early_prog_slot.empty()
-            early_msg_slot.empty()
+        elif start_date > end_date:
             st.error("Start Date must be on or before End Date.")
-            return
-
-        # Progress UX (mounted early)
-        prog = early_prog_slot.progress(0, text="Safety First: Initializing...")
-        early_msg_slot.caption("Safety First: Always verify permits and isolation before starting work.")
-        _smooth_progress(prog, 0, 18, text="Validating filters...")
-        _smooth_progress(prog, 18, 55, text="Fetching work orders...")
-
-        loc_val = None if location in (None, "(all)") else location
-        st_val = None if status_ui in (None, "(all)") else status_ui
-
-        df = _fetch_work_orders(
-            site_name=site_name,
-            start_date=start_date,
-            end_date=end_date,
-            status_ui=st_val,
-            location=loc_val,
-        )
-
-        _smooth_progress(prog, 55, 88, text="Preparing results...")
-        _smooth_progress(prog, 88, 100, text="Results ready")
-        early_prog_slot.empty()
-        early_msg_slot.empty()
-
-        # Persist results
-        st.session_state["s1_wo_last_df"] = df
-        st.session_state["s1_wo_last_meta"] = {
-            "site_name": site_name,
-            "start_date": start_date,
-            "end_date": end_date,
-            "status": st_val,
-            "location": loc_val,
-        }
-
-        # Update KPIs
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            total = int(len(df))
-            c_rej = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
-            c_open = int((df["status"].astype("string").str.upper() == "OPEN").sum())
-            c_wip = int((df["status"].astype("string").str.upper() == "WIP").sum())
-            c_approved = int((df["status"].astype("string").str.upper() == "APPROVED").sum())
-            c_closed = int((df["status"].astype("string").str.upper() == "CLOSED").sum())
         else:
-            total = c_rej = c_open = c_wip = c_approved = c_closed = 0
+            progress_slot = st.empty()
+            prog = progress_slot.progress(0, text="Safety First: Initializing...")
+            _smooth_progress(prog, 0, 18, text="Validating filters...")
+            _smooth_progress(prog, 18, 55, text="Fetching work orders...")
 
-        st.session_state["s1_wo_last_kpis"] = {
-            "total": total,
-            "rejected": c_rej,
-            "open": c_open,
-            "wip": c_wip,
-            "approved": c_approved,
-            "closed": c_closed,
-        }
+            df = _fetch_work_orders(
+                site_name=site_name,
+                start_date=start_date,
+                end_date=end_date,
+                status_ui=None,
+                location=None,
+            )
 
-        if df.empty:
-            st.info("No work orders found for the selected Site Name and Date Range.")
-            return
+            _smooth_progress(prog, 55, 88, text="Preparing results...")
+            _smooth_progress(prog, 88, 100, text="Results ready")
+            progress_slot.empty()
 
-    # Render cached results
+            # Persist results
+            st.session_state["s1_wo_last_df"] = df
+            st.session_state["s1_wo_last_meta"] = {
+                "site_name": site_name,
+                "start_date": start_date,
+                "end_date": end_date,
+                "status": None,
+                "location": None,
+            }
+
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                total = int(len(df))
+                c_rej = int((df["status"].astype("string").str.upper() == "REJECTED").sum())
+                c_open = int((df["status"].astype("string").str.upper() == "OPEN").sum())
+                c_wip = int((df["status"].astype("string").str.upper() == "WIP").sum())
+                c_approved = int(df["status"].astype("string").str.upper().isin(["APPROVED", "CLOSED"]).sum())
+                c_closed = int((df["status"].astype("string").str.upper() == "CLOSED").sum())
+            else:
+                total = c_rej = c_open = c_wip = c_approved = c_closed = 0
+
+            st.session_state["s1_wo_last_kpis"] = {
+                "total": total,
+                "rejected": c_rej,
+                "open": c_open,
+                "wip": c_wip,
+                "approved": c_approved,
+                "closed": c_closed,
+            }
+
+    # Render cached results (outside button/action block)
     df_last = st.session_state.get("s1_wo_last_df")
-    if isinstance(df_last, pd.DataFrame) and not df_last.empty:
+    if isinstance(df_last, pd.DataFrame) and df_last.empty:
+        st.info("No work orders found for the selected Site Name and Date Range.")
+    elif isinstance(df_last, pd.DataFrame) and not df_last.empty:
         df = df_last
 
         # KPI cards
@@ -2911,6 +2915,14 @@ def _render_view_work_order() -> None:
         c_wip = int(k.get("wip", 0) or 0)
         c_approved = int(k.get("approved", 0) or 0)
         c_closed = int(k.get("closed", 0) or 0)
+        COLOR_MAP = {
+            "total": "#0f172a",
+            "open": "#2563eb",
+            "wip": "#f97316",
+            "approved": "#10b981",
+            "closed": "#065f46",
+            "rejected": "#dc2626",
+        }
 
         st.markdown(
             """
@@ -2928,12 +2940,12 @@ def _render_view_work_order() -> None:
         st.markdown(
             f"""
             <div class="kpi-row">
-              <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:#2563eb;">{total}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:#dc2626;">{c_rej}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:#16a34a;">{c_open}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:#f97316;">{c_wip}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:#10b981;">{c_approved}</div></div>
-              <div class="kpi-card"><div class="kpi-title">Closed</div><div class="kpi-value" style="color:#065f46;">{c_closed}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Work Orders</div><div class="kpi-value" style="color:{COLOR_MAP['total']};">{total}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Rejected</div><div class="kpi-value" style="color:{COLOR_MAP['rejected']};">{c_rej}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Open</div><div class="kpi-value" style="color:{COLOR_MAP['open']};">{c_open}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Awaiting Approval</div><div class="kpi-value" style="color:{COLOR_MAP['wip']};">{c_wip}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Approved</div><div class="kpi-value" style="color:{COLOR_MAP['approved']};">{c_approved}</div></div>
+              <div class="kpi-card"><div class="kpi-title">Closed</div><div class="kpi-value" style="color:{COLOR_MAP['closed']};">{c_closed}</div></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -2955,6 +2967,196 @@ def _render_view_work_order() -> None:
         st.dataframe(styled, width="stretch", hide_index=True)
 
 
+# ================= BILINGUAL UI ENGINE =================
+BILINGUAL_MAP = {
+    # Section Titles
+    "Permit Details": "परमिट विवरण",
+    "Identified Hazards": "पहचाने गए खतरे",
+    "Risk Assessment": "जोखिम मूल्यांकन",
+    "Personal Protective Equipment (PPE)": "व्यक्तिगत सुरक्षा उपकरण",
+    "Safety Precautions": "सुरक्षा सावधानियाँ",
+    "Associated Permits": "संबंधित परमिट",
+    "Tools & Equipment": "उपकरण एवं औजार",
+    "Permit Issuer Checklist": "परमिट जारीकर्ता जाँच सूची",
+    "Personnel & Signatures": "कर्मचारी एवं हस्ताक्षर",
+    "Permit Extension": "परमिट विस्तार",
+    "Permit Closure": "परमिट समापन",
+
+    # Meta fields
+    "Permit Number": "परमिट संख्या",
+    "Permit Validity Date": "परमिट की वैधता तिथि",
+    "Start Time": "प्रारंभ समय",
+    "End Time": "समाप्ति समय",
+    "Project / Site Name": "परियोजना / साइट का नाम",
+    "Work Location": "कार्य स्थान",
+    "Description of Work": "कार्य का विवरण",
+    "Contractor Name": "ठेकेदार का नाम",
+
+    # Common
+    "Others": "अन्य",
+    "Remarks": "टिप्पणी",
+
+    # Buttons
+    "Submit PTW": "परमिट जमा करें",
+    "Reset Form": "फॉर्म रीसेट करें",
+    "Download PTW": "परमिट डाउनलोड करें",
+    "View PTW": "परमिट देखें",
+
+    # Alerts
+    "PTW Submitted Successfully": "परमिट सफलतापूर्वक जमा हुआ",
+    "Error Occurred": "त्रुटि हुई",
+    "Please Fill Required Fields": "कृपया आवश्यक फ़ील्ड भरें",
+
+    # Request PTW specific (additional UI strings)
+    "Request PTW - Electrical Work Permit": "पीटीडब्ल्यू अनुरोध - विद्युत कार्य अनुमति",
+    "Complete all sections below to submit a Permit To Work request": "अनुमति-से-कार्य अनुरोध सबमिट करने के लिए नीचे दिए गए सभी अनुभाग पूरे करें",
+    "This PTW is under review with the supervisor.": "यह पीटीडब्ल्यू सुपरवाइज़र के साथ समीक्षा में है।",
+    "Raise Another PTW Request": "एक और पीटीडब्ल्यू अनुरोध बनाएँ",
+    "Select a date to view available Work Orders. The PTW will be linked to the selected Work Order.": "उपलब्ध वर्क ऑर्डर देखने के लिए एक तारीख चुनें। पीटीडब्ल्यू चयनित वर्क ऑर्डर से लिंक होगा।",
+    "Select Date (Work Order Date)": "तारीख चुनें (वर्क ऑर्डर की तारीख)",
+    "Loading work orders for selected date...": "चयनित तारीख के लिए वर्क ऑर्डर लोड हो रहे हैं...",
+    "Validating selection...": "चयन सत्यापित किया जा रहा है...",
+    "Fetching OPEN work orders...": "OPEN वर्क ऑर्डर प्राप्त किए जा रहे हैं...",
+    "Work orders ready": "वर्क ऑर्डर तैयार हैं",
+    "Error fetching work orders": "वर्क ऑर्डर प्राप्त करने में त्रुटि",
+    "No OPEN work orders found for": "के लिए कोई OPEN वर्क ऑर्डर नहीं मिला",
+    "Select Work Order(s)": "वर्क ऑर्डर चुनें",
+    "Preparing selection...": "चयन तैयार किया जा रहा है...",
+    "Fetching work order details...": "वर्क ऑर्डर विवरण प्राप्त किए जा रहे हैं...",
+    "Ready": "तैयार",
+    "Error fetching work order details": "वर्क ऑर्डर विवरण प्राप्त करने में त्रुटि",
+    "The following fields are auto-filled from the selected Work Order:": "निम्न फ़ील्ड चयनित वर्क ऑर्डर से स्वतः भरे जाते हैं:",
+    "Start Time and End Time are automatically recorded when you submit the PTW (End = Start + 8 hours).": "पीटीडब्ल्यू सबमिट करते समय प्रारंभ और समाप्ति समय स्वतः दर्ज होते हैं (समाप्ति = प्रारंभ + 8 घंटे)।",
+    "Please select one or more Work Orders to continue with the PTW request.": "पीटीडब्ल्यू अनुरोध जारी रखने के लिए कृपया एक या अधिक वर्क ऑर्डर चुनें।",
+    "Submitting PTW": "पीटीडब्ल्यू सबमिट किया जा रहा है",
+    "Work Details": "कार्य विवरण",
+    "Describe the work to be performed...": "किया जाने वाला कार्य विवरण लिखें...",
+    "Enter contractor/company name": "ठेकेदार/कंपनी का नाम दर्ज करें",
+    "B. Hazards / Hazardous Activities": "B. खतरे / जोखिमपूर्ण गतिविधियाँ",
+    "Select all applicable hazards identified for this work": "इस कार्य के लिए पहचाने गए सभी लागू खतरों का चयन करें",
+    "Live DC cables": "लाइव DC केबल",
+    "High DC voltage": "उच्च DC वोल्टेज",
+    "Arc flash / short circuit": "आर्क फ्लैश / शॉर्ट सर्किट",
+    "Improper grounding": "गलत ग्राउंडिंग",
+    "Overload": "ओवरलोड",
+    "Loose connectors": "ढीले कनेक्टर",
+    "Poor grounding": "कमज़ोर ग्राउंडिंग",
+    "Working at height": "ऊँचाई पर कार्य",
+    "Wet surfaces": "गीली सतहें",
+    "Manual handling": "मैनुअल हैंडलिंग",
+    "Tracker moving parts": "ट्रैकर के चलने वाले हिस्से",
+    "Heavy panels": "भारी पैनल",
+    "Sharp edges": "तेज़ किनारे",
+    "Heat": "गर्मी",
+    "Overhead line": "ओवरहेड लाइन",
+    "Dust": "धूल",
+    "Wildlife": "वन्यजीव",
+    "Lightning": "आकाशीय बिजली",
+    "Other Hazards (if any)": "अन्य खतरे (यदि हों)",
+    "C. Risk Identification": "C. जोखिम पहचान",
+    "Select all identified risks for this work": "इस कार्य के लिए पहचाने गए सभी जोखिमों का चयन करें",
+    "Electrocution": "विद्युत-आघात (इलेक्ट्रोक्यूशन)",
+    "Electric shock": "बिजली का झटका",
+    "Electric burn": "विद्युत जलन",
+    "Unexpected energization": "अप्रत्याशित ऊर्जाकरण",
+    "Fall": "गिरना",
+    "Tripping": "ठोकर लगना",
+    "Falling particles": "गिरते कण/वस्तुएँ",
+    "Crushing": "कुचलना",
+    "Burns": "जलना",
+    "Fire": "आग",
+    "Heat stress": "हीट स्ट्रेस",
+    "Bites/Stings": "काटना/डंक",
+    "Back injury": "पीठ में चोट",
+    "Other Risks (if any)": "अन्य जोखिम (यदि हों)",
+    "D. Personal Protective Equipment (PPE)": "D. व्यक्तिगत सुरक्षा उपकरण (PPE)",
+    "Select all required PPE for this work": "इस कार्य के लिए आवश्यक सभी PPE का चयन करें",
+    "Safety Helmet": "सेफ्टी हेलमेट",
+    "Safety Shoes": "सेफ्टी जूते",
+    "Electrical Gloves": "इलेक्ट्रिकल ग्लव्स",
+    "Safety Harness": "सेफ्टी हार्नेस",
+    "Reflective Vest": "रिफ्लेक्टिव वेस्ट",
+    "Safety Goggles": "सेफ्टी गॉगल्स",
+    "Face Shield": "फेस शील्ड",
+    "Lifeline": "लाइफलाइन",
+    "HRC Suit": "HRC सूट",
+    "Electrical Mat": "इलेक्ट्रिकल मैट",
+    "Insulated Tools": "इन्सुलेटेड टूल्स",
+    "Cut Resistant Gloves": "कट-प्रतिरोधी दस्ताने",
+    "Respirator": "रेस्पिरेटर",
+    "Dust Mask": "डस्ट मास्क",
+    "Ear Plugs": "ईयर प्लग्स",
+    "Other PPE (if any)": "अन्य PPE (यदि हों)",
+    "E. Safety Precautions": "E. सुरक्षा सावधानियाँ",
+    "Select all applicable safety precautions": "सभी लागू सुरक्षा सावधानियों का चयन करें",
+    "Electrical isolation": "इलेक्ट्रिकल आइसोलेशन",
+    "Proper isolation": "उचित आइसोलेशन",
+    "LOTO applied": "LOTO लागू",
+    "Earthing": "अर्थिंग",
+    "Fire extinguisher": "फायर एक्सटिंग्विशर",
+    "Authorized personnel only": "केवल अधिकृत कर्मी",
+    "Signage placed": "चेतावनी संकेत लगाए गए",
+    "Rescue equipment": "रेस्क्यू उपकरण",
+    "Zero voltage verified": "शून्य वोल्टेज सत्यापित",
+    "Pre-job meeting": "कार्य-पूर्व बैठक",
+    "Escape route clear": "एस्केप रूट साफ़",
+    "Adequate illumination": "पर्याप्त रोशनी",
+    "Other Precautions (if any)": "अन्य सावधानियाँ (यदि हों)",
+    "F. Associated Permits": "F. संबंधित परमिट",
+    "Select any associated permits required": "यदि कोई संबंधित परमिट आवश्यक हों तो चुनें",
+    "Hot Work Permit": "हॉट वर्क परमिट",
+    "LOTO Permit": "LOTO परमिट",
+    "Height Work Permit": "ऊँचाई कार्य परमिट",
+    "General Work Permit": "जनरल वर्क परमिट",
+    "Night Work Permit": "नाइट वर्क परमिट",
+    "Lifting Permit": "लिफ्टिंग परमिट",
+    "Excavation Permit": "खुदाई परमिट",
+    "Confined Space Permit": "कन्फाइंड स्पेस परमिट",
+    "Other Permits (if any)": "अन्य परमिट (यदि हों)",
+    "G. Tools / Equipment Required": "G. आवश्यक उपकरण / टूल्स",
+    "List all tools and equipment required for the work": "कार्य के लिए आवश्यक सभी टूल्स और उपकरणों की सूची दें",
+    "H. Safety Checklist (Permit Issuer)": "H. सुरक्षा चेकलिस्ट (परमिट जारीकर्ता)",
+    "Complete all safety checks before issuing permit": "परमिट जारी करने से पहले सभी सुरक्षा जांच पूरी करें",
+    "Is JSA carried out?": "क्या JSA किया गया है?",
+    "Is environment suitable?": "क्या वातावरण उपयुक्त है?",
+    "Is LOTO applied?": "क्या LOTO लागू है?",
+    "Firefighting equipment available?": "क्या अग्निशमन उपकरण उपलब्ध हैं?",
+    "PPE for energized work?": "ऊर्जित कार्य के लिए PPE?",
+    "Rescue equipment available?": "क्या रेस्क्यू उपकरण उपलब्ध हैं?",
+    "Workers medically fit?": "क्या कर्मचारी चिकित्सकीय रूप से फिट हैं?",
+    "Equipment grounded?": "क्या उपकरण ग्राउंडेड हैं?",
+    "Tools inspected?": "क्या टूल्स की जाँच हुई है?",
+    "Adequate lighting?": "क्या पर्याप्त रोशनी है?",
+    "Rescue plan in place?": "क्या रेस्क्यू प्लान मौजूद है?",
+    "Warning signage placed?": "क्या चेतावनी संकेत लगाए गए हैं?",
+    "Testing equipment calibrated?": "क्या टेस्टिंग उपकरण कैलिब्रेटेड हैं?",
+    "Conductive items removed?": "क्या चालक (कंडक्टिव) वस्तुएँ हटाई गई हैं?",
+    "Line clearance obtained?": "क्या लाइन क्लियरेंस प्राप्त है?",
+    "Safety briefing done?": "क्या सुरक्षा ब्रीफिंग हुई है?",
+    "I. Undertaking (MANDATORY)": "I. प्रतिज्ञान (अनिवार्य)",
+    "Important:": "महत्वपूर्ण:",
+    "This undertaking must be accepted before submitting the permit.": "परमिट सबमिट करने से पहले इस प्रतिज्ञान को स्वीकार करना आवश्यक है।",
+    "I have reviewed and understood the risk assessment, safety precautions, and emergency procedures. I accept responsibility for ensuring all personnel involved comply with the permit conditions.": "मैंने जोखिम आकलन, सुरक्षा सावधानियाँ और आपातकालीन प्रक्रियाएँ पढ़ ली हैं और समझ ली हैं। मैं यह सुनिश्चित करने की जिम्मेदारी स्वीकार करता/करती हूँ कि सभी संबंधित कर्मी परमिट की शर्तों का पालन करें।",
+    "J. People Involved": "J. शामिल व्यक्ति",
+    "At S1 (Request) level: Enter Permit Receiver and Co-workers. Permit Holder and Issuer are assigned at S2 (Approval) level.": "S1 (अनुरोध) स्तर पर: परमिट रिसीवर और सह-कर्मियों का विवरण भरें। परमिट होल्डर और जारीकर्ता S2 (अनुमोदन) स्तर पर असाइन किए जाते हैं।",
+    "Permit Receiver Name": "परमिट रिसीवर का नाम",
+    "Co-worker 1": "सह-कर्मी 1",
+    "Co-worker 2": "सह-कर्मी 2",
+    "Co-worker 3": "सह-कर्मी 3",
+    "Co-worker 4": "सह-कर्मी 4",
+    "Co-worker 5": "सह-कर्मी 5",
+    "Co-worker 6": "सह-कर्मी 6",
+}
+
+
+def bi(label: str) -> str:
+    if st.session_state.get("show_hindi_help", False):
+        hi = BILINGUAL_MAP.get(label)
+        if hi:
+            return f"{label} / {hi}"
+    return label
+
+
 def _render_request_ptw() -> None:
     """
     Render the Request PTW tab with Work Order-driven flow.
@@ -2966,6 +3168,11 @@ def _render_request_ptw() -> None:
     4. Start/End times are system-controlled (captured at submit, end = start + 8 hours)
     5. At S1 level: only Permit Receiver and Co-workers are filled
     """
+    st.session_state.setdefault("show_hindi_help", True)
+    st.checkbox(
+        "Show Hindi / हिंदी दिखाएँ",
+        key="show_hindi_help"
+    )
     # Enhanced UI Styling
     st.markdown("""
     <style>
@@ -3027,25 +3234,31 @@ def _render_request_ptw() -> None:
     """, unsafe_allow_html=True)
     
     # Header
-    st.markdown("""
-    <div class="ptw-header">
-        <h2>⚡ Request PTW - Electrical Work Permit</h2>
-        <p>Complete all sections below to submit a Permit To Work request</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="ptw-header">
+            <h2>⚡ {bi("Request PTW - Electrical Work Permit")}</h2>
+            <p>{bi("Complete all sections below to submit a Permit To Work request")}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Check if we just submitted successfully - show success message and reset prompt
     if st.session_state.get("ptw_just_submitted"):
         last_permit = st.session_state.get("s1_ptw_last_permit_no", "")
         
         # Success banner
-        st.markdown(f"""
-        <div class="success-card">
-            <h3>✅ PTW Submitted Successfully!</h3>
-            <p style="font-size: 18px; margin: 10px 0;"><strong>Permit No:</strong> {last_permit}</p>
-            <p style="margin-top: 15px; font-size: 16px;">This PTW is under review with the supervisor.</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="success-card">
+                <h3>✅ {bi("PTW Submitted Successfully")}!</h3>
+                <p style="font-size: 18px; margin: 10px 0;"><strong>{bi("Permit Number")}:</strong> {last_permit}</p>
+                <p style="margin-top: 15px; font-size: 16px;">{bi("This PTW is under review with the supervisor.")}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         
         # Action buttons
         col1, col2, col3 = st.columns([1, 2, 1])
@@ -3055,7 +3268,7 @@ def _render_request_ptw() -> None:
         if isinstance(file_data, (bytes, bytearray)) and len(file_data) > 0:
             with col2:
                 st.download_button(
-                    label="📥 Download PTW (PDF)",
+                    label=f"📥 {bi('Download PTW')} (PDF)",
                     data=file_data,
                     file_name=f"{last_permit}.pdf",
                     mime="application/pdf",
@@ -3067,7 +3280,7 @@ def _render_request_ptw() -> None:
         # Then show button to raise another PTW
         with col2:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("📝 Raise Another PTW Request", type="secondary", width="stretch", key="raise_another_ptw"):
+            if st.button(f"📝 {bi('Raise Another PTW Request')}", type="secondary", width="stretch", key="raise_another_ptw"):
                 st.session_state["ptw_just_submitted"] = False
                 _reset_ptw_form_state()
                 st.rerun()
@@ -3098,11 +3311,11 @@ def _render_request_ptw() -> None:
 
     def _render_work_order_selection_block() -> None:
         # ===== SECTION A: Permit Details (Work Order Selection) =====
-        st.markdown('<div class="section-title">📌 A. Permit Details</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-title">📌 A. {bi("Permit Details")}</div>', unsafe_allow_html=True)
         st.markdown(
-            """
+            f"""
             <div style="background: #e0f2fe; border-left: 4px solid #0284c7; padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 10px 0;">
-                Select a date to view available Work Orders. The PTW will be linked to the selected Work Order.
+                {bi("Select a date to view available Work Orders. The PTW will be linked to the selected Work Order.")}
             </div>
             """,
             unsafe_allow_html=True,
@@ -3121,7 +3334,7 @@ def _render_request_ptw() -> None:
                 st.session_state["ptw_work_location"] = ""
 
             selected_date = st.date_input(
-                "Select Date (Work Order Date)",
+                bi("Select Date (Work Order Date)"),
                 value=st.session_state.get("ptw_selected_date", date.today()),
                 key="ptw_date_selector",
                 on_change=_on_ptw_date_change,
@@ -3130,15 +3343,15 @@ def _render_request_ptw() -> None:
         # Mount loading UI BEFORE any backend work (prevents "page loads then progress")
         load_slot = st.empty()
         if st.session_state.get("ptw_date_loading"):
-            prog = load_slot.progress(0, text="Loading work orders for selected date...")
+            prog = load_slot.progress(0, text=bi("Loading work orders for selected date..."))
             try:
-                _smooth_progress(prog, 0, 35, text="Validating selection...")
-                _smooth_progress(prog, 35, 80, text="Fetching OPEN work orders...")
+                _smooth_progress(prog, 0, 35, text=bi("Validating selection..."))
+                _smooth_progress(prog, 35, 80, text=bi("Fetching OPEN work orders..."))
                 display_map = _build_work_order_display_map(selected_date)
                 st.session_state["ptw_wo_display_map_for_date"] = display_map
-                _smooth_progress(prog, 80, 100, text="Work orders ready")
+                _smooth_progress(prog, 80, 100, text=bi("Work orders ready"))
             except Exception as e:
-                st.error(f"Error fetching work orders: {e}")
+                st.error(f"{bi('Error fetching work orders')}: {e}")
                 st.session_state["ptw_wo_ids_for_date"] = []
             finally:
                 st.session_state["ptw_date_loading"] = False
@@ -3149,11 +3362,11 @@ def _render_request_ptw() -> None:
 
         with col_wo:
             if not wo_labels:
-                st.warning(f"No OPEN work orders found for {selected_date.strftime('%Y-%m-%d')}")
+                st.warning(f"{bi('No OPEN work orders found for')} {selected_date.strftime('%Y-%m-%d')}")
                 selected_ids: list[str] = []
             else:
                 selected_labels = st.multiselect(
-                    "Select Work Order(s)",
+                    bi("Select Work Order(s)"),
                     options=wo_labels,
                     key="ptw_wo_multiselect",
                 )
@@ -3163,16 +3376,16 @@ def _render_request_ptw() -> None:
         wo_details_list: list[dict] = []
         if selected_ids:
             wo_prog_slot = st.empty()
-            prog = wo_prog_slot.progress(0, text="Preparing selection...")
+            prog = wo_prog_slot.progress(0, text=bi("Preparing selection..."))
             try:
-                _smooth_progress(prog, 0, 65, text="Fetching work order details...")
+                _smooth_progress(prog, 0, 65, text=bi("Fetching work order details..."))
                 for woid in selected_ids:
                     d = _get_work_order_details(woid)
                     if isinstance(d, dict) and d:
                         wo_details_list.append(d)
-                _smooth_progress(prog, 65, 100, text="Ready")
+                _smooth_progress(prog, 65, 100, text=bi("Ready"))
             except Exception as e:
-                st.error(f"Error fetching work order details: {e}")
+                st.error(f"{bi('Error fetching work order details')}: {e}")
                 wo_details_list = []
             finally:
                 wo_prog_slot.empty()
@@ -3214,29 +3427,29 @@ def _render_request_ptw() -> None:
 
         # Display auto-filled fields (read-only) - OUTSIDE form for reactive updates
         st.markdown("---")
-        st.markdown("##### The following fields are auto-filled from the selected Work Order:")
+        st.markdown(f"##### {bi('The following fields are auto-filled from the selected Work Order:')}")
 
         col_site, col_loc, col_validity = st.columns(3)
         with col_site:
             st.text_input(
-                "Project / Site Name",
+                bi("Project / Site Name"),
                 value=site_name_display,
                 disabled=True,
             )
         with col_loc:
             st.text_input(
-                "Work Location",
+                bi("Work Location"),
                 value=work_location_display,
                 disabled=True,
             )
         with col_validity:
             st.text_input(
-                "Permit Validity Date",
+                bi("Permit Validity Date"),
                 value=permit_validity_display,
                 disabled=True,
             )
 
-        st.caption("Start Time and End Time are automatically recorded when you submit the PTW (End = Start + 8 hours).")
+        st.caption(bi("Start Time and End Time are automatically recorded when you submit the PTW (End = Start + 8 hours)."))
 
     # Wrap the WHOLE Request PTW interactive body in a fragment (if supported)
     # so Work Order selection triggers re-render of the dependent form below.
@@ -3253,7 +3466,7 @@ def _render_request_ptw() -> None:
 
         # Check if we can proceed with the form
         if not selected_ids:
-            st.warning("Please select one or more Work Orders to continue with the PTW request.")
+            st.warning(bi("Please select one or more Work Orders to continue with the PTW request."))
             return
 
         # Store for use in form submission
@@ -3293,7 +3506,10 @@ def _render_request_ptw() -> None:
             st.session_state["ptw_submit_requested"] = False
 
             # Mount progress UI immediately (top of section)
-            st.markdown('<div class="section-title">🚀 Submitting PTW</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="section-title">🚀 {bi("Submitting PTW")}</div>',
+                unsafe_allow_html=True,
+            )
 
             def _ss(k: str, default: Any) -> Any:
                 return st.session_state.get(k, default)
@@ -3433,154 +3649,173 @@ def _render_request_ptw() -> None:
 
     with st.form(form_key):
         # Manual entry fields with better styling
-        st.markdown('<div class="section-title">📋 Work Details</div>', unsafe_allow_html=True)
-        work_description = st.text_area("Description of Work *", height=100, key="ptw_work_desc", 
-                                         placeholder="Describe the work to be performed...")
-        contractor_name = st.text_area("Contractor Name", key="ptw_contractor",
-                                        placeholder="Enter contractor/company name", height=38)
+        st.markdown(f'<div class="section-title">📋 {bi("Work Details")}</div>', unsafe_allow_html=True)
+        work_description = st.text_area(
+            f"{bi('Description of Work')} *",
+            height=100,
+            key="ptw_work_desc",
+            placeholder=bi("Describe the work to be performed..."),
+        )
+        contractor_name = st.text_area(
+            bi("Contractor Name"),
+            key="ptw_contractor",
+            placeholder=bi("Enter contractor/company name"),
+            height=38,
+        )
 
         st.divider()
 
         # ===== SECTION B: Hazards =====
-        st.markdown('<div class="section-title">⚠️ B. Hazards / Hazardous Activities</div>', unsafe_allow_html=True)
-        st.caption("Select all applicable hazards identified for this work")
+        st.markdown(
+            f'<div class="section-title">⚠️ {bi("B. Hazards / Hazardous Activities")}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            bi("Select all applicable hazards identified for this work")
+        )
 
         hz_cols = st.columns(4)
         with hz_cols[0]:
-            hz_live_dc_cables = st.checkbox("Live DC cables", key="hz_live_dc_cables")
-            hz_high_dc = st.checkbox("High DC voltage", key="hz_high_dc")
-            hz_arc_flash = st.checkbox("Arc flash / short circuit", key="hz_arc_flash")
-            hz_improper_grounding = st.checkbox("Improper grounding", key="hz_improper_grounding")
-            hz_overload = st.checkbox("Overload", key="hz_overload")
+            hz_live_dc_cables = st.checkbox(bi("Live DC cables"), key="hz_live_dc_cables")
+            hz_high_dc = st.checkbox(bi("High DC voltage"), key="hz_high_dc")
+            hz_arc_flash = st.checkbox(bi("Arc flash / short circuit"), key="hz_arc_flash")
+            hz_improper_grounding = st.checkbox(bi("Improper grounding"), key="hz_improper_grounding")
+            hz_overload = st.checkbox(bi("Overload"), key="hz_overload")
         with hz_cols[1]:
-            hz_loose_connectors = st.checkbox("Loose connectors", key="hz_loose_connectors")
-            hz_poor_grounding = st.checkbox("Poor grounding", key="hz_poor_grounding")
-            hz_working_height = st.checkbox("Working at height", key="hz_working_height")
-            hz_wet_surfaces = st.checkbox("Wet surfaces", key="hz_wet_surfaces")
-            hz_manual_handling = st.checkbox("Manual handling", key="hz_manual_handling")
+            hz_loose_connectors = st.checkbox(bi("Loose connectors"), key="hz_loose_connectors")
+            hz_poor_grounding = st.checkbox(bi("Poor grounding"), key="hz_poor_grounding")
+            hz_working_height = st.checkbox(bi("Working at height"), key="hz_working_height")
+            hz_wet_surfaces = st.checkbox(bi("Wet surfaces"), key="hz_wet_surfaces")
+            hz_manual_handling = st.checkbox(bi("Manual handling"), key="hz_manual_handling")
         with hz_cols[2]:
-            hz_tracker_parts = st.checkbox("Tracker moving parts", key="hz_tracker_parts")
-            hz_heavy_panels = st.checkbox("Heavy panels", key="hz_heavy_panels")
-            hz_sharp_edges = st.checkbox("Sharp edges", key="hz_sharp_edges")
-            hz_heat = st.checkbox("Heat", key="hz_heat")
-            hz_overhead_line = st.checkbox("Overhead line", key="hz_overhead_line")
+            hz_tracker_parts = st.checkbox(bi("Tracker moving parts"), key="hz_tracker_parts")
+            hz_heavy_panels = st.checkbox(bi("Heavy panels"), key="hz_heavy_panels")
+            hz_sharp_edges = st.checkbox(bi("Sharp edges"), key="hz_sharp_edges")
+            hz_heat = st.checkbox(bi("Heat"), key="hz_heat")
+            hz_overhead_line = st.checkbox(bi("Overhead line"), key="hz_overhead_line")
         with hz_cols[3]:
-            hz_dust = st.checkbox("Dust", key="hz_dust")
-            hz_wildlife = st.checkbox("Wildlife", key="hz_wildlife")
-            hz_lightning = st.checkbox("Lightning", key="hz_lightning")
+            hz_dust = st.checkbox(bi("Dust"), key="hz_dust")
+            hz_wildlife = st.checkbox(bi("Wildlife"), key="hz_wildlife")
+            hz_lightning = st.checkbox(bi("Lightning"), key="hz_lightning")
 
-        hz_others_text = st.text_area("Other Hazards (if any)", key="hz_others_text", height=38)
+        hz_others_text = st.text_area(bi("Other Hazards (if any)"), key="hz_others_text", height=38)
 
         st.divider()
 
         # ===== SECTION C: Risk Identification =====
-        st.markdown('<div class="section-title">🎯 C. Risk Identification</div>', unsafe_allow_html=True)
-        st.caption("Select all identified risks for this work")
+        st.markdown(f'<div class="section-title">🎯 {bi("C. Risk Identification")}</div>', unsafe_allow_html=True)
+        st.caption(bi("Select all identified risks for this work"))
 
         rk_cols = st.columns(4)
         with rk_cols[0]:
-            rk_electrocution = st.checkbox("Electrocution", key="rk_electrocution")
-            rk_electric_shock = st.checkbox("Electric shock", key="rk_electric_shock")
-            rk_electric_burn = st.checkbox("Electric burn", key="rk_electric_burn")
-            rk_unexpected_energization = st.checkbox("Unexpected energization", key="rk_unexpected_energization")
+            rk_electrocution = st.checkbox(bi("Electrocution"), key="rk_electrocution")
+            rk_electric_shock = st.checkbox(bi("Electric shock"), key="rk_electric_shock")
+            rk_electric_burn = st.checkbox(bi("Electric burn"), key="rk_electric_burn")
+            rk_unexpected_energization = st.checkbox(bi("Unexpected energization"), key="rk_unexpected_energization")
         with rk_cols[1]:
-            rk_fall = st.checkbox("Fall", key="rk_fall")
-            rk_tripping = st.checkbox("Tripping", key="rk_tripping")
-            rk_falling_particles = st.checkbox("Falling particles", key="rk_falling_particles")
-            rk_crushing = st.checkbox("Crushing", key="rk_crushing")
+            rk_fall = st.checkbox(bi("Fall"), key="rk_fall")
+            rk_tripping = st.checkbox(bi("Tripping"), key="rk_tripping")
+            rk_falling_particles = st.checkbox(bi("Falling particles"), key="rk_falling_particles")
+            rk_crushing = st.checkbox(bi("Crushing"), key="rk_crushing")
         with rk_cols[2]:
-            rk_burns = st.checkbox("Burns", key="rk_burns")
-            rk_fire = st.checkbox("Fire", key="rk_fire")
-            rk_heat_stress = st.checkbox("Heat stress", key="rk_heat_stress")
-            rk_bites = st.checkbox("Bites/Stings", key="rk_bites")
+            rk_burns = st.checkbox(bi("Burns"), key="rk_burns")
+            rk_fire = st.checkbox(bi("Fire"), key="rk_fire")
+            rk_heat_stress = st.checkbox(bi("Heat stress"), key="rk_heat_stress")
+            rk_bites = st.checkbox(bi("Bites/Stings"), key="rk_bites")
         with rk_cols[3]:
-            rk_back_injury = st.checkbox("Back injury", key="rk_back_injury")
+            rk_back_injury = st.checkbox(bi("Back injury"), key="rk_back_injury")
 
-        rk_others_text = st.text_area("Other Risks (if any)", key="rk_others_text", height=38)
+        rk_others_text = st.text_area(bi("Other Risks (if any)"), key="rk_others_text", height=38)
 
         st.divider()
 
         # ===== SECTION D: PPE =====
-        st.markdown('<div class="section-title">🦺 D. Personal Protective Equipment (PPE)</div>', unsafe_allow_html=True)
-        st.caption("Select all required PPE for this work")
+        st.markdown(
+            f'<div class="section-title">🦺 {bi("D. Personal Protective Equipment (PPE)")}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(bi("Select all required PPE for this work"))
 
         ppe_cols = st.columns(4)
         with ppe_cols[0]:
-            ppe_helmet = st.checkbox("Safety Helmet", key="ppe_helmet")
-            ppe_shoes = st.checkbox("Safety Shoes", key="ppe_shoes")
-            ppe_electrical_gloves = st.checkbox("Electrical Gloves", key="ppe_electrical_gloves")
-            ppe_harness = st.checkbox("Safety Harness", key="ppe_harness")
+            ppe_helmet = st.checkbox(bi("Safety Helmet"), key="ppe_helmet")
+            ppe_shoes = st.checkbox(bi("Safety Shoes"), key="ppe_shoes")
+            ppe_electrical_gloves = st.checkbox(bi("Electrical Gloves"), key="ppe_electrical_gloves")
+            ppe_harness = st.checkbox(bi("Safety Harness"), key="ppe_harness")
         with ppe_cols[1]:
-            ppe_reflective_vest = st.checkbox("Reflective Vest", key="ppe_reflective_vest")
-            ppe_goggles = st.checkbox("Safety Goggles", key="ppe_goggles")
-            ppe_face_shield = st.checkbox("Face Shield", key="ppe_face_shield")
-            ppe_lifeline = st.checkbox("Lifeline", key="ppe_lifeline")
+            ppe_reflective_vest = st.checkbox(bi("Reflective Vest"), key="ppe_reflective_vest")
+            ppe_goggles = st.checkbox(bi("Safety Goggles"), key="ppe_goggles")
+            ppe_face_shield = st.checkbox(bi("Face Shield"), key="ppe_face_shield")
+            ppe_lifeline = st.checkbox(bi("Lifeline"), key="ppe_lifeline")
         with ppe_cols[2]:
-            ppe_hrc_suit = st.checkbox("HRC Suit", key="ppe_hrc_suit")
-            ppe_electrical_mat = st.checkbox("Electrical Mat", key="ppe_electrical_mat")
-            ppe_insulated_tools = st.checkbox("Insulated Tools", key="ppe_insulated_tools")
-            ppe_cut_gloves = st.checkbox("Cut Resistant Gloves", key="ppe_cut_gloves")
+            ppe_hrc_suit = st.checkbox(bi("HRC Suit"), key="ppe_hrc_suit")
+            ppe_electrical_mat = st.checkbox(bi("Electrical Mat"), key="ppe_electrical_mat")
+            ppe_insulated_tools = st.checkbox(bi("Insulated Tools"), key="ppe_insulated_tools")
+            ppe_cut_gloves = st.checkbox(bi("Cut Resistant Gloves"), key="ppe_cut_gloves")
         with ppe_cols[3]:
-            ppe_respirator = st.checkbox("Respirator", key="ppe_respirator")
-            ppe_dust_mask = st.checkbox("Dust Mask", key="ppe_dust_mask")
-            ppe_ear_plugs = st.checkbox("Ear Plugs", key="ppe_ear_plugs")
+            ppe_respirator = st.checkbox(bi("Respirator"), key="ppe_respirator")
+            ppe_dust_mask = st.checkbox(bi("Dust Mask"), key="ppe_dust_mask")
+            ppe_ear_plugs = st.checkbox(bi("Ear Plugs"), key="ppe_ear_plugs")
 
-        ppe_others_text = st.text_area("Other PPE (if any)", key="ppe_others_text", height=38)
+        ppe_others_text = st.text_area(bi("Other PPE (if any)"), key="ppe_others_text", height=38)
 
         st.divider()
 
         # ===== SECTION E: Safety Precautions =====
-        st.markdown('<div class="section-title">🛡️ E. Safety Precautions</div>', unsafe_allow_html=True)
-        st.caption("Select all applicable safety precautions")
+        st.markdown(f'<div class="section-title">🛡️ {bi("E. Safety Precautions")}</div>', unsafe_allow_html=True)
+        st.caption(bi("Select all applicable safety precautions"))
 
         sp_cols = st.columns(4)
         with sp_cols[0]:
-            sp_electrical_isolation = st.checkbox("Electrical isolation", key="sp_electrical_isolation")
-            sp_proper_isolation = st.checkbox("Proper isolation", key="sp_proper_isolation")
-            sp_loto = st.checkbox("LOTO applied", key="sp_loto")
-            sp_earthing = st.checkbox("Earthing", key="sp_earthing")
+            sp_electrical_isolation = st.checkbox(bi("Electrical isolation"), key="sp_electrical_isolation")
+            sp_proper_isolation = st.checkbox(bi("Proper isolation"), key="sp_proper_isolation")
+            sp_loto = st.checkbox(bi("LOTO applied"), key="sp_loto")
+            sp_earthing = st.checkbox(bi("Earthing"), key="sp_earthing")
         with sp_cols[1]:
-            sp_fire_extinguisher = st.checkbox("Fire extinguisher", key="sp_fire_extinguisher")
-            sp_authorized_personnel = st.checkbox("Authorized personnel only", key="sp_authorized_personnel")
-            sp_signage = st.checkbox("Signage placed", key="sp_signage")
-            sp_insulated_tools = st.checkbox("Insulated tools", key="sp_insulated_tools")
+            sp_fire_extinguisher = st.checkbox(bi("Fire extinguisher"), key="sp_fire_extinguisher")
+            sp_authorized_personnel = st.checkbox(bi("Authorized personnel only"), key="sp_authorized_personnel")
+            sp_signage = st.checkbox(bi("Signage placed"), key="sp_signage")
+            sp_insulated_tools = st.checkbox(bi("Insulated tools"), key="sp_insulated_tools")
         with sp_cols[2]:
-            sp_rescue_equipment = st.checkbox("Rescue equipment", key="sp_rescue_equipment")
-            sp_zero_voltage = st.checkbox("Zero voltage verified", key="sp_zero_voltage")
-            sp_pre_job_meeting = st.checkbox("Pre-job meeting", key="sp_pre_job_meeting")
-            sp_escape_route = st.checkbox("Escape route clear", key="sp_escape_route")
+            sp_rescue_equipment = st.checkbox(bi("Rescue equipment"), key="sp_rescue_equipment")
+            sp_zero_voltage = st.checkbox(bi("Zero voltage verified"), key="sp_zero_voltage")
+            sp_pre_job_meeting = st.checkbox(bi("Pre-job meeting"), key="sp_pre_job_meeting")
+            sp_escape_route = st.checkbox(bi("Escape route clear"), key="sp_escape_route")
         with sp_cols[3]:
-            sp_illumination = st.checkbox("Adequate illumination", key="sp_illumination")
+            sp_illumination = st.checkbox(bi("Adequate illumination"), key="sp_illumination")
 
-        sp_others_text = st.text_area("Other Precautions (if any)", key="sp_others_text", height=38)
+        sp_others_text = st.text_area(bi("Other Precautions (if any)"), key="sp_others_text", height=38)
 
         st.divider()
 
         # ===== SECTION F: Associated Permits =====
-        st.markdown('<div class="section-title">📄 F. Associated Permits</div>', unsafe_allow_html=True)
-        st.caption("Select any associated permits required")
+        st.markdown(f'<div class="section-title">📄 {bi("F. Associated Permits")}</div>', unsafe_allow_html=True)
+        st.caption(bi("Select any associated permits required"))
 
         ap_cols = st.columns(4)
         with ap_cols[0]:
-            ap_hot_work = st.checkbox("Hot Work Permit", key="ap_hot_work")
-            ap_loto = st.checkbox("LOTO Permit", key="ap_loto")
-            ap_height_work = st.checkbox("Height Work Permit", key="ap_height_work")
+            ap_hot_work = st.checkbox(bi("Hot Work Permit"), key="ap_hot_work")
+            ap_loto = st.checkbox(bi("LOTO Permit"), key="ap_loto")
+            ap_height_work = st.checkbox(bi("Height Work Permit"), key="ap_height_work")
         with ap_cols[1]:
-            ap_general_work = st.checkbox("General Work Permit", key="ap_general_work")
-            ap_night_work = st.checkbox("Night Work Permit", key="ap_night_work")
-            ap_lifting = st.checkbox("Lifting Permit", key="ap_lifting")
+            ap_general_work = st.checkbox(bi("General Work Permit"), key="ap_general_work")
+            ap_night_work = st.checkbox(bi("Night Work Permit"), key="ap_night_work")
+            ap_lifting = st.checkbox(bi("Lifting Permit"), key="ap_lifting")
         with ap_cols[2]:
-            ap_excavation = st.checkbox("Excavation Permit", key="ap_excavation")
-            ap_confined_space = st.checkbox("Confined Space Permit", key="ap_confined_space")
+            ap_excavation = st.checkbox(bi("Excavation Permit"), key="ap_excavation")
+            ap_confined_space = st.checkbox(bi("Confined Space Permit"), key="ap_confined_space")
 
-        ap_others_text = st.text_area("Other Permits (if any)", key="ap_others_text", height=38)
+        ap_others_text = st.text_area(bi("Other Permits (if any)"), key="ap_others_text", height=38)
 
         st.divider()
 
         # ===== SECTION G: Tools/Equipment =====
-        st.markdown('<div class="section-title">🔧 G. Tools / Equipment Required</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">🔧 {bi("G. Tools / Equipment Required")}</div>',
+            unsafe_allow_html=True,
+        )
         tools_equipment = st.text_area(
-            "List all tools and equipment required for the work",
+            bi("List all tools and equipment required for the work"),
             height=80,
             key="ptw_tools_equipment"
         )
@@ -3588,63 +3823,73 @@ def _render_request_ptw() -> None:
         st.divider()
 
         # ===== SECTION H: Issuer Safety Checklist =====
-        st.markdown('<div class="section-title">✅ H. Safety Checklist (Permit Issuer)</div>', unsafe_allow_html=True)
-        st.caption("Complete all safety checks before issuing permit")
+        st.markdown(
+            f'<div class="section-title">✅ {bi("H. Safety Checklist (Permit Issuer)")}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(bi("Complete all safety checks before issuing permit"))
 
         chk_col1, chk_col2 = st.columns(2)
         with chk_col1:
-            chk_jsa = st.radio("Is JSA carried out?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_jsa")
-            chk_environment = st.radio("Is environment suitable?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_environment")
-            chk_loto = st.radio("Is LOTO applied?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_loto")
-            chk_firefighting = st.radio("Firefighting equipment available?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_firefighting")
-            chk_energized_ppe = st.radio("PPE for energized work?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_energized_ppe")
-            chk_rescue = st.radio("Rescue equipment available?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_rescue")
-            chk_workers_fit = st.radio("Workers medically fit?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_workers_fit")
-            chk_grounded = st.radio("Equipment grounded?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_grounded")
+            chk_jsa = st.radio(bi("Is JSA carried out?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_jsa")
+            chk_environment = st.radio(bi("Is environment suitable?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_environment")
+            chk_loto = st.radio(bi("Is LOTO applied?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_loto")
+            chk_firefighting = st.radio(bi("Firefighting equipment available?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_firefighting")
+            chk_energized_ppe = st.radio(bi("PPE for energized work?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_energized_ppe")
+            chk_rescue = st.radio(bi("Rescue equipment available?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_rescue")
+            chk_workers_fit = st.radio(bi("Workers medically fit?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_workers_fit")
+            chk_grounded = st.radio(bi("Equipment grounded?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_grounded")
 
         with chk_col2:
-            chk_tools = st.radio("Tools inspected?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_tools")
-            chk_lighting = st.radio("Adequate lighting?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_lighting")
-            chk_rescue_plan = st.radio("Rescue plan in place?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_rescue_plan")
-            chk_signage = st.radio("Warning signage placed?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_signage")
-            chk_testing_equipment = st.radio("Testing equipment calibrated?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_testing_equipment")
-            chk_conductive_removed = st.radio("Conductive items removed?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_conductive_removed")
-            chk_line_clearance = st.radio("Line clearance obtained?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_line_clearance")
-            chk_briefing = st.radio("Safety briefing done?", ["Y", "N", "NA"], index=None, horizontal=True, key="chk_briefing")
+            chk_tools = st.radio(bi("Tools inspected?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_tools")
+            chk_lighting = st.radio(bi("Adequate lighting?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_lighting")
+            chk_rescue_plan = st.radio(bi("Rescue plan in place?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_rescue_plan")
+            chk_signage = st.radio(bi("Warning signage placed?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_signage")
+            chk_testing_equipment = st.radio(bi("Testing equipment calibrated?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_testing_equipment")
+            chk_conductive_removed = st.radio(bi("Conductive items removed?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_conductive_removed")
+            chk_line_clearance = st.radio(bi("Line clearance obtained?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_line_clearance")
+            chk_briefing = st.radio(bi("Safety briefing done?"), ["Y", "N", "NA"], index=None, horizontal=True, key="chk_briefing")
 
         st.divider()
 
         # ===== SECTION I: Undertaking =====
-        st.markdown('<div class="section-title">📝 I. Undertaking (MANDATORY)</div>', unsafe_allow_html=True)
-        st.markdown("""
-        <div class="warning-banner">
-            <strong>⚠️ Important:</strong> This undertaking must be accepted before submitting the permit.
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(f'<div class="section-title">📝 {bi("I. Undertaking (MANDATORY)")}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="warning-banner">
+                <strong>⚠️ {bi("Important:")}</strong> {bi("This undertaking must be accepted before submitting the permit.")}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         undertaking_accept = st.checkbox(
-            "I have reviewed and understood the risk assessment, safety precautions, and emergency procedures. "
-            "I accept responsibility for ensuring all personnel involved comply with the permit conditions.",
+            bi(
+                "I have reviewed and understood the risk assessment, safety precautions, and emergency procedures. "
+                "I accept responsibility for ensuring all personnel involved comply with the permit conditions."
+            ),
             key="ptw_undertaking"
         )
 
         st.divider()
 
         # ===== SECTION J: People Involved (S1 Level) =====
-        st.markdown('<div class="section-title">👥 J. People Involved</div>', unsafe_allow_html=True)
-        st.caption("At S1 (Request) level: Enter Permit Receiver and Co-workers. Permit Holder and Issuer are assigned at S2 (Approval) level.")
+        st.markdown(f'<div class="section-title">👥 {bi("J. People Involved")}</div>', unsafe_allow_html=True)
+        st.caption(
+            bi("At S1 (Request) level: Enter Permit Receiver and Co-workers. Permit Holder and Issuer are assigned at S2 (Approval) level.")
+        )
 
         ppl_col1, ppl_col2, ppl_col3 = st.columns(3)
         with ppl_col1:
-            receiver_name = st.text_area("Permit Receiver Name *", key="ptw_receiver", height=38)
-            coworker_1 = st.text_area("Co-worker 1", key="ptw_coworker1", height=38)
+            receiver_name = st.text_area(f"{bi('Permit Receiver Name')} *", key="ptw_receiver", height=38)
+            coworker_1 = st.text_area(bi("Co-worker 1"), key="ptw_coworker1", height=38)
         with ppl_col2:
-            coworker_2 = st.text_area("Co-worker 2", key="ptw_coworker2", height=38)
-            coworker_3 = st.text_area("Co-worker 3", key="ptw_coworker3", height=38)
+            coworker_2 = st.text_area(bi("Co-worker 2"), key="ptw_coworker2", height=38)
+            coworker_3 = st.text_area(bi("Co-worker 3"), key="ptw_coworker3", height=38)
         with ppl_col3:
-            coworker_4 = st.text_area("Co-worker 4", key="ptw_coworker4", height=38)
-            coworker_5 = st.text_area("Co-worker 5", key="ptw_coworker5", height=38)
+            coworker_4 = st.text_area(bi("Co-worker 4"), key="ptw_coworker4", height=38)
+            coworker_5 = st.text_area(bi("Co-worker 5"), key="ptw_coworker5", height=38)
 
-        coworker_6 = st.text_area("Co-worker 6", key="ptw_coworker6", height=38)
+        coworker_6 = st.text_area(bi("Co-worker 6"), key="ptw_coworker6", height=38)
 
         st.divider()
 
@@ -3654,7 +3899,7 @@ def _render_request_ptw() -> None:
             # UI-only: next rerun will show progress immediately and run submit without rebuilding the full form first.
             st.session_state["ptw_submit_requested"] = True
         submitted = st.form_submit_button(
-            "Submit PTW",
+            bi("Submit PTW"),
             type="primary",
             width="stretch",
             disabled=is_submitting,
