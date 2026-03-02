@@ -57,23 +57,20 @@ from S1 import (
     generate_ptw_pdf,
 )
 
-# Import S3 approval stamp functions (for applying stamp when PTW is approved)
-try:
-    from S3 import (
-        get_ptw_approval_times,
-        add_floating_approval_stamp,
-        _inject_approval_times_into_form_data,
-    )
-    _HAS_S3_STAMP = True
-except ImportError:
-    _HAS_S3_STAMP = False
+# Shared approval/PDF helpers (breaks S2<->S3 circular imports)
+from ptw_approval_utils import add_floating_approval_stamp, get_ptw_approval_times
+from ptw_pdf_pipeline import (
+    EVIDENCE_BUCKET,
+    _get_content_type,
+    download_evidence_file as _download_evidence_file,
+    generate_ptw_pdf_with_attachments,
+    list_evidence_files as _list_evidence_files,
+)
 
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
-EVIDENCE_BUCKET = "ptw-evidence"
 
 # S2-specific session state prefix
 S2_PREFIX = "s2_"
@@ -93,6 +90,38 @@ def _smooth_progress(prog: Any, start: int, end: int, *, text: str, step_delay_s
     for p in range(start_i, end_i + 1):
         prog.progress(p, text=text)
         _time.sleep(step_delay_s)
+
+
+def modern_section_selector(options: list[str], *, key: str) -> str:
+    """
+    UI-only segmented (pill) selector built with Streamlit buttons.
+    Uses session_state[key] as the single source of truth for selection.
+    """
+    if not options:
+        raise ValueError("options must be a non-empty list")
+
+    if key not in st.session_state:
+        st.session_state[key] = options[0]
+
+    cols = st.columns(len(options))
+    changed = False
+    for i, opt in enumerate(options):
+        is_active = st.session_state.get(key) == opt
+        btn_kind = "primary" if is_active else "secondary"
+        if cols[i].button(
+            opt,
+            key=f"{key}_{i}",
+            use_container_width=True,
+            type=btn_kind,
+        ):
+            if st.session_state.get(key) != opt:
+                st.session_state[key] = opt
+                changed = True
+
+    if changed:
+        st.rerun()
+
+    return str(st.session_state.get(key, options[0]))
 
 
 def _apply_modern_tabs_css() -> None:
@@ -172,10 +201,111 @@ def _apply_modern_tabs_css() -> None:
           .block-container {
             padding-top: 1rem !important;
           }
+
+          /* ==============================================
+             SEGMENTED NAV (pill-style buttons)
+             ============================================== */
+          /* Segmented button container spacing */
+          div[data-testid="column"] {
+              padding: 0px 4px !important;
+          }
+
+          /* Button styling */
+          .stButton > button {
+              border-radius: 12px !important;
+              font-weight: 700 !important;
+              height: 45px !important;
+              border: 1px solid rgba(148,163,184,0.35) !important;
+              transition: all 0.2s ease-in-out !important;
+          }
+
+          /* Secondary style (inactive) */
+          .stButton > button[kind="secondary"] {
+              background-color: rgba(226,232,240,0.35) !important;
+              color: #0f172a !important;
+          }
+
+          /* Primary style (active) */
+          .stButton > button[kind="primary"] {
+              background: linear-gradient(135deg, rgba(37,99,235,0.14), rgba(59,130,246,0.09)) !important;
+              border: 1px solid rgba(37,99,235,0.35) !important;
+              color: #0b2a6f !important;
+              box-shadow: 0 8px 20px rgba(15,23,42,0.08) !important;
+          }
+
+          .stButton > button:hover {
+              transform: translateY(-1px);
+          }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def _compute_s2_kpis_from_work_orders(*, start_date: date, end_date: date) -> dict[str, int]:
+    """
+    UI-only KPI computation for S2 "View Submitted PTW".
+
+    Requirements:
+    - Must be computed from `work_orders` only (NOT ptw_requests, NOT derive_ptw_status)
+    - Must respect the selected date range, using stage-specific lifecycle dates:
+      - Pending @ S2 uses date_s1_created
+      - Pending @ S3 uses date_s2_forwarded
+      - Approved uses date_s3_approved
+    - Must be recalculated only when the user clicks "Fetch PTWs" (same rerun that fetches data)
+    - Rejected KPI is intentionally omitted from the UI.
+    """
+    start_iso = start_date.strftime("%Y-%m-%d")
+    end_iso = (end_date + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    sb = get_supabase_client(prefer_service_role=True)
+
+    # ----------------------------
+    # Pending at S2
+    # ----------------------------
+    res_s2 = (
+        sb.table(TABLE_WORK_ORDERS)
+        .select("work_order_id")
+        .gte("date_s1_created", start_iso)
+        .lt("date_s1_created", end_iso)
+        .is_("date_s2_forwarded", "null")
+        .execute()
+    )
+    pending_s2 = len(getattr(res_s2, "data", None) or [])
+
+    # ----------------------------
+    # Pending at S3
+    # ----------------------------
+    res_s3 = (
+        sb.table(TABLE_WORK_ORDERS)
+        .select("work_order_id")
+        .gte("date_s2_forwarded", start_iso)
+        .lt("date_s2_forwarded", end_iso)
+        .is_("date_s3_approved", "null")
+        .execute()
+    )
+    pending_s3 = len(getattr(res_s3, "data", None) or [])
+
+    # ----------------------------
+    # Approved
+    # ----------------------------
+    res_approved = (
+        sb.table(TABLE_WORK_ORDERS)
+        .select("work_order_id")
+        .gte("date_s3_approved", start_iso)
+        .lt("date_s3_approved", end_iso)
+        .execute()
+    )
+    approved = len(getattr(res_approved, "data", None) or [])
+
+    total = int(pending_s2 + pending_s3 + approved)
+
+    return {
+        "total": int(total),
+        "pending_s2": int(pending_s2),
+        "pending_s3": int(pending_s3),
+        "approved": int(approved),
+    }
 
 
 # =============================================================================
@@ -266,334 +396,6 @@ def _upload_evidence_file(
                 "Please create it in Supabase Dashboard > Storage > Create a new bucket."
             ) from e
         raise RuntimeError(f"Failed to upload evidence file: {e}") from e
-
-
-def _get_content_type(ext: str) -> str:
-    """Get MIME content type from file extension."""
-    content_types = {
-        ".pdf": "application/pdf",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
-    return content_types.get(ext.lower(), "application/octet-stream")
-
-
-def _list_evidence_files(work_order_id: str, evidence_type: str) -> list[dict]:
-    """
-    List existing evidence files for a work order.
-    
-    Returns list of dicts with 'name', 'path', and 'url' keys.
-    """
-    sb = get_supabase_client(prefer_service_role=True)
-    
-    try:
-        folder_path = f"{work_order_id}/{evidence_type}"
-        resp = sb.storage.from_(EVIDENCE_BUCKET).list(folder_path)
-        
-        if not resp:
-            return []
-        
-        files = []
-        for item in resp:
-            if isinstance(item, dict) and item.get("name"):
-                file_path = f"{folder_path}/{item['name']}"
-                files.append({
-                    "name": item["name"],
-                    "path": file_path,
-                })
-        return files
-    
-    except Exception:
-        return []
-
-
-def _download_evidence_file(file_path: str) -> bytes | None:
-    """Download an evidence file from Supabase Storage."""
-    sb = get_supabase_client(prefer_service_role=True)
-    
-    try:
-        resp = sb.storage.from_(EVIDENCE_BUCKET).download(file_path)
-        return resp
-    except Exception:
-        return None
-
-
-def _get_evidence_public_url(file_path: str) -> str | None:
-    """Get public URL for an evidence file (signed URL for private buckets)."""
-    sb = get_supabase_client(prefer_service_role=True)
-    
-    try:
-        # Create signed URL valid for 1 hour
-        resp = sb.storage.from_(EVIDENCE_BUCKET).create_signed_url(file_path, 3600)
-        if resp and "signedURL" in resp:
-            return resp["signedURL"]
-        return None
-    except Exception:
-        return None
-
-
-# =============================================================================
-# PDF WITH ATTACHMENTS
-# =============================================================================
-
-
-def _create_attachments_page(
-    isolation_files: list[dict],
-    toolbox_files: list[dict],
-    work_order_id: str,
-) -> bytes | None:
-    """
-    Create a PDF page with attachment thumbnails/references.
-    
-    Args:
-        isolation_files: List of isolation evidence files
-        toolbox_files: List of toolbox evidence files
-        work_order_id: The work order ID for reference
-    
-    Returns:
-        PDF bytes for the attachments page, or None if no files
-    """
-    if not isolation_files and not toolbox_files:
-        return None
-    
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    max_width = width - 120
-
-    styles = getSampleStyleSheet()
-    normal_style = styles["Normal"]
-
-    def draw_wrapped_text(text: str, x: float, y: float, max_w: float) -> float:
-        """Draw text with wrapping; return new y position."""
-        text_esc = (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        p = Paragraph(text_esc, normal_style)
-        w, h = p.wrap(max_w, 100)
-        p.drawOn(c, x, y - h)
-        return y - h - 5
-
-    y_position = height - 50
-    
-    # Header
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, y_position, "EVIDENCE ATTACHMENTS")
-    y_position -= 10
-    
-    c.setFont("Helvetica", 10)
-    c.drawString(50, y_position, f"Work Order: {work_order_id}")
-    y_position -= 5
-    c.drawString(50, y_position, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    y_position -= 30
-    
-    # Draw line separator
-    c.line(50, y_position, width - 50, y_position)
-    y_position -= 20
-    
-    def add_section(title: str, files: list[dict], y_pos: float) -> float:
-        if not files:
-            return y_pos
-        
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(50, y_pos, title)
-        y_pos -= 20
-        
-        for idx, file_info in enumerate(files):
-            file_name = file_info.get("name", "Unknown")
-            file_path = file_info.get("path", "")
-            
-            # Check if we need a new page
-            if y_pos < 150:
-                c.showPage()
-                y_pos = height - 50
-            
-            # Try to embed image if it's an image file
-            ext = os.path.splitext(file_name)[1].lower()
-            is_image = ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]
-            
-            if is_image:
-                # Download and embed the image
-                file_bytes = _download_evidence_file(file_path)
-                if file_bytes:
-                    try:
-                        img = Image.open(BytesIO(file_bytes))
-                        
-                        # Resize to fit (max 200x150)
-                        max_width, max_height = 200, 150
-                        img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-                        
-                        # Convert to RGB if necessary
-                        if img.mode in ('RGBA', 'P'):
-                            img = img.convert('RGB')
-                        
-                        img_buffer = BytesIO()
-                        img.save(img_buffer, format='JPEG', quality=85)
-                        img_buffer.seek(0)
-                        
-                        img_reader = ImageReader(img_buffer)
-                        
-                        # Draw image
-                        c.drawImage(img_reader, 50, y_pos - img.height, 
-                                   width=img.width, height=img.height)
-                        
-                        # Draw file name below image (wrapped)
-                        c.setFont("Helvetica", 9)
-                        y_pos = draw_wrapped_text(f"{idx + 1}. {file_name}", 50, y_pos - img.height - 15, max_width)
-                        y_pos -= 20
-                        
-                    except Exception:
-                        # Fallback to text reference
-                        c.setFont("Helvetica", 10)
-                        y_pos = draw_wrapped_text(f"{idx + 1}. {file_name} (image)", 70, y_pos, max_width)
-                        y_pos -= 15
-                else:
-                    c.setFont("Helvetica", 10)
-                    y_pos = draw_wrapped_text(f"{idx + 1}. {file_name} (image - unable to load)", 70, y_pos, max_width)
-                    y_pos -= 15
-            else:
-                # For PDFs and other documents, just list them
-                c.setFont("Helvetica", 10)
-                y_pos = draw_wrapped_text(f"{idx + 1}. {file_name}", 70, y_pos, max_width)
-                y_pos -= 15
-        
-        y_pos -= 10
-        return y_pos
-    
-    # Add sections
-    y_position = add_section("ISOLATION EVIDENCE", isolation_files, y_position)
-    y_position = add_section("TOOLBOX TALK EVIDENCE", toolbox_files, y_position)
-    
-    c.save()
-    buffer.seek(0)
-    return buffer.read()
-
-
-def _merge_pdfs(main_pdf: bytes, attachments_pdf: bytes | None) -> bytes:
-    """Merge main PTW PDF with attachments page."""
-    if not attachments_pdf:
-        return main_pdf
-    
-    try:
-        writer = PdfWriter()
-        
-        # Add main PDF pages
-        main_reader = PdfReader(BytesIO(main_pdf))
-        for page in main_reader.pages:
-            writer.add_page(page)
-        
-        # Add attachments page(s)
-        attachments_reader = PdfReader(BytesIO(attachments_pdf))
-        for page in attachments_reader.pages:
-            writer.add_page(page)
-        
-        # Write merged PDF
-        output = BytesIO()
-        writer.write(output)
-        output.seek(0)
-        return output.read()
-        
-    except Exception:
-        # If merge fails, return original PDF
-        return main_pdf
-
-
-def generate_ptw_pdf_with_attachments(
-    form_data: dict,
-    work_order_id: str,
-    progress_callback=None,
-) -> bytes:
-    """
-    Generate PTW PDF with evidence attachments on the last page.
-    
-    If the PTW is S3-approved (date_s3_approved is set), the APPROVED stamp
-    will be applied to every page of the PDF.
-    
-    Args:
-        form_data: The PTW form data
-        work_order_id: Work order ID for fetching attachments
-        progress_callback: Optional callback function for progress updates
-    
-    Returns:
-        Complete PDF bytes with attachments (and APPROVED stamp if approved)
-    """
-    if progress_callback:
-        progress_callback(5, "Checking approval status...")
-    
-    # Check if PTW is S3-approved and inject approval timestamps
-    is_s3_approved = False
-    approval_times = {}
-    updated_form_data = dict(form_data) if form_data else {}
-    
-    # Always inject holder/issuer timestamps AND signatures for template placeholders
-    try:
-        approval_times = get_ptw_approval_times(work_order_id)
-        is_s3_approved = bool(approval_times.get("date_s3_approved_raw"))
-
-        if approval_times.get("holder_datetime"):
-            updated_form_data["holder_datetime"] = approval_times["holder_datetime"]
-        if is_s3_approved and approval_times.get("issuer_datetime"):
-            updated_form_data["issuer_datetime"] = approval_times["issuer_datetime"]
-    except Exception:
-        pass  # Continue without injected times if unavailable
-    
-    # Inject signatures from names (required for PDF template placeholders)
-    holder_name = updated_form_data.get("holder_name") or updated_form_data.get("permit_holder_name") or ""
-    issuer_name = updated_form_data.get("issuer_name") or updated_form_data.get("permit_issuer_name") or ""
-    
-    if holder_name and not updated_form_data.get("holder_signature"):
-        updated_form_data["holder_signature"] = holder_name
-    if issuer_name and not updated_form_data.get("issuer_signature"):
-        updated_form_data["issuer_signature"] = issuer_name
-    
-    if progress_callback:
-        progress_callback(10, "Downloading template...")
-    
-    # Generate main PDF
-    template_bytes = _download_template_from_supabase()
-    
-    if progress_callback:
-        progress_callback(30, "Generating PTW document...")
-    
-    doc_data = build_doc_data(updated_form_data)
-    main_pdf = generate_ptw_pdf(template_bytes, doc_data, progress_callback=progress_callback)
-    
-    if progress_callback:
-        progress_callback(50, "Fetching evidence files...")
-    
-    # Get evidence files
-    isolation_files = _list_evidence_files(work_order_id, "isolation")
-    toolbox_files = _list_evidence_files(work_order_id, "toolbox")
-    
-    if progress_callback:
-        progress_callback(70, "Creating attachments page...")
-    
-    # Create attachments page
-    attachments_pdf = _create_attachments_page(isolation_files, toolbox_files, work_order_id)
-    
-    if progress_callback:
-        progress_callback(85, "Merging documents...")
-    
-    # Merge PDFs
-    final_pdf = _merge_pdfs(main_pdf, attachments_pdf)
-    
-    # Apply APPROVED stamp if PTW is S3-approved
-    if is_s3_approved and _HAS_S3_STAMP:
-        if progress_callback:
-            progress_callback(95, "Applying approval stamp...")
-        try:
-            final_pdf = add_floating_approval_stamp(
-                final_pdf,
-                approved_on=approval_times.get("issuer_datetime", ""),
-            )
-        except Exception:
-            pass  # Continue without stamp if error
-    
-    if progress_callback:
-        progress_callback(100, "Complete!")
-    
-    return final_pdf
 
 
 # =============================================================================
@@ -830,11 +632,13 @@ def _update_work_order_s2_forwarded(
     
     resp = (
         sb.table(TABLE_WORK_ORDERS)
-        .update({
-            "date_s2_forwarded": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(sep=" ", timespec="seconds"),
-            "isolation_requirement": isolation_requirement,
-        })
-        .eq("work_order_id", work_order_id)
+        .update(
+            {
+                "date_s2_forwarded": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(sep=" ", timespec="seconds"),
+                "isolation_requirement": isolation_requirement,
+            }
+        )
+        .in_("work_order_id", [str(work_order_id).strip()])
         .execute()
     )
     
@@ -854,7 +658,7 @@ def _revoke_s2_submission(work_order_id: str) -> None:
     resp = (
         sb.table(TABLE_WORK_ORDERS)
         .update({"date_s2_forwarded": None})
-        .eq("work_order_id", work_order_id)
+        .in_("work_order_id", [str(work_order_id).strip()])
         .execute()
     )
     
@@ -874,13 +678,148 @@ def _extract_work_order_ids_from_form_data(*, work_order_id: str, form_data: dic
 
 
 def _update_work_orders_s2_forwarded(*, work_order_ids: list[str], isolation_requirement: str) -> None:
-    for woid in [str(x).strip() for x in (work_order_ids or []) if str(x).strip()]:
-        _update_work_order_s2_forwarded(woid, isolation_requirement)
+    from ptw_lifecycle_utils import _update_all_work_orders_lifecycle
+
+    _update_all_work_orders_lifecycle(
+        work_order_ids=[str(x).strip() for x in (work_order_ids or []) if str(x).strip()],
+        update_fields={
+            "date_s2_forwarded": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(sep=" ", timespec="seconds"),
+            "isolation_requirement": isolation_requirement,
+        },
+    )
 
 
 def _revoke_s2_submissions(*, work_order_ids: list[str]) -> None:
-    for woid in [str(x).strip() for x in (work_order_ids or []) if str(x).strip()]:
-        _revoke_s2_submission(woid)
+    from ptw_lifecycle_utils import _update_all_work_orders_lifecycle
+
+    _update_all_work_orders_lifecycle(
+        work_order_ids=[str(x).strip() for x in (work_order_ids or []) if str(x).strip()],
+        update_fields={"date_s2_forwarded": None},
+    )
+
+
+# =============================================================================
+# CREATE WORK ORDER — DATA HELPERS
+# =============================================================================
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _cwo_fetch_sites() -> list[str]:
+    """Return distinct site_name values from work_orders."""
+    sb = get_supabase_client(prefer_service_role=True)
+    resp = sb.table(TABLE_WORK_ORDERS).select("site_name").execute()
+    rows = getattr(resp, "data", None) or []
+    return sorted({str(r["site_name"]).strip() for r in rows if r.get("site_name") and str(r["site_name"]).strip()})
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _cwo_fetch_locations() -> list[str]:
+    """Return distinct location tokens from work_orders (handles comma-separated storage)."""
+    sb = get_supabase_client(prefer_service_role=True)
+    resp = sb.table(TABLE_WORK_ORDERS).select("location").execute()
+    rows = getattr(resp, "data", None) or []
+    values: set[str] = set()
+    for r in rows:
+        for part in str(r.get("location") or "").split(","):
+            part = part.strip()
+            if part:
+                values.add(part)
+    return sorted(values)
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _cwo_fetch_equipment() -> list[str]:
+    """Return distinct equipment tokens from work_orders (handles comma-separated storage)."""
+    sb = get_supabase_client(prefer_service_role=True)
+    resp = sb.table(TABLE_WORK_ORDERS).select("equipment").execute()
+    rows = getattr(resp, "data", None) or []
+    values: set[str] = set()
+    for r in rows:
+        for part in str(r.get("equipment") or "").split(","):
+            part = part.strip()
+            if part:
+                values.add(part)
+    return sorted(values)
+
+
+_CWO_FREQUENCIES = ["D", "W", "Q", "HY", "Y", "UP"]
+
+
+def _cwo_insert_work_order(
+    *,
+    site_name: str,
+    location: list[str],
+    equipment: list[str],
+    frequency: str,
+    isolation_requirement: str,
+    date_planned: date,
+) -> str:
+    """
+    Insert a new work_orders row.
+    work_order_id is NOT sent — auto-generated by trg_work_orders_generate_id.
+    Multi-select values stored as comma-separated strings.
+    Returns the auto-generated work_order_id or empty string.
+    """
+    sb = get_supabase_client(prefer_service_role=True)
+    date_planned_str = datetime.combine(date_planned, datetime.min.time()).strftime("%Y-%m-%d %H:%M:%S")
+    payload = {
+        "site_name": site_name.strip(),
+        "location": ",".join(x.strip() for x in location if x.strip()),
+        "equipment": ",".join(x.strip() for x in equipment if x.strip()),
+        "frequency": frequency,
+        "isolation_requirement": isolation_requirement,
+        "date_planned": date_planned_str,
+        "status": "OPEN",
+    }
+    resp = sb.table(TABLE_WORK_ORDERS).insert(payload).execute()
+    err = getattr(resp, "error", None)
+    if err:
+        raise RuntimeError(f"Failed to create Work Order: {err}")
+    rows = getattr(resp, "data", None) or []
+    if rows and isinstance(rows[0], dict):
+        return str(rows[0].get("work_order_id") or "")
+    return ""
+
+
+def _cwo_update_work_order(
+    *,
+    work_order_id: str,
+    site_name: str,
+    location: list[str],
+    equipment: list[str],
+    frequency: str,
+    isolation_requirement: str,
+    date_planned: date,
+) -> None:
+    """
+    Update work order ONLY when date_s1_created IS NULL (atomic guard).
+    Raises RuntimeError if the update is blocked or the DB returns an error.
+    """
+    sb = get_supabase_client(prefer_service_role=True)
+    date_planned_str = datetime.combine(date_planned, datetime.min.time()).strftime("%Y-%m-%d %H:%M:%S")
+    payload = {
+        "site_name": site_name.strip(),
+        "location": ",".join(x.strip() for x in location if x.strip()),
+        "equipment": ",".join(x.strip() for x in equipment if x.strip()),
+        "frequency": frequency,
+        "isolation_requirement": isolation_requirement,
+        "date_planned": date_planned_str,
+    }
+    resp = (
+        sb.table(TABLE_WORK_ORDERS)
+        .update(payload)
+        .eq("work_order_id", work_order_id)
+        .is_("date_s1_created", "null")
+        .execute()
+    )
+    err = getattr(resp, "error", None)
+    if err:
+        raise RuntimeError(f"Update failed: {err}")
+    rows = getattr(resp, "data", None) or []
+    if not rows:
+        raise RuntimeError(
+            "Update blocked: Work Order may already have an initiated PTW (date_s1_created is set)."
+        )
 
 
 # =============================================================================
@@ -1134,24 +1073,44 @@ def _render_view_submitted_ptw_body() -> None:
             if st.button("Fetch PTWs", type="primary", key="s2_fetch_ptw"):
                 st.session_state["s2_ptw_fetch_requested"] = True
 
-        # Heavy work: only when requested or after refresh, with spinner to avoid flicker
+        # Heavy work: only when requested or after refresh
         if st.session_state.get("s2_ptw_fetch_requested") or st.session_state.get("refresh_s2"):
+            fetch_clicked = bool(st.session_state.get("s2_ptw_fetch_requested"))
             st.session_state["s2_ptw_fetch_requested"] = False
             st.session_state["refresh_s2"] = False
-            with st.spinner("Fetching submitted PTWs..."):
-                progress_slot = st.empty()
-                prog = progress_slot.progress(0, text="Fetching submitted PTWs...")
-                try:
-                    _smooth_progress(prog, 0, 20, text="Validating date range...")
-                    _smooth_progress(prog, 20, 70, text="Loading from database...")
-                    df = _fetch_ptw_for_s2(start_date=start_date, end_date=end_date)
-                    st.session_state["s2_ptw_view_df"] = df
-                    _smooth_progress(prog, 70, 100, text="PTWs ready")
-                except Exception as e:
-                    st.error(f"Failed to fetch PTW requests: {e}")
-                    st.session_state["s2_ptw_view_df"] = pd.DataFrame()
-                finally:
-                    progress_slot.empty()
+            progress_slot = st.empty()
+            prog = progress_slot.progress(0, text="Fetching submitted PTWs...")
+            try:
+                _smooth_progress(prog, 0, 20, text="Validating date range...")
+                _smooth_progress(prog, 20, 70, text="Loading from database...")
+                df = _fetch_ptw_for_s2(start_date=start_date, end_date=end_date)
+                st.session_state["s2_ptw_view_df"] = df
+                # KPI snapshot: ONLY recompute on explicit Fetch PTWs click (requirement).
+                if fetch_clicked:
+                    try:
+                        st.session_state["s2_vsp_kpis"] = _compute_s2_kpis_from_work_orders(
+                            start_date=start_date, end_date=end_date
+                        )
+                    except Exception:
+                        st.session_state["s2_vsp_kpis"] = {
+                            "total": 0,
+                            "pending_s2": 0,
+                            "pending_s3": 0,
+                            "approved": 0,
+                        }
+                _smooth_progress(prog, 70, 100, text="PTWs ready")
+            except Exception as e:
+                st.error(f"Failed to fetch PTW requests: {e}")
+                st.session_state["s2_ptw_view_df"] = pd.DataFrame()
+                if fetch_clicked:
+                    st.session_state["s2_vsp_kpis"] = {
+                        "total": 0,
+                        "pending_s2": 0,
+                        "pending_s3": 0,
+                        "approved": 0,
+                    }
+            finally:
+                progress_slot.empty()
 
     _filters_block()
     
@@ -1165,14 +1124,12 @@ def _render_view_submitted_ptw_body() -> None:
         st.info("No submitted PTWs found for the selected date range.")
         return
     
-    # Summary metrics (modern KPI cards, S2 display statuses)
-    total = int(len(df))
-
-    st_status = df["status"].astype("string").fillna("").str.upper()
-    pending_s2_count = int((st_status == "PENDING_AT_S2").sum())
-    pending_s3_count = int((st_status == "PENDING_AT_S3").sum())
-    approved_count = int((st_status == "APPROVED_BY_S3").sum())
-    rejected_count = int((st_status == "REJECTED").sum())
+    # Summary metrics (modern KPI cards) — computed from work_orders only.
+    k = st.session_state.get("s2_vsp_kpis") or {}
+    total = int(k.get("total", 0) or 0)
+    pending_s2_count = int(k.get("pending_s2", 0) or 0)
+    pending_s3_count = int(k.get("pending_s3", 0) or 0)
+    approved_count = int(k.get("approved", 0) or 0)
 
     st.markdown(
         f"""
@@ -1195,11 +1152,6 @@ def _render_view_submitted_ptw_body() -> None:
           <div class="kpi-card">
             <div class="kpi-title">Approved</div>
             <div class="kpi-value" style="color:#10b981;">{approved_count}</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-title">Rejected</div>
-            <div class="kpi-value" style="color:#dc2626;">{rejected_count}</div>
           </div>
         </div>
         """,
@@ -1407,26 +1359,58 @@ def _render_forwarded_ptw_card(
     
     # Non-destructive action: Download PDF
     st.markdown("### 📥 Available Actions")
-    
-    if st.button("⬇️ Download PTW PDF", key=f"download_pdf_{ptw_id}", use_container_width=True):
-        with st.spinner("Generating PDF..."):
+
+    dl_req_key = f"s2_vsp_fwd_dl_{work_order_id}_requested"
+    dl_cache_key = f"s2_vsp_fwd_dl_{work_order_id}_bytes"
+    if dl_req_key not in st.session_state:
+        st.session_state[dl_req_key] = False
+    if dl_cache_key not in st.session_state:
+        st.session_state[dl_cache_key] = None
+
+    def _on_dl() -> None:
+        st.session_state[dl_req_key] = True
+
+    st.button("⬇️ Generate PDF", key=f"s2_vsp_fwd_dl_{ptw_id}", use_container_width=True, on_click=_on_dl)
+
+    if st.session_state.get(dl_req_key):
+        st.session_state[dl_req_key] = False  # RESET IMMEDIATELY
+        prog_slot = st.empty()
+        prog = prog_slot.progress(0, text="Generating PDF...")
+        try:
+            def progress_callback(pct, msg):
+                prog.progress(int(pct), text=msg)
+
+            pdf_bytes = generate_ptw_pdf_with_attachments(
+                form_data=form_data,
+                work_order_id=work_order_id,
+                progress_callback=progress_callback,
+            )
+            # If already S3-approved, apply stamp AFTER attachments merge.
             try:
-                pdf_bytes = generate_ptw_pdf_with_attachments(
-                    form_data=form_data,
-                    work_order_id=work_order_id,
-                )
-                
-                st.download_button(
-                    label="📄 Download PTW PDF",
-                    data=pdf_bytes,
-                    file_name=f"{work_order_id}_PTW.pdf",
-                    mime="application/pdf",
-                    key=f"download_btn_{ptw_id}",
-                    use_container_width=True,
-                )
-                st.success("✅ PDF generated successfully!")
-            except Exception as e:
-                st.error(f"❌ Failed to generate PDF: {e}")
+                approval_times = get_ptw_approval_times(work_order_id)
+                if approval_times.get("date_s3_approved_raw"):
+                    pdf_bytes = add_floating_approval_stamp(
+                        pdf_bytes, approved_on=approval_times.get("issuer_datetime", "")
+                    )
+            except Exception:
+                pass
+
+            st.session_state[dl_cache_key] = pdf_bytes
+        except Exception as e:
+            st.error(f"❌ Failed to generate PDF: {e}")
+        finally:
+            prog_slot.empty()
+
+    cached_pdf = st.session_state.get(dl_cache_key)
+    if isinstance(cached_pdf, (bytes, bytearray)) and len(cached_pdf) > 0:
+        st.download_button(
+            label="📄 Download PTW PDF",
+            data=cached_pdf,
+            file_name=f"{work_order_id}_PTW.pdf",
+            mime="application/pdf",
+            key=f"s2_vsp_fwd_dl_btn_{ptw_id}",
+            use_container_width=True,
+        )
 
 
 def _render_post_submit_view(
@@ -1700,7 +1684,14 @@ def _render_ptw_detail_body(
                     prog = prog_slot.progress(0, text="Revoking...")
                     try:
                         _smooth_progress(prog, 0, 60, text="Updating database...")
-                        wo_ids = _extract_work_order_ids_from_form_data(work_order_id=work_order_id, form_data=form_data)
+                        from ptw_lifecycle_utils import _get_all_work_order_ids_for_ptw
+                        wo_ids = _get_all_work_order_ids_for_ptw(
+                            ptw_id=str(ptw_id),
+                            permit_no=str(work_order_id),
+                            form_data=form_data,
+                        )
+                        if len(wo_ids) > 1:
+                            st.info(f"Atomic lifecycle update: {len(wo_ids)} linked work orders updated together.")
                         _revoke_s2_submissions(work_order_ids=wo_ids)
                         _smooth_progress(prog, 60, 100, text="Done")
                         prog_slot.empty()
@@ -1742,6 +1733,15 @@ def _render_ptw_detail_body(
                         work_order_id=work_order_id,
                         progress_callback=progress_callback,
                     )
+                    # If already S3-approved, apply stamp AFTER attachments merge.
+                    try:
+                        approval_times = get_ptw_approval_times(work_order_id)
+                        if approval_times.get("date_s3_approved_raw"):
+                            pdf_bytes = add_floating_approval_stamp(
+                                pdf_bytes, approved_on=approval_times.get("issuer_datetime", "")
+                            )
+                    except Exception:
+                        pass
                     st.session_state[dl_cache] = pdf_bytes
                 except Exception as e:
                     st.error(f"Failed to generate PDF: {e}")
@@ -1788,16 +1788,48 @@ def _render_ptw_detail_body(
     
     # Section C: Isolation Requirement (MANDATORY)
     st.markdown("### C. Isolation Requirement (Required)")
-    
-    current_isolation = form_data.get("isolation_required", "")
-    isolation_idx = 0 if current_isolation.upper() != "NO" else 1
-    isolation_required = st.radio(
-        "Is Isolation Required? *",
-        options=["YES", "NO"],
-        index=isolation_idx,
-        key=f"{key_prefix}isolation_required",
-        horizontal=True,
-    )
+
+    # Enforce work_order-level isolation: if ANY linked work_order has
+    # isolation_requirement == "YES", lock the reviewer's choice to YES.
+    _wo_isolation_required = "NO"
+    try:
+        from ptw_lifecycle_utils import _get_all_work_order_ids_for_ptw
+        _linked_ids = _get_all_work_order_ids_for_ptw(
+            ptw_id=ptw_id,
+            permit_no=work_order_id,
+            form_data=form_data,
+        )
+        _sb = get_supabase_client(prefer_service_role=True)
+        _iso_resp = (
+            _sb.table(TABLE_WORK_ORDERS)
+            .select("isolation_requirement")
+            .in_("work_order_id", _linked_ids or [work_order_id])
+            .execute()
+        )
+        _iso_rows = getattr(_iso_resp, "data", None) or []
+        # If ANY linked WO requires isolation, mandate it for the whole PTW
+        if any(str(r.get("isolation_requirement") or "").upper().strip() == "YES" for r in _iso_rows):
+            _wo_isolation_required = "YES"
+    except Exception:
+        pass
+
+    wo_mandates_isolation = _wo_isolation_required == "YES"
+
+    if wo_mandates_isolation:
+        st.info("ℹ️ Isolation required as per Work Order. This cannot be changed.")
+        isolation_required = "YES"
+        # Keep session state in sync so downstream logic reads the correct value
+        st.session_state[f"{key_prefix}isolation_required"] = "YES"
+    else:
+        current_isolation = form_data.get("isolation_required", "")
+        isolation_idx = 0 if current_isolation.upper() != "NO" else 1
+        isolation_required = st.radio(
+            "Is Isolation Required? *",
+            options=["YES", "NO"],
+            index=isolation_idx,
+            key=f"{key_prefix}isolation_required",
+            horizontal=True,
+        )
     
     # File upload for isolation evidence (mandatory if YES)
     existing_isolation_files = _list_evidence_files(work_order_id, "isolation")
@@ -2033,8 +2065,25 @@ def _handle_s2_submit(
         progress.progress(75, text="Forwarding to S3...")
         status_msg.info("Forwarding PTW for final approval...")
         
-        wo_ids = _extract_work_order_ids_from_form_data(work_order_id=work_order_id, form_data=updated_form)
-        _update_work_orders_s2_forwarded(work_order_ids=wo_ids, isolation_requirement=isolation_required)
+        from ptw_lifecycle_utils import (
+            _get_all_work_order_ids_for_ptw,
+            _update_all_work_orders_lifecycle,
+        )
+
+        wo_ids = _get_all_work_order_ids_for_ptw(
+            ptw_id=str(ptw_id),
+            permit_no=str(work_order_id),
+            form_data=updated_form,
+        )
+        if len(wo_ids) > 1:
+            st.info(f"Atomic lifecycle update: {len(wo_ids)} linked work orders updated together.")
+        _update_all_work_orders_lifecycle(
+            work_order_ids=wo_ids,
+            update_fields={
+                "date_s2_forwarded": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(sep=" ", timespec="seconds"),
+                "isolation_requirement": isolation_required,
+            },
+        )
         
         # Step 4: Done
         progress.progress(100, text="Complete!")
@@ -2056,6 +2105,463 @@ def _handle_s2_submit(
         st.error(f"Failed to submit: {e}")
         # Avoid showing stack traces to end users in production UI
         return None
+
+
+# =============================================================================
+# CREATE WORK ORDER — UI
+# =============================================================================
+
+_CWO_PREFIX = "s2_cwo_"
+
+# Session state key for the last successfully created/updated WO id
+_CWO_LAST_CREATED_KEY = f"{_CWO_PREFIX}last_created"
+_CWO_LAST_UPDATED_KEY = f"{_CWO_PREFIX}last_updated"
+
+
+def _cwo_reset_form_state(*, keep_success: bool = False) -> None:
+    """
+    Clear all Create Work Order form keys so the form renders blank.
+
+    Bumps the form version counter so Streamlit constructs a truly fresh
+    st.form instance (just deleting widget keys is not enough for st.form).
+
+    keep_success=True preserves _CWO_LAST_CREATED_KEY / _CWO_LAST_UPDATED_KEY
+    so the success card can remain visible while the form below it is blank
+    (used after successful insert so the card shows but form is empty).
+    """
+    field_keys = [
+        f"{_CWO_PREFIX}site",
+        f"{_CWO_PREFIX}location",
+        f"{_CWO_PREFIX}equipment",
+        f"{_CWO_PREFIX}freq",
+        f"{_CWO_PREFIX}isolation",
+        f"{_CWO_PREFIX}date_planned",
+        f"{_CWO_PREFIX}edit_id",
+    ]
+    filter_keys = [
+        f"{_CWO_PREFIX}filter_site",
+        f"{_CWO_PREFIX}filter_start",
+        f"{_CWO_PREFIX}filter_end",
+        f"{_CWO_PREFIX}preview_df",
+    ]
+    for k in field_keys + filter_keys:
+        st.session_state.pop(k, None)
+    if not keep_success:
+        st.session_state.pop(_CWO_LAST_CREATED_KEY, None)
+        st.session_state.pop(_CWO_LAST_UPDATED_KEY, None)
+    # Bump form version → forces a fresh st.form with a new key on next render
+    st.session_state[f"{_CWO_PREFIX}form_version"] = (
+        st.session_state.get(f"{_CWO_PREFIX}form_version", 0) + 1
+    )
+
+
+def _cwo_check_edit_eligibility_live(work_order_id: str) -> bool:
+    """
+    Live Supabase read: returns True (edit allowed) when date_s1_created IS NULL.
+    Does NOT rely on any cached dataframe or derived status.
+    """
+    try:
+        sb = get_supabase_client(prefer_service_role=True)
+        resp = (
+            sb.table(TABLE_WORK_ORDERS)
+            .select("date_s1_created")
+            .eq("work_order_id", work_order_id)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+        if not rows:
+            return True  # Row not found — allow optimistically; DB update guard will protect
+        d1c = rows[0].get("date_s1_created")
+        return d1c is None or str(d1c).strip() in ("", "None", "NaT", "nan")
+    except Exception:
+        return True  # Fail-open; DB update's .is_("date_s1_created", "null") is the real guard
+
+
+def _render_create_work_order() -> None:
+    """
+    S2 — Create Work Order sub-section.
+
+    Design contract:
+    - NO st.rerun() after a successful create/update → prevents flicker.
+    - Success state is persisted in session_state so the card survives reruns.
+    - Progress bar renders in the SAME run as the submit (form reruns on submit).
+    - Preview fetch has its own progress animation.
+    - Edit eligibility uses a live DB read, NOT cached df or derived status.
+    """
+    st.markdown("## Create Work Order")
+    st.caption("Create and manage work orders. Once an S1 PTW is initiated, editing is locked.")
+
+    # ── Load dropdown options (cached, progress shown only on cache-miss) ──────
+    _opt_slot = st.empty()
+    try:
+        sites = _cwo_fetch_sites()
+        all_locations = _cwo_fetch_locations()
+        all_equipment = _cwo_fetch_equipment()
+    except Exception as e:
+        _opt_slot.empty()
+        st.error(f"Failed to load options: {e}")
+        return
+    _opt_slot.empty()
+
+    # ── Persistent success card (survives reruns until "Create Another") ───────
+    last_created = st.session_state.get(_CWO_LAST_CREATED_KEY)
+    last_updated = st.session_state.get(_CWO_LAST_UPDATED_KEY)
+
+    if last_created:
+        st.markdown(
+            f"""
+            <div style="
+                padding:20px;border-radius:12px;
+                background:linear-gradient(135deg,#e0f2fe,#f0fdf4);
+                border:1px solid #10b981;
+                box-shadow:0 6px 18px rgba(15,23,42,0.08);
+                margin-bottom:12px;
+            ">
+                <h3 style="margin:0;color:#065f46;">✅ Work Order Created Successfully</h3>
+                <p style="margin-top:8px;font-size:18px;font-weight:600;">
+                    Work Order ID: <span style="color:#2563eb;">{last_created}</span>
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("➕ Create Another Work Order", key=f"{_CWO_PREFIX}create_another", type="primary"):
+            _cwo_reset_form_state()
+            st.cache_data.clear()
+            st.rerun()
+        st.divider()
+
+    elif last_updated:
+        st.success(f"✅ Work Order **{last_updated}** updated successfully.")
+        if st.button("✏️ Edit Another / Create New", key=f"{_CWO_PREFIX}after_update", type="secondary"):
+            _cwo_reset_form_state()
+            st.cache_data.clear()
+            st.rerun()
+        st.divider()
+
+    # ── Edit mode banner ───────────────────────────────────────────────────────
+    edit_key = f"{_CWO_PREFIX}edit_id"
+    is_edit = bool(st.session_state.get(edit_key))
+
+    if is_edit:
+        st.info(f"✏️ Editing Work Order: **{st.session_state[edit_key]}**")
+        if st.button("✖ Cancel Edit", key=f"{_CWO_PREFIX}cancel_edit"):
+            _cwo_reset_form_state()
+            st.rerun()
+        st.divider()
+
+    st.markdown("### Work Order Details")
+
+    # ── Form ──────────────────────────────────────────────────────────────────
+    # Versioned form key: each time _cwo_reset_form_state() is called it bumps
+    # the version counter, which forces Streamlit to construct a brand-new
+    # st.form instance with all default values — regardless of prior widget state.
+    _form_version = st.session_state.get(f"{_CWO_PREFIX}form_version", 0)
+    form_key = f"{_CWO_PREFIX}form_v{_form_version}"
+    with st.form(form_key, clear_on_submit=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            site_default = st.session_state.get(f"{_CWO_PREFIX}site", "(select)")
+            site_options = ["(select)"] + sites
+            site_idx = site_options.index(site_default) if site_default in site_options else 0
+            site_name = st.selectbox(
+                "Site Name *",
+                options=site_options,
+                index=site_idx,
+                key=f"{_CWO_PREFIX}site",
+            )
+
+            frequency_default = st.session_state.get(f"{_CWO_PREFIX}freq", _CWO_FREQUENCIES[0])
+            freq_idx = _CWO_FREQUENCIES.index(frequency_default) if frequency_default in _CWO_FREQUENCIES else 0
+            frequency = st.selectbox(
+                "Frequency *",
+                options=_CWO_FREQUENCIES,
+                index=freq_idx,
+                key=f"{_CWO_PREFIX}freq",
+                help="D=Daily, W=Weekly, Q=Quarterly, HY=Half-Yearly, Y=Yearly, UP=Unplanned",
+            )
+
+        with col_b:
+            date_planned = st.date_input(
+                "Planned Date *",
+                value=st.session_state.get(f"{_CWO_PREFIX}date_planned", date.today()),
+                key=f"{_CWO_PREFIX}date_planned",
+            )
+            isolation_default = st.session_state.get(f"{_CWO_PREFIX}isolation", "NO")
+            isolation_idx = 0 if isolation_default == "YES" else 1
+            isolation_requirement = st.radio(
+                "Isolation Required? *",
+                options=["YES", "NO"],
+                index=isolation_idx,
+                horizontal=True,
+                key=f"{_CWO_PREFIX}isolation",
+            )
+
+        location_default = st.session_state.get(f"{_CWO_PREFIX}location", [])
+        location_sel = st.multiselect(
+            "Location(s) *",
+            options=all_locations,
+            default=[v for v in location_default if v in all_locations],
+            key=f"{_CWO_PREFIX}location",
+        )
+
+        equipment_default = st.session_state.get(f"{_CWO_PREFIX}equipment", [])
+        equipment_sel = st.multiselect(
+            "Equipment *",
+            options=all_equipment,
+            default=[v for v in equipment_default if v in all_equipment],
+            key=f"{_CWO_PREFIX}equipment",
+        )
+
+        submit_label = "💾 Update Work Order" if is_edit else "✅ Create Work Order"
+        submitted = st.form_submit_button(submit_label, type="primary", use_container_width=True)
+
+    # ── Validation + DB write (runs in same rerun as form submit) ─────────────
+    # Progress container is placed directly below the form; it renders
+    # immediately because we are already inside the post-submit rerun.
+    prog_container = st.empty()
+    msg_container = st.empty()
+
+    if submitted:
+        errors: list[str] = []
+        if not site_name or site_name == "(select)":
+            errors.append("Site Name is required.")
+        if not location_sel:
+            errors.append("At least one Location is required.")
+        if not equipment_sel:
+            errors.append("At least one Equipment is required.")
+
+        if errors:
+            for err_msg in errors:
+                msg_container.error(err_msg)
+        else:
+            prog = prog_container.progress(0, text="Validating inputs...")
+            try:
+                _smooth_progress(prog, 0, 25, text="Validating inputs...")
+
+                if is_edit:
+                    wo_being_edited = str(st.session_state.get(edit_key, ""))
+                    # Live eligibility check — no cached df, no derived status
+                    _smooth_progress(prog, 25, 40, text="Checking eligibility...")
+                    if not _cwo_check_edit_eligibility_live(wo_being_edited):
+                        prog_container.empty()
+                        msg_container.warning(
+                            f"⚠️ Work Order **{wo_being_edited}** already has an initiated PTW "
+                            "and cannot be edited."
+                        )
+                    else:
+                        _smooth_progress(prog, 40, 70, text="Updating Work Order...")
+                        _cwo_update_work_order(
+                            work_order_id=wo_being_edited,
+                            site_name=site_name,
+                            location=location_sel,
+                            equipment=equipment_sel,
+                            frequency=frequency,
+                            isolation_requirement=isolation_requirement,
+                            date_planned=date_planned,
+                        )
+                        _smooth_progress(prog, 70, 100, text="Done")
+                        prog_container.empty()
+                        # Reset form fields (blank) and persist update success card.
+                        _saved_updated = wo_being_edited
+                        _cwo_reset_form_state(keep_success=True)
+                        st.session_state[_CWO_LAST_UPDATED_KEY] = _saved_updated
+                        st.cache_data.clear()
+                        st.rerun()
+                else:
+                    _smooth_progress(prog, 25, 65, text="Creating Work Order...")
+                    new_id = _cwo_insert_work_order(
+                        site_name=site_name,
+                        location=location_sel,
+                        equipment=equipment_sel,
+                        frequency=frequency,
+                        isolation_requirement=isolation_requirement,
+                        date_planned=date_planned,
+                    )
+                    _smooth_progress(prog, 65, 90, text="Syncing Database...")
+                    _smooth_progress(prog, 90, 100, text="Done")
+                    prog_container.empty()
+                    # Persist the new WO id for the success card, then clear
+                    # all form fields + filters so the form re-renders blank.
+                    # keep_success=True ensures the card survives the rerun.
+                    _saved_id = new_id or "(auto-generated)"
+                    _cwo_reset_form_state(keep_success=True)
+                    st.session_state[_CWO_LAST_CREATED_KEY] = _saved_id
+                    st.cache_data.clear()
+                    st.rerun()
+
+            except RuntimeError as exc:
+                prog_container.empty()
+                msg_container.error(str(exc))
+            except Exception as exc:
+                prog_container.empty()
+                msg_container.error(f"Unexpected error: {exc}")
+
+    # ── Preview / filter section ───────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Work Orders Preview")
+    st.caption("Filter and view existing work orders. Click Edit to modify (only available before S1 initiates PTW).")
+
+    with st.form(f"{_CWO_PREFIX}filter_form", clear_on_submit=False):
+        fc1, fc2, fc3, fc4 = st.columns([2, 1.5, 1.5, 1])
+        with fc1:
+            filter_sites = ["(all)"] + sites
+            _fsite_default = st.session_state.get(f"{_CWO_PREFIX}filter_site", "(all)")
+            _fsite_idx = filter_sites.index(_fsite_default) if _fsite_default in filter_sites else 0
+            filter_site = st.selectbox("Site", options=filter_sites, index=_fsite_idx, key=f"{_CWO_PREFIX}filter_site")
+        with fc2:
+            filter_start = st.date_input(
+                "Start Date",
+                value=st.session_state.get(f"{_CWO_PREFIX}filter_start", date.today() - timedelta(days=30)),
+                key=f"{_CWO_PREFIX}filter_start",
+            )
+        with fc3:
+            filter_end = st.date_input(
+                "End Date",
+                value=st.session_state.get(f"{_CWO_PREFIX}filter_end", date.today()),
+                key=f"{_CWO_PREFIX}filter_end",
+            )
+        with fc4:
+            st.write("")
+            st.write("")
+            fetch_submitted = st.form_submit_button("Fetch", use_container_width=True)
+
+    # Progress for preview fetch — renders in same rerun as the Fetch click
+    fetch_prog_slot = st.empty()
+    fetch_flag = f"{_CWO_PREFIX}fetch_requested"
+
+    if fetch_submitted:
+        st.session_state[fetch_flag] = True
+
+    if st.session_state.get(fetch_flag):
+        st.session_state[fetch_flag] = False
+        fetch_prog = fetch_prog_slot.progress(0, text="Validating filters...")
+        try:
+            _smooth_progress(fetch_prog, 0, 20, text="Validating filters...")
+            _smooth_progress(fetch_prog, 20, 60, text="Fetching Work Orders...")
+            site_arg = "" if filter_site == "(all)" else filter_site
+            df_prev = _fetch_work_orders(
+                site_name=site_arg,
+                start_date=filter_start,
+                end_date=filter_end,
+                status_ui=None,
+                location=None,
+            )
+            _smooth_progress(fetch_prog, 60, 90, text="Preparing table...")
+            st.session_state[f"{_CWO_PREFIX}preview_df"] = df_prev
+            _smooth_progress(fetch_prog, 90, 100, text="Done")
+        except Exception as e:
+            st.session_state[f"{_CWO_PREFIX}preview_df"] = pd.DataFrame()
+            fetch_prog_slot.empty()
+            st.error(f"Failed to fetch work orders: {e}")
+        finally:
+            fetch_prog_slot.empty()
+
+    # Only render the table once the user has explicitly clicked Fetch
+    if f"{_CWO_PREFIX}preview_df" not in st.session_state:
+        st.info("Select filters above and click **Fetch** to load work orders.")
+        return
+
+    df_view: pd.DataFrame = st.session_state.get(f"{_CWO_PREFIX}preview_df", pd.DataFrame())
+
+    if df_view is None or (hasattr(df_view, "empty") and df_view.empty):
+        st.info("No work orders found for the selected filters.")
+        return
+
+    # Display columns
+    show_cols = [
+        "work_order_id", "site_name", "location", "equipment", "frequency",
+        "isolation_requirement", "date_planned", "status", "date_s1_created",
+    ]
+    for c in show_cols:
+        if c not in df_view.columns:
+            df_view[c] = pd.NA
+
+    df_display = df_view[show_cols].copy()
+    if "status" in df_display.columns:
+        df_display["status"] = df_display["status"].astype("string").fillna("").map(
+            lambda s: DB_STATUS_TO_UI.get(str(s).strip().upper(), str(s))
+        )
+
+    styled = (
+        df_display.style
+        .map(_highlight_status, subset=["status"])
+        .set_table_styles([{"selector": "th", "props": [("font-weight", "800"), ("color", "#0f172a")]}])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # ── Edit section ───────────────────────────────────────────────────────────
+    st.markdown("#### Edit a Work Order")
+    st.caption(
+        "Select a Work Order to edit. Only rows where no PTW has been initiated "
+        "(date_s1_created is empty) can be modified."
+    )
+
+    wo_options = df_view["work_order_id"].astype(str).tolist()
+    if not wo_options:
+        return
+
+    selected_wo = st.selectbox(
+        "Select Work Order to Edit",
+        options=["(select)"] + wo_options,
+        index=0,
+        key=f"{_CWO_PREFIX}edit_select",
+    )
+
+    if selected_wo and selected_wo != "(select)":
+        # Live DB eligibility check — authoritative, not cached-df-based
+        can_edit = _cwo_check_edit_eligibility_live(selected_wo)
+
+        if not can_edit:
+            st.warning(
+                f"⚠️ Work Order **{selected_wo}** already has an initiated PTW and cannot be edited."
+            )
+        else:
+            # Try to pre-fill from the cached df for convenience
+            row_matches = df_view[df_view["work_order_id"].astype(str) == selected_wo]
+            row = row_matches.iloc[0] if not row_matches.empty else None
+
+            def _safe(v, fallback: str = "") -> str:
+                """Convert a pandas-row value to str, handling pd.NA / NaT safely."""
+                try:
+                    if pd.isna(v):
+                        return fallback
+                except (TypeError, ValueError):
+                    pass
+                return str(v) if v is not None else fallback
+
+            def _on_edit() -> None:
+                # Clear any previous success card before entering edit mode
+                st.session_state.pop(_CWO_LAST_CREATED_KEY, None)
+                st.session_state.pop(_CWO_LAST_UPDATED_KEY, None)
+                st.session_state[edit_key] = selected_wo
+                if row is not None:
+                    st.session_state[f"{_CWO_PREFIX}site"] = _safe(row.get("site_name"))
+                    st.session_state[f"{_CWO_PREFIX}location"] = [
+                        p.strip() for p in _safe(row.get("location")).split(",") if p.strip()
+                    ]
+                    st.session_state[f"{_CWO_PREFIX}equipment"] = [
+                        p.strip() for p in _safe(row.get("equipment")).split(",") if p.strip()
+                    ]
+                    freq_val = _safe(row.get("frequency"))
+                    st.session_state[f"{_CWO_PREFIX}freq"] = (
+                        freq_val if freq_val in _CWO_FREQUENCIES else _CWO_FREQUENCIES[0]
+                    )
+                    iso_val = _safe(row.get("isolation_requirement"), "NO").upper()
+                    st.session_state[f"{_CWO_PREFIX}isolation"] = iso_val if iso_val in ("YES", "NO") else "NO"
+                    try:
+                        st.session_state[f"{_CWO_PREFIX}date_planned"] = pd.to_datetime(
+                            row.get("date_planned")
+                        ).date()
+                    except Exception:
+                        st.session_state[f"{_CWO_PREFIX}date_planned"] = date.today()
+
+            st.button(
+                f"✏️ Edit Work Order {selected_wo}",
+                key=f"{_CWO_PREFIX}edit_btn_{selected_wo}",
+                type="secondary",
+                on_click=_on_edit,
+            )
 
 
 # =============================================================================
@@ -2097,11 +2603,13 @@ def render(db_path: str) -> None:
     if "refresh_s2" not in st.session_state:
         st.session_state["refresh_s2"] = False
     
-    # Top horizontal tabs
-    tab1, tab2 = st.tabs(["View Work Order", "View Submitted PTW"])
-    
-    with tab1:
+    SECTION_KEY = "s2_section"
+    sections = ["View Work Order", "View Submitted PTW", "Create Work Order"]
+    section = modern_section_selector(sections, key=SECTION_KEY)
+
+    if section == "View Work Order":
         _render_view_work_order_s2()
-    
-    with tab2:
+    elif section == "View Submitted PTW":
         _render_view_submitted_ptw()
+    elif section == "Create Work Order":
+        _render_create_work_order()

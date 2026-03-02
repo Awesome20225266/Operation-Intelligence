@@ -29,17 +29,17 @@ import streamlit as st
 
 from supabase_link import get_supabase_client
 
-# PDF manipulation for approval stamp
-try:
-    from PyPDF2 import PdfReader, PdfWriter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.colors import Color
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    _HAS_PDF_LIBS = True
-except ImportError:
-    _HAS_PDF_LIBS = False
+# Shared approval/PDF helpers (breaks S2<->S3 circular imports)
+from ptw_approval_utils import (
+    add_floating_approval_stamp,
+    get_ptw_approval_times,
+    inject_approval_times_into_form_data as _inject_approval_times_into_form_data,
+)
+from ptw_pdf_pipeline import generate_ptw_pdf_with_attachments
+
+# Reuse S2's Create Work Order UI (avoids duplicating the logic; no circular import
+# because S2 imports S1/utils but never imports S3)
+from S2 import _render_create_work_order
 
 # Reuse S1 helpers (logic stays single-source-of-truth)
 from S1 import (
@@ -58,187 +58,6 @@ from S1 import (
     _download_template_from_supabase,
 )
 
-# Prefer the same "PDF with evidence" behavior as S2 if available.
-try:
-    from S2 import generate_ptw_pdf_with_attachments  # type: ignore
-except Exception:  # pragma: no cover
-    generate_ptw_pdf_with_attachments = None  # type: ignore
-
-
-# =============================================================================
-# Helper Functions for Approval Timestamps & PDF Stamp
-# =============================================================================
-
-
-def get_ptw_approval_times(work_order_id: str) -> dict:
-    """
-    Fetch S2 and S3 approval timestamps from work_orders.
-    
-    Returns:
-        {
-            "holder_datetime": "DD-MM-YYYY HH:MM" (from date_s2_forwarded),
-            "issuer_datetime": "DD-MM-YYYY HH:MM" (from date_s3_approved),
-            "date_s2_forwarded_raw": original timestamp or None,
-            "date_s3_approved_raw": original timestamp or None,
-        }
-    """
-    sb = get_supabase_client(prefer_service_role=True)
-    
-    resp = (
-        sb.table(TABLE_WORK_ORDERS)
-        .select("date_s2_forwarded,date_s3_approved")
-        .eq("work_order_id", work_order_id)
-        .limit(1)
-        .execute()
-    )
-    
-    err = getattr(resp, "error", None)
-    if err:
-        raise RuntimeError(f"Failed to fetch approval times: {err}")
-    
-    rows = getattr(resp, "data", None) or []
-    if not rows:
-        return {
-            "holder_datetime": "",
-            "issuer_datetime": "",
-            "date_s2_forwarded_raw": None,
-            "date_s3_approved_raw": None,
-        }
-    
-    row = rows[0]
-    s2_raw = row.get("date_s2_forwarded")
-    s3_raw = row.get("date_s3_approved")
-    
-    def format_datetime(val) -> str:
-        """Convert to DD-MM-YYYY HH:MM format."""
-        if val is None or str(val).strip() == "":
-            return ""
-        try:
-            dt = pd.to_datetime(val)
-            return dt.strftime("%d-%m-%Y %H:%M")
-        except Exception:
-            return str(val)
-    
-    return {
-        "holder_datetime": format_datetime(s2_raw),
-        "issuer_datetime": format_datetime(s3_raw),
-        "date_s2_forwarded_raw": s2_raw,
-        "date_s3_approved_raw": s3_raw,
-    }
-
-
-def add_floating_approval_stamp(pdf_bytes: bytes, *, approved_on: str) -> bytes:
-    """
-    Add a floating APPROVED stamp overlay to every page of a PDF.
-    
-    Args:
-        pdf_bytes: Original PDF as bytes
-        approved_on: Approval date string (DD-MM-YYYY HH:MM format)
-    
-    Returns:
-        Modified PDF bytes with APPROVED stamp
-    """
-    if not _HAS_PDF_LIBS:
-        # If PDF libraries not available, return original PDF
-        return pdf_bytes
-    
-    try:
-        # Create the stamp overlay on a canvas
-        stamp_buffer = BytesIO()
-        c = canvas.Canvas(stamp_buffer, pagesize=A4)
-        
-        # A4 dimensions: 595.28 x 841.89 points
-        page_width, page_height = A4
-        
-        # Stamp positioning - bottom right area near Permit Issuer section
-        # Adjust these coordinates as needed for exact placement
-        stamp_x = page_width - 200  # ~395 points from left
-        stamp_y = 120  # ~120 points from bottom
-        
-        # Stamp dimensions
-        stamp_width = 160
-        stamp_height = 60
-        
-        # Draw stamp border (red rectangle with rounded-ish appearance)
-        stamp_color = Color(0.8, 0.1, 0.1, alpha=0.85)  # Dark red with slight transparency
-        c.setStrokeColor(stamp_color)
-        c.setLineWidth(3)
-        c.rect(stamp_x, stamp_y, stamp_width, stamp_height, stroke=1, fill=0)
-        
-        # Draw inner border for visual effect
-        c.setLineWidth(1.5)
-        c.rect(stamp_x + 4, stamp_y + 4, stamp_width - 8, stamp_height - 8, stroke=1, fill=0)
-        
-        # Set text color
-        c.setFillColor(stamp_color)
-        
-        # Draw "APPROVED" text (bold, large)
-        c.setFont("Helvetica-Bold", 18)
-        text_x = stamp_x + stamp_width / 2
-        c.drawCentredString(text_x, stamp_y + 35, "APPROVED")
-        
-        # Draw date text (smaller)
-        c.setFont("Helvetica", 9)
-        if approved_on:
-            c.drawCentredString(text_x, stamp_y + 18, f"ON: {approved_on}")
-        
-        c.save()
-        stamp_buffer.seek(0)
-        
-        # Read original PDF
-        original_pdf = PdfReader(BytesIO(pdf_bytes))
-        stamp_pdf = PdfReader(stamp_buffer)
-        
-        # Create output PDF
-        output = PdfWriter()
-        
-        # Merge stamp with EVERY page (requirement: post S3 approval stamp on each page)
-        stamp_page = stamp_pdf.pages[0]
-        for i in range(len(original_pdf.pages)):
-            page = original_pdf.pages[i]
-            page.merge_page(stamp_page)
-            output.add_page(page)
-        
-        # Write to bytes
-        output_buffer = BytesIO()
-        output.write(output_buffer)
-        output_buffer.seek(0)
-        
-        return output_buffer.read()
-    
-    except Exception as e:
-        # If stamping fails, return original PDF rather than crashing
-        import traceback
-        traceback.print_exc()
-        return pdf_bytes
-
-
-def _inject_approval_times_into_form_data(form_data: dict, work_order_id: str, is_approved: bool = False) -> dict:
-    """
-    Inject holder_datetime and issuer_datetime into form_data from work_orders.
-    
-    Args:
-        form_data: Existing form_data dict
-        work_order_id: The work order ID
-        is_approved: Whether this is for an approved PTW (determines if issuer_datetime should be set)
-    
-    Returns:
-        Updated form_data dict with datetime fields
-    """
-    approval_times = get_ptw_approval_times(work_order_id)
-    
-    updated = dict(form_data) if form_data else {}
-    
-    # Always inject holder_datetime from S2 forwarding date
-    if approval_times["holder_datetime"]:
-        updated["holder_datetime"] = approval_times["holder_datetime"]
-    
-    # Inject issuer_datetime only if PTW is approved
-    if is_approved and approval_times["issuer_datetime"]:
-        updated["issuer_datetime"] = approval_times["issuer_datetime"]
-    
-    return updated
-
 
 def _smooth_progress(progress_bar, start: int, end: int, text: str) -> None:
     """Animate progress bar smoothly from start to end."""
@@ -247,6 +66,38 @@ def _smooth_progress(progress_bar, start: int, end: int, text: str) -> None:
         val = start + (end - start) * i // steps
         progress_bar.progress(val, text=text)
         time.sleep(0.04)
+
+
+def modern_section_selector(options: list[str], *, key: str) -> str:
+    """
+    UI-only segmented (pill) selector built with Streamlit buttons.
+    Uses session_state[key] as the single source of truth for selection.
+    """
+    if not options:
+        raise ValueError("options must be a non-empty list")
+
+    if key not in st.session_state:
+        st.session_state[key] = options[0]
+
+    cols = st.columns(len(options))
+    changed = False
+    for i, opt in enumerate(options):
+        is_active = st.session_state.get(key) == opt
+        btn_kind = "primary" if is_active else "secondary"
+        if cols[i].button(
+            opt,
+            key=f"{key}_{i}",
+            use_container_width=True,
+            type=btn_kind,
+        ):
+            if st.session_state.get(key) != opt:
+                st.session_state[key] = opt
+                changed = True
+
+    if changed:
+        st.rerun()
+
+    return str(st.session_state.get(key, options[0]))
 
 
 # =============================================================================
@@ -828,31 +679,37 @@ def _approve_work_order(*, work_order_id: str, issuer_name: str) -> tuple[bool, 
     if upd_ptw_err:
         return False, f"Failed to update PTW issuer info: {upd_ptw_err}"
 
-    # Approve all covered work orders (multi-WO safe)
-    covered = form_data.get("work_order_ids")
-    if not isinstance(covered, list) or not covered:
-        covered = [work_order_id]
-    covered_ids = [str(x).strip() for x in covered if str(x).strip()]
-    if not covered_ids:
-        covered_ids = [work_order_id]
+    # Approve ALL covered work orders atomically (batch update)
+    from ptw_lifecycle_utils import (
+        _get_all_work_order_ids_for_ptw,
+        _update_all_work_orders_lifecycle,
+    )
 
-    any_updated = False
-    for woid in covered_ids:
-        upd = (
-            sb.table(TABLE_WORK_ORDERS)
-            .update({"date_s3_approved": ts})
-            .eq("work_order_id", woid)
-            .is_("date_s3_approved", "null")
-            .execute()
-        )
-        upd_err = getattr(upd, "error", None)
-        if upd_err:
-            return False, f"Failed to approve work order: {upd_err}"
-        updated_rows = getattr(upd, "data", None) or []
-        if updated_rows:
-            any_updated = True
-    if not any_updated:
+    wo_ids = _get_all_work_order_ids_for_ptw(
+        ptw_id=str(chosen.get("ptw_id") or ""),
+        permit_no=str(chosen.get("permit_no") or ""),
+        form_data=form_data,
+    )
+    if not wo_ids:
+        wo_ids = [work_order_id]
+
+    # Keep prior behavior: if already approved, do not re-approve (avoid overwriting).
+    chk = (
+        sb.table(TABLE_WORK_ORDERS)
+        .select("work_order_id,date_s3_approved")
+        .in_("work_order_id", wo_ids)
+        .execute()
+    )
+    chk_rows = getattr(chk, "data", None) or []
+    if any((r or {}).get("date_s3_approved") is not None for r in chk_rows if isinstance(r, dict)):
         return False, "This PTW appears to already be approved (date_s3_approved is set)."
+
+    if len(wo_ids) > 1:
+        st.info(f"Atomic lifecycle update: {len(wo_ids)} linked work orders updated together.")
+    _update_all_work_orders_lifecycle(
+        work_order_ids=wo_ids,
+        update_fields={"date_s3_approved": ts},
+    )
 
     return True, ts
 
@@ -892,16 +749,16 @@ def _revoke_s3_approval(*, work_order_id: str) -> tuple[bool, str]:
     except Exception:
         covered_ids = [work_order_id]
 
-    for woid in covered_ids:
-        resp = (
-            sb.table(TABLE_WORK_ORDERS)
-            .update({"date_s3_approved": None})
-            .eq("work_order_id", woid)
-            .execute()
+    from ptw_lifecycle_utils import _update_all_work_orders_lifecycle
+    if len(covered_ids) > 1:
+        st.info(f"Atomic lifecycle update: {len(covered_ids)} linked work orders updated together.")
+    try:
+        _update_all_work_orders_lifecycle(
+            work_order_ids=covered_ids,
+            update_fields={"date_s3_approved": None},
         )
-        err = getattr(resp, "error", None)
-        if err:
-            return False, f"Failed to revoke approval: {err}"
+    except Exception as e:
+        return False, f"Failed to revoke approval: {e}"
 
     return True, "Approval revoked successfully"
 
@@ -1241,18 +1098,11 @@ def _render_post_approval_view(*, work_order_id: str, site_name: str, ptw_map: d
             updated_form = _inject_approval_times_into_form_data(form_data, work_order_id, is_approved=True)
             
             # Step 3: Generate the PDF with injected timestamps
-            if callable(generate_ptw_pdf_with_attachments):
-                pdf_bytes = generate_ptw_pdf_with_attachments(
-                    form_data=updated_form,
-                    work_order_id=work_order_id,
-                    progress_callback=progress_callback,
-                )
-            else:
-                progress_callback(30, "Downloading template...")
-                tpl = _download_template_from_supabase()
-                progress_callback(70, "Rendering PTW PDF...")
-                pdf_bytes = generate_ptw_pdf(tpl, build_doc_data(updated_form), progress_callback=progress_callback)
-                progress_callback(90, "Done")
+            pdf_bytes = generate_ptw_pdf_with_attachments(
+                form_data=updated_form,
+                work_order_id=work_order_id,
+                progress_callback=progress_callback,
+            )
             
             # Step 4: Apply APPROVED stamp overlay to the PDF (S3 approved PDFs only)
             progress_callback(95, "Applying approval stamp...")
@@ -1373,14 +1223,11 @@ def _render_approval_form(*, work_order_id: str, site_name: str, fwd_str: str, p
             # Leave issuer_datetime empty for preview (will be set on actual approval)
             updated.setdefault("issuer_datetime", "")
 
-            if callable(generate_ptw_pdf_with_attachments):
-                pdf_bytes = generate_ptw_pdf_with_attachments(updated, work_order_id, progress_callback=progress_callback)
-            else:
-                progress_callback(30, "Downloading template...")
-                tpl = _download_template_from_supabase()
-                progress_callback(70, "Rendering PTW PDF...")
-                pdf_bytes = generate_ptw_pdf(tpl, build_doc_data(updated), progress_callback=progress_callback)
-                progress_callback(100, "Done")
+            pdf_bytes = generate_ptw_pdf_with_attachments(
+                form_data=updated,
+                work_order_id=work_order_id,
+                progress_callback=progress_callback,
+            )
             
             # Note: Preview PDF does NOT get APPROVED stamp (only approved PDFs do)
             st.session_state[preview_cache_key] = pdf_bytes
@@ -1589,6 +1436,41 @@ def render(db_path: str) -> None:
                     border-radius: 14px; padding: 14px 16px; box-shadow: 0 6px 18px rgba(15,23,42,0.06); }
         .kpi-title { font-size: 14px; color: #475569; margin-bottom: 6px; font-weight: 700; }
         .kpi-value { font-size: 34px; font-weight: 900; line-height: 1.05; }
+
+        /* ==============================================
+           SEGMENTED NAV (pill-style buttons)
+           ============================================== */
+        /* Segmented button container spacing */
+        div[data-testid="column"] {
+            padding: 0px 4px !important;
+        }
+
+        /* Button styling */
+        .stButton > button {
+            border-radius: 12px !important;
+            font-weight: 700 !important;
+            height: 45px !important;
+            border: 1px solid rgba(148,163,184,0.35) !important;
+            transition: all 0.2s ease-in-out !important;
+        }
+
+        /* Secondary style (inactive) */
+        .stButton > button[kind="secondary"] {
+            background-color: rgba(226,232,240,0.35) !important;
+            color: #0f172a !important;
+        }
+
+        /* Primary style (active) */
+        .stButton > button[kind="primary"] {
+            background: linear-gradient(135deg, rgba(37,99,235,0.14), rgba(59,130,246,0.09)) !important;
+            border: 1px solid rgba(37,99,235,0.35) !important;
+            color: #0b2a6f !important;
+            box-shadow: 0 8px 20px rgba(15,23,42,0.08) !important;
+        }
+
+        .stButton > button:hover {
+            transform: translateY(-1px);
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1596,18 +1478,20 @@ def render(db_path: str) -> None:
 
     # Wrap entire tab in fragment for better performance
     _frag = getattr(st, "fragment", None)
+    def _impl() -> None:
+        SECTION_KEY = "s3_section"
+        sections = ["View Work Order", "View Approvals", "Create Work Order"]
+        section = modern_section_selector(sections, key=SECTION_KEY)
+
+        if section == "View Work Order":
+            _render_view_work_order_s3()
+        elif section == "View Approvals":
+            _render_view_approvals()
+        elif section == "Create Work Order":
+            _render_create_work_order()
+
     if callable(_frag):
-        def _impl() -> None:
-            tab1, tab2 = st.tabs(["View Work Order", "View Approvals"])
-            with tab1:
-                _render_view_work_order_s3()
-            with tab2:
-                _render_view_approvals()
         _frag(_impl)()
         return
-    
-    tab1, tab2 = st.tabs(["View Work Order", "View Approvals"])
-    with tab1:
-        _render_view_work_order_s3()
-    with tab2:
-        _render_view_approvals()
+
+    _impl()

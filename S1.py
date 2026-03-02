@@ -105,6 +105,38 @@ def _smooth_progress(prog: Any, start: int, end: int, *, text: str, step_delay_s
         _time.sleep(step_delay_s)
 
 
+def modern_section_selector(options: list[str], *, key: str) -> str:
+    """
+    UI-only segmented (pill) selector built with Streamlit buttons.
+    Uses session_state[key] as the single source of truth for selection.
+    """
+    if not options:
+        raise ValueError("options must be a non-empty list")
+
+    if key not in st.session_state:
+        st.session_state[key] = options[0]
+
+    cols = st.columns(len(options))
+    changed = False
+    for i, opt in enumerate(options):
+        is_active = st.session_state.get(key) == opt
+        btn_kind = "primary" if is_active else "secondary"
+        if cols[i].button(
+            opt,
+            key=f"{key}_{i}",
+            use_container_width=True,
+            type=btn_kind,
+        ):
+            if st.session_state.get(key) != opt:
+                st.session_state[key] = opt
+                changed = True
+
+    if changed:
+        st.rerun()
+
+    return str(st.session_state.get(key, options[0]))
+
+
 def _apply_modern_tabs_css() -> None:
     """Match S2/S3 tab UX (UI-only) + Anti-Ghosting CSS."""
     st.markdown(
@@ -168,6 +200,41 @@ def _apply_modern_tabs_css() -> None:
           /* Remove large default Streamlit top padding (S1 page) */
           .block-container {
             padding-top: 1rem !important;
+          }
+
+          /* ==============================================
+             SEGMENTED NAV (pill-style buttons)
+             ============================================== */
+          /* Segmented button container spacing */
+          div[data-testid="column"] {
+              padding: 0px 4px !important;
+          }
+
+          /* Button styling */
+          .stButton > button {
+              border-radius: 12px !important;
+              font-weight: 700 !important;
+              height: 45px !important;
+              border: 1px solid rgba(148,163,184,0.35) !important;
+              transition: all 0.2s ease-in-out !important;
+          }
+
+          /* Secondary style (inactive) */
+          .stButton > button[kind="secondary"] {
+              background-color: rgba(226,232,240,0.35) !important;
+              color: #0f172a !important;
+          }
+
+          /* Primary style (active) */
+          .stButton > button[kind="primary"] {
+              background: linear-gradient(135deg, rgba(37,99,235,0.14), rgba(59,130,246,0.09)) !important;
+              border: 1px solid rgba(37,99,235,0.35) !important;
+              color: #0b2a6f !important;
+              box-shadow: 0 8px 20px rgba(15,23,42,0.08) !important;
+          }
+
+          .stButton > button:hover {
+              transform: translateY(-1px);
           }
         </style>
         """,
@@ -247,7 +314,7 @@ def _update_work_order_s1_created(work_order_id: str, s1_timestamp: str) -> None
     resp = (
         sb.table(TABLE_WORK_ORDERS)
         .update({"date_s1_created": s1_timestamp})
-        .eq("work_order_id", work_order_id)
+        .in_("work_order_id", [str(work_order_id).strip()])
         .is_("date_s1_created", None)  # atomic NULL check
         .execute()
     )
@@ -710,7 +777,7 @@ def _reset_ptw_form_state() -> None:
     We explicitly clear PTW-related widget keys so the UI visually resets without a full-page feel.
     """
     # Prefixes for form input keys to clear
-    prefixes = ("hz_", "rk_", "ppe_", "sp_", "ap_", "chk_", "ptw_")
+    prefixes = ("hz_", "rk_", "ppe_", "sp_", "ap_", "chk_", "s1_rptw_")
     
     # Keys to explicitly keep (don't delete)
     keep = {
@@ -718,9 +785,9 @@ def _reset_ptw_form_state() -> None:
         "s1_ptw_last_file",
         "s1_ptw_last_permit_no",
         "s1_ptw_last_ext",
-        "s1_ptw_view_df",
+        "s1_vap_df",
         "s1_ptw_reset_counter",
-        "ptw_just_submitted",  # Keep this for success screen
+        "s1_rptw_just_submitted",  # Keep this for success screen
         # Keep S1 portal state
         "nav_page",
     }
@@ -2772,22 +2839,22 @@ def render(db_path: str) -> None:
         st.session_state["s1_ptw_last_permit_no"] = None
     if "s1_ptw_last_ext" not in st.session_state:
         st.session_state["s1_ptw_last_ext"] = "pdf"
-    if "ptw_just_submitted" not in st.session_state:
-        st.session_state["ptw_just_submitted"] = False
+    if "s1_rptw_just_submitted" not in st.session_state:
+        st.session_state["s1_rptw_just_submitted"] = False
 
     st.markdown("<div style='margin-top:5px;'>", unsafe_allow_html=True)
     _apply_modern_tabs_css()
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["View Work Order", "Request PTW", "View Applied PTW", "Permit Closure"]
-    )
+    SECTION_KEY = "s1_section"
+    sections = ["View Work Order", "Request PTW", "View Applied PTW", "Permit Closure"]
+    section = modern_section_selector(sections, key=SECTION_KEY)
     st.markdown("</div>", unsafe_allow_html=True)
-    with tab1:
+    if section == "View Work Order":
         _render_view_work_order()
-    with tab2:
+    elif section == "Request PTW":
         _render_request_ptw()
-    with tab3:
+    elif section == "View Applied PTW":
         _render_view_applied_ptw()
-    with tab4:
+    elif section == "Permit Closure":
         _render_permit_closure()
 
 
@@ -3245,7 +3312,7 @@ def _render_request_ptw() -> None:
     )
     
     # Check if we just submitted successfully - show success message and reset prompt
-    if st.session_state.get("ptw_just_submitted"):
+    if st.session_state.get("s1_rptw_just_submitted"):
         last_permit = st.session_state.get("s1_ptw_last_permit_no", "")
         
         # Success banner
@@ -3281,7 +3348,7 @@ def _render_request_ptw() -> None:
         with col2:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button(f"📝 {bi('Raise Another PTW Request')}", type="secondary", width="stretch", key="raise_another_ptw"):
-                st.session_state["ptw_just_submitted"] = False
+                st.session_state["s1_rptw_just_submitted"] = False
                 _reset_ptw_form_state()
                 st.rerun()
         
@@ -3289,21 +3356,21 @@ def _render_request_ptw() -> None:
 
     # Form key includes reset counter to force form reset
     reset_counter = st.session_state.get("s1_ptw_reset_counter", 0)
-    form_key = f"ptw_electrical_form_{reset_counter}"
+    form_key = f"s1_rptw_electrical_form_{reset_counter}"
 
     # Initialize session state for work order selection (outside form for reactivity)
-    if "ptw_selected_date" not in st.session_state:
-        st.session_state["ptw_selected_date"] = date.today()
-    if "ptw_selected_wo_id" not in st.session_state:
-        st.session_state["ptw_selected_wo_id"] = None
-    if "ptw_wo_details" not in st.session_state:
-        st.session_state["ptw_wo_details"] = None
-    if "ptw_wo_ids_for_date" not in st.session_state:
-        st.session_state["ptw_wo_ids_for_date"] = []
-    if "ptw_date_loading" not in st.session_state:
-        st.session_state["ptw_date_loading"] = True  # mount progress on first load
-    if "ptw_wo_loading" not in st.session_state:
-        st.session_state["ptw_wo_loading"] = False
+    if "s1_rptw_selected_date" not in st.session_state:
+        st.session_state["s1_rptw_selected_date"] = date.today()
+    if "s1_rptw_selected_wo_id" not in st.session_state:
+        st.session_state["s1_rptw_selected_wo_id"] = None
+    if "s1_rptw_wo_details" not in st.session_state:
+        st.session_state["s1_rptw_wo_details"] = None
+    if "s1_rptw_wo_ids_for_date" not in st.session_state:
+        st.session_state["s1_rptw_wo_ids_for_date"] = []
+    if "s1_rptw_date_loading" not in st.session_state:
+        st.session_state["s1_rptw_date_loading"] = True  # mount progress on first load
+    if "s1_rptw_wo_loading" not in st.session_state:
+        st.session_state["s1_rptw_wo_loading"] = False
 
     # Use Streamlit fragments (if available) to prevent "whole page reload" feeling on
     # Date / Work Order selection. This is UI-only; backend logic stays identical.
@@ -3326,38 +3393,38 @@ def _render_request_ptw() -> None:
         with col_date:
             def _on_ptw_date_change() -> None:
                 # UI-only: show progress immediately on rerun for date-driven work order list
-                st.session_state["ptw_selected_date"] = st.session_state.get("ptw_date_selector")
-                st.session_state["ptw_date_loading"] = True
-                st.session_state["ptw_selected_wo_id"] = None
-                st.session_state["ptw_wo_details"] = None
-                st.session_state["ptw_site_name"] = ""
-                st.session_state["ptw_work_location"] = ""
+                st.session_state["s1_rptw_selected_date"] = st.session_state.get("s1_rptw_date_selector")
+                st.session_state["s1_rptw_date_loading"] = True
+                st.session_state["s1_rptw_selected_wo_id"] = None
+                st.session_state["s1_rptw_wo_details"] = None
+                st.session_state["s1_rptw_site_name"] = ""
+                st.session_state["s1_rptw_work_location"] = ""
 
             selected_date = st.date_input(
                 bi("Select Date (Work Order Date)"),
-                value=st.session_state.get("ptw_selected_date", date.today()),
-                key="ptw_date_selector",
+                value=st.session_state.get("s1_rptw_selected_date", date.today()),
+                key="s1_rptw_date_selector",
                 on_change=_on_ptw_date_change,
             )
 
         # Mount loading UI BEFORE any backend work (prevents "page loads then progress")
         load_slot = st.empty()
-        if st.session_state.get("ptw_date_loading"):
+        if st.session_state.get("s1_rptw_date_loading"):
             prog = load_slot.progress(0, text=bi("Loading work orders for selected date..."))
             try:
                 _smooth_progress(prog, 0, 35, text=bi("Validating selection..."))
                 _smooth_progress(prog, 35, 80, text=bi("Fetching OPEN work orders..."))
                 display_map = _build_work_order_display_map(selected_date)
-                st.session_state["ptw_wo_display_map_for_date"] = display_map
+                st.session_state["s1_rptw_wo_display_map_for_date"] = display_map
                 _smooth_progress(prog, 80, 100, text=bi("Work orders ready"))
             except Exception as e:
                 st.error(f"{bi('Error fetching work orders')}: {e}")
-                st.session_state["ptw_wo_ids_for_date"] = []
+                st.session_state["s1_rptw_wo_ids_for_date"] = []
             finally:
-                st.session_state["ptw_date_loading"] = False
+                st.session_state["s1_rptw_date_loading"] = False
                 load_slot.empty()
 
-        display_map = st.session_state.get("ptw_wo_display_map_for_date") or {}
+        display_map = st.session_state.get("s1_rptw_wo_display_map_for_date") or {}
         wo_labels = list(display_map.keys()) if isinstance(display_map, dict) else []
 
         with col_wo:
@@ -3368,7 +3435,7 @@ def _render_request_ptw() -> None:
                 selected_labels = st.multiselect(
                     bi("Select Work Order(s)"),
                     options=wo_labels,
-                    key="ptw_wo_multiselect",
+                    key="s1_rptw_wo_multiselect",
                 )
                 selected_ids = [str(display_map.get(lbl, "")).strip() for lbl in selected_labels if str(display_map.get(lbl, "")).strip()]
 
@@ -3412,18 +3479,18 @@ def _render_request_ptw() -> None:
 
         # Persist auto-filled values for submit handler (UI-only ordering; same values)
         if selected_ids:
-            st.session_state["ptw_selected_wo_ids"] = selected_ids
+            st.session_state["s1_rptw_selected_wo_ids"] = selected_ids
             # Backward compat: keep a primary ID (first) for legacy flows
-            st.session_state["ptw_selected_wo_id"] = selected_ids[0]
-            st.session_state["ptw_site_name"] = site_name_display
-            st.session_state["ptw_work_location"] = work_location_display
-            st.session_state["ptw_permit_no"] = "-".join(sorted(selected_ids))
+            st.session_state["s1_rptw_selected_wo_id"] = selected_ids[0]
+            st.session_state["s1_rptw_site_name"] = site_name_display
+            st.session_state["s1_rptw_work_location"] = work_location_display
+            st.session_state["s1_rptw_permit_no"] = "-".join(sorted(selected_ids))
         else:
-            st.session_state["ptw_selected_wo_ids"] = []
-            st.session_state["ptw_selected_wo_id"] = None
-            st.session_state["ptw_site_name"] = ""
-            st.session_state["ptw_work_location"] = ""
-            st.session_state["ptw_permit_no"] = ""
+            st.session_state["s1_rptw_selected_wo_ids"] = []
+            st.session_state["s1_rptw_selected_wo_id"] = None
+            st.session_state["s1_rptw_site_name"] = ""
+            st.session_state["s1_rptw_work_location"] = ""
+            st.session_state["s1_rptw_permit_no"] = ""
 
         # Display auto-filled fields (read-only) - OUTSIDE form for reactive updates
         st.markdown("---")
@@ -3457,8 +3524,8 @@ def _render_request_ptw() -> None:
         _render_work_order_selection_block()
 
         # Read from session after selector block (fragment-safe)
-        selected_ids = st.session_state.get("ptw_selected_wo_ids") or []
-        selected_wo_id = st.session_state.get("ptw_selected_wo_id")
+        selected_ids = st.session_state.get("s1_rptw_selected_wo_ids") or []
+        selected_wo_id = st.session_state.get("s1_rptw_selected_wo_id")
         
         # Permit validity is current date (NOT work order date)
         # As per requirement: validity = current datetime at submission
@@ -3470,10 +3537,10 @@ def _render_request_ptw() -> None:
             return
 
         # Store for use in form submission
-        st.session_state["ptw_selected_wo_ids"] = selected_ids
-        st.session_state["ptw_selected_wo_id"] = selected_wo_id
-        st.session_state["ptw_site_name"] = st.session_state.get("ptw_site_name", "")
-        st.session_state["ptw_work_location"] = st.session_state.get("ptw_work_location", "")
+        st.session_state["s1_rptw_selected_wo_ids"] = selected_ids
+        st.session_state["s1_rptw_selected_wo_id"] = selected_wo_id
+        st.session_state["s1_rptw_site_name"] = st.session_state.get("s1_rptw_site_name", "")
+        st.session_state["s1_rptw_work_location"] = st.session_state.get("s1_rptw_work_location", "")
 
         # Prevent Enter key from implicitly submitting the form (UI-only safety)
         # Allow Enter inside TEXTAREA for multi-line notes.
@@ -3499,11 +3566,11 @@ def _render_request_ptw() -> None:
         )
 
         # If Submit PTW was clicked, avoid rebuilding the whole form before showing progress.
-        if "ptw_submit_requested" not in st.session_state:
-            st.session_state["ptw_submit_requested"] = False
+        if "s1_rptw_submit_requested" not in st.session_state:
+            st.session_state["s1_rptw_submit_requested"] = False
 
-        if st.session_state.get("ptw_submit_requested", False):
-            st.session_state["ptw_submit_requested"] = False
+        if st.session_state.get("s1_rptw_submit_requested", False):
+            st.session_state["s1_rptw_submit_requested"] = False
 
             # Mount progress UI immediately (top of section)
             st.markdown(
@@ -3514,10 +3581,10 @@ def _render_request_ptw() -> None:
             def _ss(k: str, default: Any) -> Any:
                 return st.session_state.get(k, default)
 
-            work_order_ids = _ss("ptw_selected_wo_ids", []) or []
-            permit_no = _ss("ptw_permit_no", "") or "-".join(sorted([str(x).strip() for x in work_order_ids if str(x).strip()]))
-            site_name = _ss("ptw_site_name", "")
-            work_location = _ss("ptw_work_location", "")
+            work_order_ids = _ss("s1_rptw_selected_wo_ids", []) or []
+            permit_no = _ss("s1_rptw_permit_no", "") or "-".join(sorted([str(x).strip() for x in work_order_ids if str(x).strip()]))
+            site_name = _ss("s1_rptw_site_name", "")
+            work_location = _ss("s1_rptw_work_location", "")
             
             # Permit validity is current date (NOT work order date)
             # As per requirement: validity = current datetime at submission
@@ -3529,8 +3596,8 @@ def _render_request_ptw() -> None:
                 permit_validity_date=permit_validity_date,  # Current datetime
                 site_name=site_name,
                 work_location=work_location,
-                work_description=_ss("ptw_work_desc", ""),
-                contractor_name=_ss("ptw_contractor", ""),
+                work_description=_ss("s1_rptw_work_desc", ""),
+                contractor_name=_ss("s1_rptw_contractor", ""),
                 # Hazards
                 hz_live_dc_cables=_ss("hz_live_dc_cables", False),
                 hz_loose_connectors=_ss("hz_loose_connectors", False),
@@ -3609,7 +3676,7 @@ def _render_request_ptw() -> None:
                 ap_lifting=_ss("ap_lifting", False),
                 ap_others_text=_ss("ap_others_text", ""),
                 # Tools (Section G uses key="ptw_tools_equipment")
-                tools_equipment=_ss("ptw_tools_equipment", ""),
+                tools_equipment=_ss("s1_rptw_tools_equipment", ""),
                 # Checklist (Y/N/NA)
                 chk_jsa=_ss("chk_jsa", None),
                 chk_environment=_ss("chk_environment", None),
@@ -3628,15 +3695,15 @@ def _render_request_ptw() -> None:
                 chk_line_clearance=_ss("chk_line_clearance", None),
                 chk_briefing=_ss("chk_briefing", None),
                 # Undertaking
-                undertaking_accept=_ss("ptw_undertaking", False),
+                undertaking_accept=_ss("s1_rptw_undertaking", False),
                 # People
-                receiver_name=_ss("ptw_receiver", ""),
-                coworker_1=_ss("ptw_coworker1", ""),
-                coworker_2=_ss("ptw_coworker2", ""),
-                coworker_3=_ss("ptw_coworker3", ""),
-                coworker_4=_ss("ptw_coworker4", ""),
-                coworker_5=_ss("ptw_coworker5", ""),
-                coworker_6=_ss("ptw_coworker6", ""),
+                receiver_name=_ss("s1_rptw_receiver", ""),
+                coworker_1=_ss("s1_rptw_coworker1", ""),
+                coworker_2=_ss("s1_rptw_coworker2", ""),
+                coworker_3=_ss("s1_rptw_coworker3", ""),
+                coworker_4=_ss("s1_rptw_coworker4", ""),
+                coworker_5=_ss("s1_rptw_coworker5", ""),
+                coworker_6=_ss("s1_rptw_coworker6", ""),
             )
             st.stop()
 
@@ -3653,12 +3720,12 @@ def _render_request_ptw() -> None:
         work_description = st.text_area(
             f"{bi('Description of Work')} *",
             height=100,
-            key="ptw_work_desc",
+            key="s1_rptw_work_desc",
             placeholder=bi("Describe the work to be performed..."),
         )
         contractor_name = st.text_area(
             bi("Contractor Name"),
-            key="ptw_contractor",
+            key="s1_rptw_contractor",
             placeholder=bi("Enter contractor/company name"),
             height=38,
         )
@@ -3817,7 +3884,7 @@ def _render_request_ptw() -> None:
         tools_equipment = st.text_area(
             bi("List all tools and equipment required for the work"),
             height=80,
-            key="ptw_tools_equipment"
+            key="s1_rptw_tools_equipment"
         )
 
         st.divider()
@@ -3867,7 +3934,7 @@ def _render_request_ptw() -> None:
                 "I have reviewed and understood the risk assessment, safety precautions, and emergency procedures. "
                 "I accept responsibility for ensuring all personnel involved comply with the permit conditions."
             ),
-            key="ptw_undertaking"
+            key="s1_rptw_undertaking"
         )
 
         st.divider()
@@ -3880,24 +3947,24 @@ def _render_request_ptw() -> None:
 
         ppl_col1, ppl_col2, ppl_col3 = st.columns(3)
         with ppl_col1:
-            receiver_name = st.text_area(f"{bi('Permit Receiver Name')} *", key="ptw_receiver", height=38)
-            coworker_1 = st.text_area(bi("Co-worker 1"), key="ptw_coworker1", height=38)
+            receiver_name = st.text_area(f"{bi('Permit Receiver Name')} *", key="s1_rptw_receiver", height=38)
+            coworker_1 = st.text_area(bi("Co-worker 1"), key="s1_rptw_coworker1", height=38)
         with ppl_col2:
-            coworker_2 = st.text_area(bi("Co-worker 2"), key="ptw_coworker2", height=38)
-            coworker_3 = st.text_area(bi("Co-worker 3"), key="ptw_coworker3", height=38)
+            coworker_2 = st.text_area(bi("Co-worker 2"), key="s1_rptw_coworker2", height=38)
+            coworker_3 = st.text_area(bi("Co-worker 3"), key="s1_rptw_coworker3", height=38)
         with ppl_col3:
-            coworker_4 = st.text_area(bi("Co-worker 4"), key="ptw_coworker4", height=38)
-            coworker_5 = st.text_area(bi("Co-worker 5"), key="ptw_coworker5", height=38)
+            coworker_4 = st.text_area(bi("Co-worker 4"), key="s1_rptw_coworker4", height=38)
+            coworker_5 = st.text_area(bi("Co-worker 5"), key="s1_rptw_coworker5", height=38)
 
-        coworker_6 = st.text_area(bi("Co-worker 6"), key="ptw_coworker6", height=38)
+        coworker_6 = st.text_area(bi("Co-worker 6"), key="s1_rptw_coworker6", height=38)
 
         st.divider()
 
         # ===== SUBMIT BUTTON =====
-        is_submitting = bool(st.session_state.get("ptw_is_submitting", False))
+        is_submitting = bool(st.session_state.get("s1_rptw_is_submitting", False))
         def _on_ptw_submit_click() -> None:
             # UI-only: next rerun will show progress immediately and run submit without rebuilding the full form first.
-            st.session_state["ptw_submit_requested"] = True
+            st.session_state["s1_rptw_submit_requested"] = True
         submitted = st.form_submit_button(
             bi("Submit PTW"),
             type="primary",
@@ -3950,9 +4017,9 @@ def _handle_ptw_submit(**kwargs) -> None:
 
     try:
         # Prevent double clicks / duplicate submits in same session
-        if st.session_state.get("ptw_is_submitting", False):
+        if st.session_state.get("s1_rptw_is_submitting", False):
             return
-        st.session_state["ptw_is_submitting"] = True
+        st.session_state["s1_rptw_is_submitting"] = True
 
         progress_placeholder.progress(0, text="Validating inputs...")
         status_placeholder.info("Step 1/4: Validating form data")
@@ -3974,7 +4041,7 @@ def _handle_ptw_submit(**kwargs) -> None:
                 "One or more selected Work Orders already have a PTW."
                 + (f" Existing PTW ID: `{existing_ptw_id}`" if existing_ptw_id else "")
             )
-            st.session_state["ptw_is_submitting"] = False
+            st.session_state["s1_rptw_is_submitting"] = False
             return
 
         # Build form data with system-controlled times
@@ -4118,13 +4185,23 @@ def _handle_ptw_submit(**kwargs) -> None:
             form_data=form_data,
         )
         
-        # Update work_orders.date_s1_created to mark PTW submission time
-        # This drives the status derivation (OPEN -> WIP)
-        for wo in work_order_ids:
-            _update_work_order_s1_created(
-                work_order_id=wo,
-                s1_timestamp=submit_time.isoformat(sep=" ", timespec="seconds"),
-            )
+        # Update work_orders.date_s1_created for ALL linked work orders atomically
+        # (multi-WO PTW lifecycle consistency)
+        from ptw_lifecycle_utils import (
+            _get_all_work_order_ids_for_ptw,
+            _update_all_work_orders_lifecycle,
+        )
+
+        wo_ids = _get_all_work_order_ids_for_ptw(ptw_id=str(ptw_id), permit_no=permit_no, form_data=form_data)
+        if len(wo_ids) > 1:
+            st.info(f"Atomic lifecycle update: {len(wo_ids)} linked work orders updated together.")
+
+        _update_all_work_orders_lifecycle(
+            work_order_ids=wo_ids,
+            update_fields={
+                "date_s1_created": submit_time.isoformat(sep=" ", timespec="seconds"),
+            },
+        )
 
         progress_placeholder.progress(50, text="Downloading template from Supabase...")
         status_placeholder.info("Step 3/4: Generating PTW document")
@@ -4135,11 +4212,10 @@ def _handle_ptw_submit(**kwargs) -> None:
         except Exception as e:
             raise RuntimeError(f"Failed to download template: {e}") from e
 
-        # Generate document (with attachments if S2's generator is available)
+        # Generate document (with attachments pipeline if available)
         try:
-            from S2 import generate_ptw_pdf_with_attachments
-            # Note: at S1 submission, no evidence files exist yet, but using this generator
-            # ensures consistency. Attachments page will be empty for S1-only PDFs.
+            from ptw_pdf_pipeline import generate_ptw_pdf_with_attachments
+            # Note: at S1 submission, evidence may not exist yet; attachments page can be empty.
             pdf_bytes = generate_ptw_pdf_with_attachments(
                 form_data=form_data,
                 work_order_id=permit_no,
@@ -4162,8 +4238,8 @@ def _handle_ptw_submit(**kwargs) -> None:
         # Reset form for next entry
         st.session_state["s1_ptw_reset_counter"] = st.session_state.get("s1_ptw_reset_counter", 0) + 1
         # Clear work order selection
-        st.session_state["ptw_selected_wo_id"] = None
-        st.session_state["ptw_wo_details"] = None
+        st.session_state["s1_rptw_selected_wo_id"] = None
+        st.session_state["s1_rptw_wo_details"] = None
 
         progress_placeholder.progress(100, text="Complete!")
         status_placeholder.empty()
@@ -4171,8 +4247,8 @@ def _handle_ptw_submit(**kwargs) -> None:
         msg_placeholder.empty()
 
         # Set flag to show success screen on next render
-        st.session_state["ptw_just_submitted"] = True
-        st.session_state["ptw_is_submitting"] = False
+        st.session_state["s1_rptw_just_submitted"] = True
+        st.session_state["s1_rptw_is_submitting"] = False
         
         # Full visual reset (widgets) after SUCCESS only
         _reset_ptw_form_state()
@@ -4193,7 +4269,7 @@ def _handle_ptw_submit(**kwargs) -> None:
         # Avoid showing stack traces to end users in production UI
         st.session_state["s1_ptw_last_file"] = None
         st.session_state["s1_ptw_last_permit_no"] = None
-        st.session_state["ptw_is_submitting"] = False
+        st.session_state["s1_rptw_is_submitting"] = False
 
 
 def _extract_work_order_ids_from_ptw_row(r: dict) -> list[str]:
@@ -4493,21 +4569,46 @@ def _render_permit_closure() -> None:
         key="s1_close_declaration",
     )
 
-    if st.button("Close Permit", type="primary", key="s1_close_btn", disabled=not declared):
-        with st.spinner("Closing permit..."):
+    close_req_key = "s1_pc_close_requested"
+    if close_req_key not in st.session_state:
+        st.session_state[close_req_key] = False
+
+    def _on_close() -> None:
+        st.session_state[close_req_key] = True
+
+    st.button("Close Permit", type="primary", key="s1_pc_close_btn", disabled=not declared, on_click=_on_close)
+
+    if st.session_state.get(close_req_key):
+        st.session_state[close_req_key] = False  # RESET IMMEDIATELY
+
+        progress_slot = st.empty()
+        prog = progress_slot.progress(0, text="Closing permit...")
+        try:
+            _smooth_progress(prog, 0, 30, text="Validating...")
             sb = get_supabase_client(prefer_service_role=True)
             now = datetime.now().isoformat(sep=" ", timespec="seconds")
 
             ptw_id = str(sel_row.get("ptw_id") or "").strip()
+            permit_no = str(sel_row.get("permit_no") or "").strip()
             wo_ids = sel_row.get("work_order_ids") or []
             wo_ids = [str(x).strip() for x in (wo_ids if isinstance(wo_ids, list) else []) if str(x).strip()]
+            from ptw_lifecycle_utils import _get_all_work_order_ids_for_ptw
+            wo_ids = _get_all_work_order_ids_for_ptw(
+                ptw_id=ptw_id,
+                permit_no=permit_no or "-".join(wo_ids),
+                form_data={"work_order_ids": wo_ids} if wo_ids else None,
+            )
 
-            # Update all covered work orders (do not overwrite existing closures)
-            for woid in wo_ids:
-                sb.table(TABLE_WORK_ORDERS).update({"date_s1_closed": now}).eq("work_order_id", woid).is_(
-                    "date_s1_closed", "null"
-                ).execute()
+            _smooth_progress(prog, 30, 70, text="Updating work orders...")
+            from ptw_lifecycle_utils import _update_all_work_orders_lifecycle
+            if len(wo_ids) > 1:
+                st.info(f"Atomic lifecycle update: {len(wo_ids)} linked work orders updated together.")
+            _update_all_work_orders_lifecycle(
+                work_order_ids=wo_ids,
+                update_fields={"date_s1_closed": now},
+            )
 
+            _smooth_progress(prog, 70, 90, text="Saving closure details...")
             # Persist closure overlay block into ptw_requests.form_data for future downloads
             if ptw_id:
                 get_resp = (
@@ -4528,11 +4629,15 @@ def _render_permit_closure() -> None:
                 )
                 sb.table(TABLE_PTW_REQUESTS).update({"form_data": fd}).eq("ptw_id", ptw_id).execute()
 
-            st.success("Permit closed successfully.")
-            # Refresh cached lists
-            st.cache_data.clear()
-            st.session_state["s1_close_run_fetch"] = True
-            st.rerun()
+            _smooth_progress(prog, 90, 100, text="Done")
+        finally:
+            progress_slot.empty()
+
+        st.success("Permit closed successfully.")
+        # Refresh cached lists
+        st.cache_data.clear()
+        st.session_state["s1_close_run_fetch"] = True
+        st.rerun()
 
 
 def _render_view_applied_ptw() -> None:
@@ -4540,37 +4645,40 @@ def _render_view_applied_ptw() -> None:
     st.markdown("## View Applied PTW")
     st.caption("Browse and download previously submitted Permit To Work requests")
 
+    key_prefix = "s1_vap_"
+
     # Filters
     col1, col2, col3 = st.columns([1.5, 1.5, 1])
     with col1:
         start_date = st.date_input(
             "From Date",
             value=date.today(),
-            key="ptw_view_start"
+            key=f"{key_prefix}start"
         )
     with col2:
         end_date = st.date_input(
             "To Date",
             value=date.today(),
-            key="ptw_view_end"
+            key=f"{key_prefix}end"
         )
     with col3:
         st.write("")  # Spacer
         st.write("")  # Spacer
-        if "s1_view_ptw_run_fetch" not in st.session_state:
-            st.session_state["s1_view_ptw_run_fetch"] = False
+        fetch_flag = f"{key_prefix}fetch_requested"
+        if fetch_flag not in st.session_state:
+            st.session_state[fetch_flag] = False
         def _on_fetch_ptws() -> None:
-            st.session_state["s1_view_ptw_run_fetch"] = True
-        fetch_btn = st.button("Fetch PTWs", type="primary", on_click=_on_fetch_ptws)
+            st.session_state[fetch_flag] = True
+        st.button("Fetch PTWs", type="primary", key=f"{key_prefix}fetch_btn", on_click=_on_fetch_ptws)
 
     # =========================================================================
     # FIX: Process fetch FIRST before any other rendering to prevent tab switch
     # The flag is checked and cleared immediately to prevent double-processing
     # =========================================================================
-    should_fetch = st.session_state.get("s1_view_ptw_run_fetch", False)
+    should_fetch = bool(st.session_state.get(fetch_flag, False))
     if should_fetch:
         # Clear flag FIRST to prevent re-triggering on subsequent reruns
-        st.session_state["s1_view_ptw_run_fetch"] = False
+        st.session_state[fetch_flag] = False
         
         prog_slot = st.empty()
         prog = prog_slot.progress(0, text="Fetching PTWs...")
@@ -4578,7 +4686,7 @@ def _render_view_applied_ptw() -> None:
             _smooth_progress(prog, 0, 25, text="Validating date range...")
             _smooth_progress(prog, 25, 70, text="Fetching PTW requests...")
             df = fetch_ptw_requests(start_date=start_date, end_date=end_date)
-            st.session_state["s1_ptw_view_df"] = df
+            st.session_state[f"{key_prefix}df"] = df
             _smooth_progress(prog, 70, 100, text="Results ready")
         except Exception as e:
             st.error(f"Failed to fetch PTW requests: {e}")
@@ -4587,9 +4695,9 @@ def _render_view_applied_ptw() -> None:
             prog_slot.empty()
     
     # Show results if data exists (from current or previous fetch)
-    if st.session_state.get("s1_ptw_view_df") is not None:
+    if st.session_state.get(f"{key_prefix}df") is not None:
 
-        df = st.session_state.get("s1_ptw_view_df")
+        df = st.session_state.get(f"{key_prefix}df")
 
         if df is None or df.empty:
             st.info("No PTW requests found for the selected date range.")
@@ -4627,7 +4735,7 @@ def _render_view_applied_ptw() -> None:
         _frag = getattr(st, "fragment", None)
 
         def _download_block() -> None:
-            df_local = st.session_state.get("s1_ptw_view_df")
+            df_local = st.session_state.get(f"{key_prefix}df")
             if df_local is None or getattr(df_local, "empty", True):
                 st.info("No PTW requests available.")
                 return
@@ -4636,21 +4744,24 @@ def _render_view_applied_ptw() -> None:
             selected_permit = st.selectbox(
                 "Select Permit No to Download",
                 options=permit_options,
-                key="s1_view_selected_permit",
+                key=f"{key_prefix}selected_permit",
             )
 
-            if "s1_view_ptw_pdf_bytes" not in st.session_state:
-                st.session_state["s1_view_ptw_pdf_bytes"] = None
-                st.session_state["s1_view_ptw_pdf_permit"] = None
-                st.session_state["s1_view_ptw_pdf_approved_on"] = None
+            pdf_bytes_key = f"{key_prefix}pdf_bytes"
+            pdf_permit_key = f"{key_prefix}pdf_permit"
+            pdf_approved_on_key = f"{key_prefix}pdf_approved_on"
+            if pdf_bytes_key not in st.session_state:
+                st.session_state[pdf_bytes_key] = None
+                st.session_state[pdf_permit_key] = None
+                st.session_state[pdf_approved_on_key] = None
 
             def _on_generate_applied() -> None:
-                st.session_state["s1_view_generate_clicked"] = True
+                st.session_state[f"{key_prefix}generate_requested"] = True
 
-            gen_clicked = st.button("Generate & Download", on_click=_on_generate_applied)
+            st.button("Generate & Download", key=f"{key_prefix}gen_btn", on_click=_on_generate_applied)
 
-            if gen_clicked or st.session_state.get("s1_view_generate_clicked"):
-                st.session_state["s1_view_generate_clicked"] = False
+            if st.session_state.get(f"{key_prefix}generate_requested"):
+                st.session_state[f"{key_prefix}generate_requested"] = False
                 try:
                     prog_slot = st.empty()
                     prog = prog_slot.progress(0, text="Generating report...")
@@ -4714,7 +4825,7 @@ def _render_view_applied_ptw() -> None:
                             pass
                     
                     try:
-                        from S2 import generate_ptw_pdf_with_attachments
+                        from ptw_pdf_pipeline import generate_ptw_pdf_with_attachments
                         # Use first work_order_id from permit's coverage
                         wo_ids = _extract_work_order_ids_from_ptw_row({"form_data": updated_form})
                         primary_wo_id = wo_ids[0] if wo_ids else selected_permit
@@ -4735,15 +4846,15 @@ def _render_view_applied_ptw() -> None:
                     _smooth_progress(prog, 85, 100, text="Download ready")
                     prog_slot.empty()
 
-                    st.session_state["s1_view_ptw_pdf_bytes"] = pdf_bytes
-                    st.session_state["s1_view_ptw_pdf_permit"] = selected_permit
-                    st.session_state["s1_view_ptw_pdf_approved_on"] = approved_on
+                    st.session_state[pdf_bytes_key] = pdf_bytes
+                    st.session_state[pdf_permit_key] = selected_permit
+                    st.session_state[pdf_approved_on_key] = approved_on
                 except Exception as e:
                     st.error(f"Failed to generate document: {e}")
 
-            cached_pdf = st.session_state.get("s1_view_ptw_pdf_bytes")
-            cached_permit = st.session_state.get("s1_view_ptw_pdf_permit")
-            cached_approved_on = st.session_state.get("s1_view_ptw_pdf_approved_on") or ""
+            cached_pdf = st.session_state.get(pdf_bytes_key)
+            cached_permit = st.session_state.get(pdf_permit_key)
+            cached_approved_on = st.session_state.get(pdf_approved_on_key) or ""
             if cached_pdf and cached_permit == selected_permit:
                 st.download_button(
                     label=f"Download {selected_permit}.pdf",
@@ -4751,7 +4862,7 @@ def _render_view_applied_ptw() -> None:
                     file_name=f"{selected_permit}.pdf",
                     mime="application/pdf",
                     type="primary",
-                    key=f"s1_view_cached_download_{selected_permit}",
+                    key=f"{key_prefix}cached_download_{selected_permit}",
                 )
 
         if callable(_frag):
